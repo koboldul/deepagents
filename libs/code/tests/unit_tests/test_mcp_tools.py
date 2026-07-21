@@ -5239,3 +5239,51 @@ class TestFilterTrustedProjectServers:
         )
 
         assert list(kept) == ["z", "a", "m"]
+
+
+async def test_resolve_and_load_mcp_tools_stays_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MCP resolution must not perform blocking IO on the server event loop.
+
+    The langgraph dev server builds the agent graph under langgraph's
+    `blockbuster` guard, which raises `BlockingError` on synchronous filesystem
+    calls made on the event loop. `resolve_and_load_mcp_tools` discovers config
+    files, reads them, and resolves the project root and per-server trust -- all
+    blocking disk IO that must run in worker threads. Regression guard for that
+    offload.
+    """
+    from blockbuster import BlockingError, blockbuster_ctx
+
+    from deepagents_code.mcp_tools import resolve_and_load_mcp_tools
+    from deepagents_code.project_utils import ProjectContext
+
+    # Isolate discovery from the real home config and give it a project-level
+    # `.mcp.json` with a server so discovery, config loading, and project-server
+    # trust resolution all execute (each a distinct blocking-IO path).
+    home = tmp_path / "home"
+    (home / ".deepagents").mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: home))
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"demo": {"command": "echo", "args": ["hi"]}}}),
+        encoding="utf-8",
+    )
+    ctx = ProjectContext(user_cwd=project, project_root=project)
+
+    async def _load() -> None:
+        await resolve_and_load_mcp_tools(
+            no_mcp=False, project_context=ctx, stateless=True
+        )
+
+    # Warm lazy imports first so the guard observes only runtime IO, not
+    # first-import side effects (which the real server triggers before its loop).
+    await _load()
+
+    with blockbuster_ctx():
+        try:
+            await _load()
+        except BlockingError as exc:  # pragma: no cover - regression failure path
+            pytest.fail(f"MCP resolution blocked the event loop: {exc}")

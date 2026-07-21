@@ -2467,17 +2467,21 @@ async def resolve_and_load_mcp_tools(
     config_load_errors: list[tuple[Path, str]] = []
 
     try:
-        config_paths = discover_mcp_configs(project_context=project_context)
+        config_paths = await asyncio.to_thread(
+            discover_mcp_configs, project_context=project_context
+        )
     except (OSError, RuntimeError) as exc:
         logger.warning("MCP config auto-discovery failed", exc_info=True)
         config_paths = []
         config_load_errors.append((Path("<discovery>"), str(exc)))
 
-    user_configs, project_configs = classify_discovered_configs(config_paths)
+    user_configs, project_configs = await asyncio.to_thread(
+        classify_discovered_configs, config_paths
+    )
     configs: list[dict[str, Any]] = []
 
     for path in user_configs:
-        config, error = load_mcp_config_with_error(path)
+        config, error = await asyncio.to_thread(load_mcp_config_with_error, path)
         if error is not None:
             config_load_errors.append((path, error))
         if config is not None:
@@ -2487,7 +2491,9 @@ async def resolve_and_load_mcp_tools(
     loaded_project_configs: list[tuple[Path, dict[str, Any]]] = []
 
     for path in project_configs:
-        config, error = _load_mcp_config_top_level_with_error(path)
+        config, error = await asyncio.to_thread(
+            _load_mcp_config_top_level_with_error, path
+        )
         if error is not None:
             config_load_errors.append((path, error))
         if config is not None:
@@ -2512,7 +2518,7 @@ async def resolve_and_load_mcp_tools(
             load_mcp_server_trust_lists,
         )
 
-        trust_lists = load_mcp_server_trust_lists()
+        trust_lists = await asyncio.to_thread(load_mcp_server_trust_lists)
         if trust_lists.read_error is not None:
             # Surface the read failure as a visible config error (a bare
             # logger.warning has no handler outside debug mode).
@@ -2576,21 +2582,25 @@ async def resolve_and_load_mcp_tools(
         # `configs` without a trust decision (defense in depth against a future
         # validator that accepts a shape `extract_project_server_summaries`
         # currently skips).
-        project_base = _resolve_project_config_base(project_context)
-        kept: dict[str, Any] = {}
-        for name, server in project_config["mcpServers"].items():
-            source = server_sources[name]
-            project_root = project_root_for_mcp_config_path(
-                source, fallback=project_base
-            )
-            kept.update(
-                filter_trusted_project_servers(
-                    {name: server},
-                    trust_lists,
-                    project_root=project_root,
-                    config_trusted=config_trusted,
+        def _compute_trusted_servers() -> dict[str, Any]:
+            project_base = _resolve_project_config_base(project_context)
+            kept: dict[str, Any] = {}
+            for name, server in project_config["mcpServers"].items():
+                source = server_sources[name]
+                project_root = project_root_for_mcp_config_path(
+                    source, fallback=project_base
                 )
-            )
+                kept.update(
+                    filter_trusted_project_servers(
+                        {name: server},
+                        trust_lists,
+                        project_root=project_root,
+                        config_trusted=config_trusted,
+                    )
+                )
+            return kept
+
+        kept = await asyncio.to_thread(_compute_trusted_servers)
 
         if kept:
             filtered = {**project_config, "mcpServers": kept}
@@ -2631,7 +2641,7 @@ async def resolve_and_load_mcp_tools(
             if project_context is not None
             else explicit_config_path
         )
-        configs.append(load_mcp_config(config_path))
+        configs.append(await asyncio.to_thread(load_mcp_config, config_path))
 
     def _bad_config_infos() -> list[MCPServerInfo]:
         return [
@@ -2653,7 +2663,7 @@ async def resolve_and_load_mcp_tools(
 
     from deepagents_code.mcp_disabled import get_disabled_servers
 
-    disabled_names = get_disabled_servers()
+    disabled_names = await asyncio.to_thread(get_disabled_servers)
     disabled_infos: list[MCPServerInfo] = []
     if disabled_names:
         active: dict[str, Any] = {}
