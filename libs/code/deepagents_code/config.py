@@ -115,6 +115,7 @@ _DOTENV_DENIED_ENV_KEYS = frozenset(
         "BASH_ENV",
         "BASHOPTS",
         "CDPATH",
+        "COMSPEC",
         "DYLD_INSERT_LIBRARIES",
         "DYLD_LIBRARY_PATH",
         "ENV",
@@ -131,6 +132,8 @@ _DOTENV_DENIED_ENV_KEYS = frozenset(
         "PYTHONSTARTUP",
         "SHELLOPTS",
         "SSH_ASKPASS",
+        "SYSTEMROOT",
+        "WINDIR",
         _INHERITED_PYTHONPATH_ENV,
     }
 )
