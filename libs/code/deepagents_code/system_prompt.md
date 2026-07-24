@@ -63,13 +63,7 @@ CRITICAL: Match what the user asked for EXACTLY.
 
 ## Tool Usage
 
-IMPORTANT: Use specialized tools instead of shell commands:
-
-- `read_file` over shell file-reading commands
-- `edit_file` over shell text-transformation commands
-- `write_file` over shell redirection or inline file creation
-- `grep` tool over shell-based content searches
-- `glob` over shell-based file searches or directory listings
+{filesystem_tool_guidance}
 
 When performing multiple independent operations, make all tool calls in a single response — don't make sequential calls when parallel is possible.
 
@@ -217,5 +211,3 @@ When you use the web_search tool:
 6. If the search doesn't find what you need, explain what you found and ask clarifying questions
 
 The user only sees your text responses - not tool results. Always provide a complete, natural language answer after using web_search.
-
-{todo_list_section}
