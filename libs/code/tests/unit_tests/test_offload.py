@@ -1024,12 +1024,13 @@ class TestOffloadFallbackRoot:
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         assert _offload_fallback_root() == root
-        # The shared config root's permissions are left untouched.
-        assert stat.S_IMODE(root.stat().st_mode) == 0o755
-        # Only the archive subdirectory is made private.
         archive_dir = root / "conversation_history"
         assert archive_dir.is_dir()
-        assert stat.S_IMODE(archive_dir.stat().st_mode) == 0o700
+        if os.name != "nt":
+            # The shared config root's permissions are left untouched.
+            assert stat.S_IMODE(root.stat().st_mode) == 0o755
+            # Only the archive subdirectory is made private.
+            assert stat.S_IMODE(archive_dir.stat().st_mode) == 0o700
 
     def test_fallback_root_uses_temp_when_home_is_read_only(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1052,7 +1053,8 @@ class TestOffloadFallbackRoot:
 
         assert root == temp_dir / f"deepagents-{uid}"
         assert root.is_dir()
-        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        if os.name != "nt":
+            assert stat.S_IMODE(root.stat().st_mode) == 0o700
         assert probe.call_count == 2
 
     def test_fallback_root_avoids_file_at_predictable_per_user_path(
@@ -1085,7 +1087,8 @@ class TestOffloadFallbackRoot:
 
         assert root != reserved
         assert root.name.startswith(f"deepagents-{uid}-")
-        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        if os.name != "nt":
+            assert stat.S_IMODE(root.stat().st_mode) == 0o700
 
     def test_fallback_root_rejects_foreign_owned_per_user_dir(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1163,7 +1166,8 @@ class TestOffloadFallbackRoot:
         root = _offload_fallback_root()
 
         assert root == temp_dir / f"deepagents-{uid}"
-        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        if os.name != "nt":
+            assert stat.S_IMODE(root.stat().st_mode) == 0o700
         # The temp fallback is not persistent; the flag reflects that.
         from deepagents_code.offload import offload_storage_is_ephemeral
 
@@ -1178,6 +1182,9 @@ class TestOffloadFallbackRoot:
         `chmod(0o700)` is what protects a pre-existing world-readable archive
         dir. Removing that call would regress this test.
         """
+        if os.name == "nt":
+            pytest.skip("POSIX directory mode hardening is unavailable on Windows")
+
         root = tmp_path / ".deepagents"
         root.mkdir()
         archive_dir = root / "conversation_history"
@@ -1314,15 +1321,16 @@ class TestDeleteOffloadedHistory:
 class TestArtifactsRoot:
     """Cover the real-filesystem artifacts root for offloaded tool results."""
 
-    def test_artifacts_root_is_stable_and_hardened(
+    def test_posix_artifacts_root_is_stable_and_hardened(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The per-user artifacts dir is predictable, private, and reused."""
+        """The UID-qualified POSIX artifacts directory remains unchanged."""
         temp_dir = tmp_path / "tmp"
         temp_dir.mkdir()
         getuid = getattr(os, "getuid", None)
         uid = getuid() if getuid is not None else os.getpid()
 
+        monkeypatch.setattr(offload, "_NATIVE_WINDOWS", False)
         monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp_dir))
 
         storage = _artifacts_root()
@@ -1330,9 +1338,34 @@ class TestArtifactsRoot:
 
         assert storage.large_results_dir is None
         assert root_path.samefile(temp_dir / f"dcode-artifacts-{uid}")
-        assert stat.S_IMODE(root_path.stat().st_mode) == 0o700
+        if os.name != "nt":
+            assert stat.S_IMODE(root_path.stat().st_mode) == 0o700
         # Stable across calls (paths embedded in resumed threads stay resolvable).
         assert _artifacts_root() == storage
+
+    def test_windows_artifacts_root_is_stable_across_process_restarts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Different server PIDs reuse the app-managed per-user artifacts path."""
+        state_dir = tmp_path / ".deepagents" / ".state"
+        monkeypatch.setattr(offload, "_NATIVE_WINDOWS", True)
+        monkeypatch.setattr(
+            "deepagents_code.model_config.DEFAULT_STATE_DIR",
+            state_dir,
+        )
+
+        monkeypatch.setattr(os, "getpid", lambda: 101)
+        first = _artifacts_root()
+        monkeypatch.setattr(os, "getpid", lambda: 202)
+        second = _artifacts_root()
+
+        expected = state_dir / "artifacts"
+        assert first == second
+        assert first.large_results_dir is None
+        assert first.root == _filesystem_tool_path(expected)
+        assert Path(first.root).samefile(expected)
+        if os.name != "nt":
+            assert stat.S_IMODE(expected.stat().st_mode) == 0o700
 
     def test_windows_artifacts_root_is_accepted_by_filesystem_tools(self) -> None:
         """A Windows temp path retains its drive without a rejected drive prefix."""
@@ -1346,6 +1379,36 @@ class TestArtifactsRoot:
         assert root == "//?/C:/Users/test/AppData/Local/Temp/dcode-artifacts-123"
         assert PureWindowsPath(root).is_absolute()
         assert validate_path(result_path) == result_path
+
+    def test_windows_artifacts_root_falls_back_when_state_dir_is_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unusable stable state directory retains the routed fallback."""
+        state_dir = tmp_path / ".deepagents" / ".state"
+        artifacts_dir = state_dir / "artifacts"
+        temp_dir = tmp_path / "tmp"
+        temp_dir.mkdir()
+        real_harden_dir = offload._harden_dir
+
+        def harden_dir(path: Path) -> None:
+            if path == artifacts_dir:
+                raise PermissionError
+            real_harden_dir(path)
+
+        monkeypatch.setattr(offload, "_NATIVE_WINDOWS", True)
+        monkeypatch.setattr(offload, "_harden_dir", harden_dir)
+        monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp_dir))
+        monkeypatch.setattr(
+            "deepagents_code.model_config.DEFAULT_STATE_DIR",
+            state_dir,
+        )
+
+        storage = _artifacts_root()
+
+        assert storage.root == "/dcode-artifacts-fallback"
+        assert storage.large_results_dir is not None
+        assert storage.large_results_dir.parent == temp_dir
+        assert storage.large_results_dir.is_dir()
 
     def test_artifacts_root_falls_back_when_predictable_path_foreign_owned(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

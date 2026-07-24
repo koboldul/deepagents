@@ -3,17 +3,282 @@
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import os
-from typing import TYPE_CHECKING, cast
+import socket
+from typing import TYPE_CHECKING, Protocol, cast
 
 import pytest
+from pytest_socket import SocketBlockedError
+from typing_extensions import Buffer
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Callable, Generator, Iterable
+    from contextlib import AbstractContextManager
     from pathlib import Path
 
 
 _UPDATE_CHECK_SELF_MANAGED_MARK = "self_managed_update_check"
+_WINDOWS_XDIST_MAX_WORKERS = 8
+_REAL_SOCKET = socket.socket
+_REAL_BIND = socket.socket.bind
+_REAL_CONNECT = socket.socket.connect
+_REAL_CONNECT_EX = socket.socket.connect_ex
+_REAL_SEND = socket.socket.send
+_REAL_SENDALL = socket.socket.sendall
+_REAL_SENDTO = socket.socket.sendto
+
+
+class _RawAcceptSocket(Protocol):
+    """Socket exposing the low-level accept primitive."""
+
+    def _accept(self) -> tuple[int, object]: ...
+
+
+_SocketAddress = str | Buffer | tuple[object, ...]
+
+
+class _SocketSendMsg(Protocol):
+    """Bound-compatible descriptor for platforms exposing `socket.sendmsg`."""
+
+    def __call__(
+        self,
+        socket_instance: socket.socket,
+        buffers: Iterable[Buffer],
+        ancdata: Iterable[tuple[int, int, Buffer]] = (),
+        flags: int = 0,
+        address: _SocketAddress | None = None,
+        /,
+    ) -> int: ...
+
+
+class _SocketSendfile(Protocol):
+    """Descriptor shape used to call the platform `socket.sendfile` method."""
+
+    def __call__(
+        self,
+        socket_instance: socket.socket,
+        file: object,
+        offset: int = 0,
+        count: int | None = None,
+        /,
+    ) -> int: ...
+
+
+_REAL_SENDFILE = cast("_SocketSendfile", socket.socket.sendfile)
+_REAL_SENDMSG = cast(
+    "_SocketSendMsg | None",
+    getattr(socket.socket, "sendmsg", None),
+)
+_REAL_SENDMSG_AFALG = getattr(socket.socket, "sendmsg_afalg", None)
+
+
+def _is_loopback_address(
+    family: socket.AddressFamily | int,
+    address: object,
+) -> bool:
+    unix_family = getattr(socket, "AF_UNIX", None)
+    if unix_family is not None and family == unix_family:
+        return True
+    if family not in {socket.AF_INET, socket.AF_INET6}:
+        return False
+    if not isinstance(address, tuple) or not address:
+        return False
+    host = address[0]
+    if not isinstance(host, str):
+        return False
+    if host.casefold() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.split("%", maxsplit=1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def _require_loopback_address(
+    family: socket.AddressFamily | int,
+    address: object,
+) -> None:
+    """Reject a non-loopback destination before entering the socket API."""
+    if not _is_loopback_address(family, address):
+        raise SocketBlockedError
+
+
+def _require_loopback_peer(socket_instance: socket.socket) -> None:
+    """Guard connected send APIs that do not carry a destination argument."""
+    unix_family = getattr(socket, "AF_UNIX", None)
+    if unix_family is not None and socket_instance.family == unix_family:
+        return
+    if socket_instance.family not in {socket.AF_INET, socket.AF_INET6}:
+        raise SocketBlockedError
+    try:
+        peer = socket_instance.getpeername()
+    except OSError:
+        raise SocketBlockedError from None
+    _require_loopback_address(socket_instance.family, peer)
+
+
+class _WindowsLoopbackSocket(_REAL_SOCKET):
+    """Socket that permits only local IPC while pytest networking is disabled."""
+
+    def bind(self, address: _SocketAddress) -> None:
+        _require_loopback_address(self.family, address)
+        _REAL_BIND(self, address)
+
+    def connect(self, address: _SocketAddress) -> None:
+        _require_loopback_address(self.family, address)
+        _REAL_CONNECT(self, address)
+
+    def connect_ex(self, address: _SocketAddress) -> int:
+        _require_loopback_address(self.family, address)
+        return _REAL_CONNECT_EX(self, address)
+
+    def send(self, data: Buffer, flags: int = 0) -> int:
+        _require_loopback_peer(self)
+        return _REAL_SEND(self, data, flags)
+
+    def sendall(self, data: Buffer, flags: int = 0) -> None:
+        _require_loopback_peer(self)
+        _REAL_SENDALL(self, data, flags)
+
+    def sendto(
+        self,
+        data: Buffer,
+        flags_or_address: int | _SocketAddress,
+        address: _SocketAddress | None = None,
+        /,
+    ) -> int:
+        destination = flags_or_address if address is None else address
+        _require_loopback_address(self.family, destination)
+        if address is None:
+            return _REAL_SENDTO(
+                self,
+                data,
+                cast("_SocketAddress", flags_or_address),
+            )
+        return _REAL_SENDTO(self, data, cast("int", flags_or_address), address)
+
+    def sendfile(
+        self,
+        file: object,
+        offset: int = 0,
+        count: int | None = None,
+    ) -> int:
+        _require_loopback_peer(self)
+        return _REAL_SENDFILE(self, file, offset, count)
+
+
+def _guarded_sendmsg(
+    socket_instance: _WindowsLoopbackSocket,
+    buffers: Iterable[Buffer],
+    ancdata: Iterable[tuple[int, int, Buffer]] = (),
+    flags: int = 0,
+    address: _SocketAddress | None = None,
+) -> int:
+    """Apply the loopback policy to platforms exposing `socket.sendmsg`."""
+    sendmsg = _REAL_SENDMSG
+    if sendmsg is None:
+        msg = "socket.sendmsg is unavailable"
+        raise NotImplementedError(msg)
+    if address is None:
+        _require_loopback_peer(socket_instance)
+        return sendmsg(socket_instance, buffers, ancdata, flags)
+    _require_loopback_address(socket_instance.family, address)
+    return sendmsg(socket_instance, buffers, ancdata, flags, address)
+
+
+def _guarded_sendmsg_afalg(
+    socket_instance: _WindowsLoopbackSocket,
+    *args: object,
+    **kwargs: object,
+) -> int:
+    """Block Linux AF_ALG sends, which cannot represent loopback IPC."""
+    del socket_instance, args, kwargs
+    raise SocketBlockedError
+
+
+if _REAL_SENDMSG is not None:
+    setattr(  # noqa: B010  # method exists only on supporting platforms
+        _WindowsLoopbackSocket,
+        "sendmsg",
+        _guarded_sendmsg,
+    )
+if _REAL_SENDMSG_AFALG is not None:
+    setattr(  # noqa: B010  # method exists only on supporting platforms
+        _WindowsLoopbackSocket,
+        "sendmsg_afalg",
+        _guarded_sendmsg_afalg,
+    )
+
+
+def _windows_loopback_socketpair(
+    family: int = socket.AF_INET,
+    type: int = socket.SOCK_STREAM,  # noqa: A002  # matches socket.socketpair
+    proto: int = 0,
+) -> tuple[socket.socket, socket.socket]:
+    """Create the private loopback pair required by Windows asyncio loops.
+
+    Returns:
+        Connected loopback sockets without reopening general network access.
+    """
+    if family != socket.AF_INET or type != socket.SOCK_STREAM:
+        msg = "Windows test socketpair only supports IPv4 stream sockets"
+        raise ValueError(msg)
+    listener = _REAL_SOCKET(family, type, proto)
+    client: socket.socket | None = None
+    server: socket.socket | None = None
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        client = _REAL_SOCKET(family, type, proto)
+        _REAL_CONNECT(client, listener.getsockname())
+        raw_listener = cast("_RawAcceptSocket", listener)
+        descriptor, _ = raw_listener._accept()
+        server = _REAL_SOCKET(family, type, proto, fileno=descriptor)
+    except BaseException:
+        if client is not None:
+            client.close()
+        if server is not None:
+            server.close()
+        raise
+    else:
+        return client, server
+    finally:
+        listener.close()
+
+
+if os.name == "nt":
+    setattr(  # noqa: B010  # platform stub rejects the Windows-only replacement
+        socket,
+        "socketpair",
+        _windows_loopback_socketpair,
+    )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Permit Windows loopback IPC while preserving the global network block."""
+    if os.name != "nt" or not item.config.getoption("disable_socket"):
+        return
+    if (
+        item.config.getoption("force_enable_socket")
+        or item.get_closest_marker("enable_socket")
+        or "socket_enabled" in getattr(item, "fixturenames", ())
+    ):
+        return
+    setattr(  # noqa: B010  # platform stub rejects the test-only replacement
+        socket,
+        "socket",
+        _WindowsLoopbackSocket,
+    )
+
+
+def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
+    """Cap Windows auto workers to avoid process and loopback-port saturation."""
+    del config
+    if os.name != "nt":
+        return None
+    return min(_WINDOWS_XDIST_MAX_WORKERS, os.cpu_count() or 1)
 
 
 def _self_manages_update_check(request: pytest.FixtureRequest) -> bool:
@@ -21,15 +286,69 @@ def _self_manages_update_check(request: pytest.FixtureRequest) -> bool:
     return request.node.get_closest_marker(_UPDATE_CHECK_SELF_MANAGED_MARK) is not None
 
 
+@contextlib.contextmanager
+def _isolated_model_cache_warmup(cache_root: Path) -> Generator[None, None, None]:
+    """Warm model caches without consulting user configuration or credentials."""
+    from deepagents_code import config, model_config
+
+    config_dir = cache_root / ".deepagents"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path_patches = pytest.MonkeyPatch()
+    path_patches.setattr(model_config, "DEFAULT_CONFIG_DIR", config_dir)
+    path_patches.setattr(
+        model_config, "DEFAULT_CONFIG_PATH", config_dir / "config.toml"
+    )
+    path_patches.setattr(model_config, "DEFAULT_STATE_DIR", config_dir / ".state")
+    path_patches.setattr(config, "_GLOBAL_DOTENV_PATH", config_dir / ".env")
+
+    discovery_var = "DEEPAGENTS_CODE_OLLAMA_DISCOVERY"
+    original_discovery = os.environ.get(discovery_var)
+    os.environ[discovery_var] = "0"
+    model_config.clear_caches()
+    try:
+        with contextlib.suppress(Exception):
+            model_config.get_available_models()
+            model_config.get_model_profiles()
+        _clear_path_dependent_model_caches()
+        yield
+    finally:
+        try:
+            model_config.clear_caches()
+        finally:
+            try:
+                path_patches.undo()
+            finally:
+                try:
+                    model_config.clear_caches()
+                finally:
+                    if original_discovery is None:
+                        os.environ.pop(discovery_var, None)
+                    else:
+                        os.environ[discovery_var] = original_discovery
+
+
+def _clear_path_dependent_model_caches() -> None:
+    """Discard config-derived results while retaining warmed provider metadata."""
+    from deepagents_code import model_config
+
+    model_config._available_models_cache = None
+    model_config._default_config_cache = None
+    model_config._profiles_cache = None
+    model_config._profiles_override_cache = None
+    model_config.invalidate_thread_config_cache()
+
+
 @pytest.fixture(autouse=True, scope="session")
-def _warm_model_caches() -> Generator[None, None, None]:
+def _warm_model_caches(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Generator[None, None, None]:
     """Pre-populate model-config caches once per xdist worker.
 
     Tests like the model-selector UI tests call `get_available_models()` and
-    `get_model_profiles()` during widget init.  Without a warm cache the first
-    invocation in each worker process pays ~800-1200 ms of disk I/O to discover
-    provider profiles via `importlib.util`.  Paying that cost once per session
-    instead of once per test shaves significant time off the overall run.
+    `get_model_profiles()` during widget init. Without warm provider metadata,
+    the first invocation in each worker process pays ~800-1200 ms of disk I/O
+    via `importlib.util`. Config-derived result caches are discarded before
+    each test so a patched config path is always read by that test.
 
     Keep Ollama discovery disabled so ordinary UI tests do not probe a local
     daemon. Tests that cover discovery delete the override before calling it.
@@ -37,24 +356,33 @@ def _warm_model_caches() -> Generator[None, None, None]:
     Tests that explicitly need a clean cache (e.g. `test_model_config.py`) use
     their own function-scoped `clear_caches()` fixture which overrides this.
     """
-    discovery_var = "DEEPAGENTS_CODE_OLLAMA_DISCOVERY"
-    original = os.environ.get(discovery_var)
-    os.environ[discovery_var] = "0"
-    try:
-        with contextlib.suppress(Exception):
-            from deepagents_code.model_config import (
-                get_available_models,
-                get_model_profiles,
-            )
+    with _isolated_model_cache_warmup(tmp_path_factory.mktemp("model-cache")):
+        yield
 
-            get_available_models()
-            get_model_profiles()
+
+@pytest.fixture(autouse=True)
+def _reset_path_dependent_model_caches() -> Generator[None, None, None]:
+    """Prevent a prior test's config path from affecting the next test."""
+    _clear_path_dependent_model_caches()
+    try:
         yield
     finally:
-        if original is None:
-            os.environ.pop(discovery_var, None)
-        else:
-            os.environ[discovery_var] = original
+        _clear_path_dependent_model_caches()
+
+
+@pytest.fixture
+def windows_loopback_socket_type() -> type[socket.socket]:
+    """Expose the guarded socket class to direct harness tests."""
+    return _WindowsLoopbackSocket
+
+
+@pytest.fixture
+def isolated_model_cache_warmup() -> Callable[
+    [Path],
+    AbstractContextManager[None],
+]:
+    """Expose isolated cache warming to direct harness tests."""
+    return _isolated_model_cache_warmup
 
 
 @pytest.fixture(autouse=True)

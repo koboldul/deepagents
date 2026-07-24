@@ -992,7 +992,7 @@ def test_plugin_mcp_config_namespaces_and_substitutes(
     assert str(plugin.root) in server["command"]
     assert server["command"].endswith("/bin/docs")
     assert str(plugin.data_dir) in server["args"]
-    assert server["cwd"].endswith("/server")
+    assert server["cwd"].endswith(str(Path("server")))
     assert server["env"]["CLAUDE_PLUGIN_ROOT"] == str(plugin.root)
 
 

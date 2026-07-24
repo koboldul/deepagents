@@ -11,6 +11,7 @@ import ast
 import importlib.util
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from importlib.metadata import (
@@ -20,14 +21,16 @@ from importlib.metadata import (
 )
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlparse
-from urllib.request import url2pathname
+from urllib.parse import unquote, urlparse
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 logger = logging.getLogger(__name__)
+
+_WINDOWS_DRIVE_URI_PREFIX_LENGTH = 3
+"""Length of a Windows drive-letter path prefix in `file:` URIs."""
 
 DistributionMetadataStatus = Literal["resolved", "not_installed", "error"]
 """Outcome of a distribution version lookup.
@@ -59,21 +62,17 @@ def _editable_sdk_source_root() -> Path | None:
         if not isinstance(url, str):
             logger.debug("Ignoring editable deepagents metadata without a source URL")
             return None
-        parsed = urlparse(url)
-        if parsed.scheme != "file":
+        path = _file_uri_to_path(url)
+        if path is None:
             logger.debug("Ignoring editable deepagents metadata with non-file URL")
             return None
-        path = url2pathname(parsed.path)
-        if parsed.netloc and parsed.netloc != "localhost":
-            path = f"//{parsed.netloc}{path}"
         return Path(path)
     except (PackageNotFoundError, OSError, ValueError, TypeError):
         # `OSError` covers `FileNotFoundError`/`PermissionError`/etc. while
         # reading the metadata file; `ValueError` covers malformed JSON
         # (`json.JSONDecodeError`), bad encodings (`UnicodeDecodeError`), and an
         # invalid IPv6 host from `urlparse`; `TypeError` covers a non-text
-        # `read_text` payload. `url2pathname` is intentionally lenient and adds
-        # no new failure modes. This probe must never propagate, since callers
+        # `read_text` payload. This probe must never propagate, since callers
         # treat it as a best-effort refinement over the metadata version.
         return None
 
@@ -135,15 +134,14 @@ def _contract_home(path: Path) -> str:
     """
     text = str(path)
     try:
-        home = str(Path.home())
+        home = Path.home()
     except (OSError, RuntimeError):
         return text
-    if text == home:
-        return "~"
-    prefix = home if home.endswith("/") else f"{home}/"
-    if text.startswith(prefix):
-        return f"~/{text[len(prefix) :]}"
-    return text
+    try:
+        relative = path.relative_to(home)
+    except ValueError:
+        return text
+    return str(Path("~") / relative)
 
 
 @dataclass(frozen=True)
@@ -257,6 +255,34 @@ def _read_cli_source_version() -> str | None:
         logger.warning("Could not read deepagents-code source version", exc_info=True)
         return None
     return __version__ if isinstance(__version__, str) and __version__ else None
+
+
+def _file_uri_to_path(url: str) -> str | None:
+    """Convert a `file:` URI to a local path string.
+
+    Returns:
+        The decoded local path string, or `None` when `url` is not a
+            `file:` URI.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "file":
+        return None
+    path = unquote(parsed.path)
+    if os.name == "nt":
+        if parsed.netloc and parsed.netloc != "localhost":
+            unc_path = path.lstrip("/").replace("/", "\\")
+            return f"\\\\{parsed.netloc}\\{unc_path}"
+        if (
+            len(path) >= _WINDOWS_DRIVE_URI_PREFIX_LENGTH
+            and path[0] == "/"
+            and path[2] == ":"
+            and path[1].isalpha()
+        ):
+            path = path[1:]
+        return path.replace("/", "\\")
+    if parsed.netloc and parsed.netloc != "localhost":
+        return f"//{parsed.netloc}{path}"
+    return path
 
 
 def _cli_editable_info() -> tuple[bool, str | None]:

@@ -107,14 +107,12 @@ async def _connect() -> AsyncIterator[aiosqlite.Connection]:
 
     _patch_aiosqlite()
 
-    conn: aiosqlite.Connection | None = None
+    conn = _aiosqlite.connect(str(get_db_path()), timeout=30.0)
     try:
-        async with _aiosqlite.connect(str(get_db_path()), timeout=30.0) as opened:
-            conn = opened
+        async with conn as opened:
             yield opened
     finally:
-        if conn is not None:
-            await _drain_aiosqlite_worker(conn)
+        await _drain_aiosqlite_worker(conn)
 
 
 class ThreadInfo(TypedDict):
@@ -179,12 +177,8 @@ def format_timestamp(iso_timestamp: str | None) -> str:
         return ""
     try:
         dt = datetime.fromisoformat(iso_timestamp).astimezone()
-        return (
-            dt.strftime("%b %d, %-I:%M%p")
-            .lower()
-            .replace("am", "am")
-            .replace("pm", "pm")
-        )
+        hour = dt.hour % 12 or 12
+        return f"{dt:%b} {dt.day}, {hour}:{dt:%M}{dt:%p}".lower()
     except (ValueError, TypeError):
         logger.debug(
             "Failed to parse timestamp %r; displaying as blank",

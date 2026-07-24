@@ -209,7 +209,7 @@ class TestFormatToolDisplay:
         # Path under cwd should render as a relative path if it's shorter.
         abs_path = str(Path.cwd() / "subdir" / "file.py")
         result = format_tool_display("read_file", {"file_path": abs_path})
-        assert "subdir/file.py" in result
+        assert str(Path("subdir") / "file.py") in result
         # Full absolute path should not appear when relative form was chosen.
         assert abs_path not in result
 

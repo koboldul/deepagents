@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -3381,6 +3382,9 @@ class TestDroppedImagePaste:
         self, tmp_path
     ) -> None:
         """If slash mode stripped a dropped path, submission should recover it."""
+        if os.name == "nt":
+            pytest.skip("Slash-command path recovery is specific to POSIX paths")
+
         img_path = tmp_path / "recover.png"
         from PIL import Image
 

@@ -64,6 +64,11 @@ from deepagents_code._git import (
     read_git_branch_from_filesystem,
     read_git_branch_via_subprocess,
 )
+from deepagents_code._posix_shell import (
+    _PosixOwnerGuard,
+    _PosixOwnerRegistry,
+    _start_posix_shell_process,
+)
 from deepagents_code._session_stats import (
     SessionStats,
     SpinnerStatus,
@@ -113,6 +118,8 @@ from deepagents_code.tui.widgets.welcome import WelcomeBanner
 
 logger = logging.getLogger(__name__)
 _GRACEFUL_EXIT_WAIT_SECONDS = 2.0
+_SHELL_TERMINATE_TIMEOUT_SECONDS = 5.0
+_SHELL_PROCESS_GROUP_POLL_SECONDS = 0.05
 _monotonic = time.monotonic
 
 _DEFERRED_START_NOTICE = (
@@ -178,6 +185,85 @@ single thread imports it re-entrantly, but can trip CPython's per-module import
 deadlock detector when two threads cold-import overlapping modules.
 """
 
+
+def _posix_process_group_exists(process_group_id: int) -> bool:
+    """Return whether the dedicated shell process group still exists."""
+    killpg = getattr(os, "killpg", None)
+    if not callable(killpg):
+        return False
+    try:
+        killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+async def _wait_for_posix_process_group_exit(
+    process_group_id: int,
+    *,
+    wait_seconds: float,
+) -> bool:
+    """Wait a bounded interval for a POSIX shell process group to disappear.
+
+    Returns:
+        `True` when the group disappeared before the deadline.
+    """
+    deadline = _monotonic() + wait_seconds
+    while _posix_process_group_exists(process_group_id):
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(_SHELL_PROCESS_GROUP_POLL_SECONDS, remaining))
+    return True
+
+
+def _windows_job_has_processes(windows_job: _WindowsJobObject) -> bool:
+    """Return whether a completed Windows shell Job still owns descendants."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _BasicAccountingInformation(ctypes.Structure):
+        _fields_ = [
+            ("total_user_time", ctypes.c_longlong),
+            ("total_kernel_time", ctypes.c_longlong),
+            ("this_period_total_user_time", ctypes.c_longlong),
+            ("this_period_total_kernel_time", ctypes.c_longlong),
+            ("total_page_fault_count", wintypes.DWORD),
+            ("total_processes", wintypes.DWORD),
+            ("active_processes", wintypes.DWORD),
+            ("total_terminated_processes", wintypes.DWORD),
+        ]
+
+    handle = getattr(windows_job, "_handle", None)
+    if not isinstance(handle, int):
+        return True
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.QueryInformationJobObject.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+    accounting = _BasicAccountingInformation()
+    queried = kernel32.QueryInformationJobObject(
+        handle,
+        1,
+        ctypes.byref(accounting),
+        ctypes.sizeof(accounting),
+        None,
+    )
+    if not queried:
+        return True
+    return accounting.active_processes > 0
+
+
 _TOOL_GROUP_EXCLUSIONS = frozenset({"ask_user", "edit_file", "write_todos"})
 """Tools that stay expanded instead of collapsing into step summaries.
 
@@ -208,6 +294,9 @@ _MESSAGE_TOP_SPACER_ID = "message-top-spacer"
 
 _MESSAGE_BOTTOM_SPACER_ID = "message-bottom-spacer"
 """DOM id for the spacer representing source messages below the mounted window."""
+
+_QUOTED_PATH_MIN_LENGTH = 2
+"""Minimum length for a token containing matching quote characters."""
 
 _TIMESTAMP_FOOTER_EXCLUDED_TYPES: frozenset[MessageType] = frozenset(
     {MessageType.APP, MessageType.SUMMARIZATION}
@@ -261,10 +350,11 @@ def _warn_discarded_goal_channels(state_values: dict[str, Any]) -> list[str]:
     Returns:
         Names of channels whose persisted value was discarded as malformed.
     """
-    from deepagents_code.resume_state import (
-        coerce_goal_proposal_kind,
-        coerce_goal_status,
-    )
+    with _DEEPAGENTS_IMPORT_LOCK:
+        from deepagents_code.resume_state import (
+            coerce_goal_proposal_kind,
+            coerce_goal_status,
+        )
 
     discarded: list[str] = []
     for channel in (
@@ -601,6 +691,7 @@ if TYPE_CHECKING:
     )
     from deepagents_code.tui.widgets.restart_prompt import RestartChoice
     from deepagents_code.tui.widgets.update_progress import UpdateProgressScreen
+    from deepagents_code.update_check import _WindowsJobObject
 
 _LAUNCH_INIT_CONNECTION_TIMEOUT_SECONDS = 60.0
 """Upper bound on waiting for server readiness during onboarding model switch.
@@ -3242,6 +3333,21 @@ class DeepAgentsApp(App):
 
         self._shell_process: asyncio.subprocess.Process | None = None
         """Shell command process tracking for interruption (! commands)."""
+
+        self._shell_job: _WindowsJobObject | None = None
+        """Windows Job Object tracking descendants of the active shell command."""
+
+        self._owned_shell_jobs: list[_WindowsJobObject] = []
+        """Windows Jobs retained for successful commands with background work."""
+
+        self._shell_owner_guard: _PosixOwnerGuard | None = None
+        """POSIX watchdog owning descendants of the active shell command."""
+
+        self._owned_shell_owner_guards = _PosixOwnerRegistry()
+        """POSIX ownership retained for successful commands with background work."""
+
+        self._shell_shutdown_lock = asyncio.Lock()
+        """Serializes active and retained shell-process teardown."""
 
         self._shell_worker: Worker[None] | None = None
         """Active `!` shell-command worker, tracked for interruption."""
@@ -8910,15 +9016,35 @@ class DeepAgentsApp(App):
             CancelledError: If the command is interrupted by the user.
         """
         refresh_started = False
+        command_completed = False
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self._cwd,
-                start_new_session=(sys.platform != "win32"),
-            )
-            self._shell_process = proc
+            creationflags = 0
+            if sys.platform == "win32":
+                from deepagents_code.update_check import (
+                    _WINDOWS_CREATE_SUSPENDED,
+                )
+
+                creationflags = _WINDOWS_CREATE_SUSPENDED
+            if sys.platform == "win32":
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=self._cwd,
+                    creationflags=creationflags,
+                )
+                self._shell_process = proc
+                from deepagents_code.update_check import (
+                    _assign_windows_job_and_resume,
+                )
+
+                self._shell_job = await _assign_windows_job_and_resume(proc)
+            else:
+                proc, self._shell_owner_guard = await _start_posix_shell_process(
+                    command,
+                    cwd=self._cwd,
+                )
+                self._shell_process = proc
 
             try:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -8926,14 +9052,12 @@ class DeepAgentsApp(App):
                     timeout=60,
                 )
             except TimeoutError:
-                await self._kill_shell_process()
                 err_msg = "Command timed out (60s limit)"
                 await self._mount_message(ErrorMessage(err_msg))
                 if not incognito:
                     self._buffer_shell_for_model_context(command, err_msg, None)
                 return
             except asyncio.CancelledError:
-                await self._kill_shell_process()
                 if not incognito:
                     self._buffer_shell_for_model_context(
                         command,
@@ -8975,6 +9099,8 @@ class DeepAgentsApp(App):
             # Anchor to bottom so shell output stays visible
             with suppress(NoMatches, ScreenStackError):
                 self.query_one("#chat", VerticalScroll).anchor()
+            await self._retain_completed_shell_process_tree()
+            command_completed = True
 
         except OSError as e:
             logger.exception("Failed to execute shell command: %s", command)
@@ -8999,7 +9125,36 @@ class DeepAgentsApp(App):
                 )
             raise
         finally:
-            await self._cleanup_shell_task(refresh_git_branch=not refresh_started)
+            try:
+                if not command_completed:
+                    await self._kill_shell_process()
+            finally:
+                await self._cleanup_shell_task(
+                    refresh_git_branch=not refresh_started,
+                )
+
+    async def _retain_completed_shell_process_tree(self) -> None:
+        """Keep background descendants owned after their command root exits.
+
+        Windows Job containment is enforced. POSIX ownership is best-effort
+        because a descendant can deliberately escape its inherited process
+        group with `setsid()` or `setpgid()`.
+        """
+        if sys.platform == "win32":
+            shell_job = self._shell_job
+            self._shell_job = None
+            if shell_job is not None:
+                if _windows_job_has_processes(shell_job):
+                    self._owned_shell_jobs.append(shell_job)
+                else:
+                    shell_job.close()
+            return
+
+        owner_guard = self._shell_owner_guard
+        self._shell_owner_guard = None
+        if owner_guard is None:
+            return
+        await self._owned_shell_owner_guards.retain(owner_guard)
 
     def _buffer_shell_for_model_context(
         self, command: str, output: str, returncode: int | None
@@ -9091,9 +9246,17 @@ class DeepAgentsApp(App):
                 during cleanup. Successful shell runs can launch this earlier
                 so refresh overlaps with output rendering.
         """
-        was_interrupted = self._shell_process is not None and (
+        was_interrupted = (
             self._shell_worker is not None and self._shell_worker.is_cancelled
         )
+        shell_job = self._shell_job
+        self._shell_job = None
+        if shell_job is not None:
+            shell_job.close()
+        owner_guard = self._shell_owner_guard
+        self._shell_owner_guard = None
+        if owner_guard is not None:
+            await owner_guard.terminate()
         self._shell_process = None
         self._shell_running = False
         self._shell_worker = None
@@ -9123,45 +9286,123 @@ class DeepAgentsApp(App):
         """Terminate the running shell command process.
 
         On POSIX, sends SIGTERM to the entire process group (killing children).
-        On Windows, terminates only the root process. No-op if the process has
-        already exited. Waits up to 5s for clean shutdown, then escalates
-        to SIGKILL.
+        On Windows, always terminates the command's Job Object first, even when
+        the root already exited. Bounded `taskkill` is reserved for unavailable
+        or failed Job termination and for a root that survives the Job close.
+        POSIX cleanup uses the session-leader PID as the known process-group ID,
+        waits up to 5s for clean group shutdown, then escalates to SIGKILL while
+        the command is live. Retained cleanup instead addresses its specific
+        watchdog; portable process-group containment remains best-effort against
+        deliberate `setsid()`/`setpgid()` session escape. All root and watchdog
+        waits are bounded and safe to repeat.
         """
         proc = self._shell_process
-        if proc is None or proc.returncode is not None:
+        if proc is None:
+            return
+        self._shell_process = None
+
+        if sys.platform == "win32":
+            from deepagents_code.update_check import (
+                _terminate_windows_process_tree,
+            )
+
+            shell_job = self._shell_job
+            self._shell_job = None
+            await _terminate_windows_process_tree(proc, shell_job)
+            transport = getattr(proc, "_transport", None)
+            if transport is not None:
+                with suppress(Exception):
+                    transport.close()
             return
 
+        owner_guard = self._shell_owner_guard
+        self._shell_owner_guard = None
+        process_group_id = proc.pid
+        process_group_signaled = False
         try:
-            if sys.platform != "win32":
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            else:
-                proc.terminate()
+            os.killpg(process_group_id, signal.SIGTERM)
         except ProcessLookupError:
-            return
+            pass
         except OSError:
             logger.warning(
-                "Failed to terminate shell process (pid=%s)",
-                proc.pid,
+                "Failed to terminate shell process group (pgid=%s)",
+                process_group_id,
                 exc_info=True,
             )
-            return
+        else:
+            process_group_signaled = True
 
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except TimeoutError:
+        if process_group_signaled and not await _wait_for_posix_process_group_exit(
+            process_group_id,
+            wait_seconds=_SHELL_TERMINATE_TIMEOUT_SECONDS,
+        ):
             logger.warning(
-                "Shell process (pid=%s) did not exit after SIGTERM; sending SIGKILL",
-                proc.pid,
+                "Shell process group (pgid=%s) survived SIGTERM; sending SIGKILL",
+                process_group_id,
             )
             with suppress(ProcessLookupError, OSError):
-                if sys.platform != "win32":
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                else:
+                os.killpg(process_group_id, signal.SIGKILL)
+        elif not process_group_signaled and proc.returncode is None:
+            with suppress(OSError, ProcessLookupError):
+                proc.kill()
+
+        try:
+            await asyncio.wait_for(
+                proc.wait(),
+                timeout=_SHELL_TERMINATE_TIMEOUT_SECONDS,
+            )
+        except (OSError, ProcessLookupError, TimeoutError):
+            if proc.returncode is None:
+                with suppress(OSError, ProcessLookupError):
                     proc.kill()
-            with suppress(ProcessLookupError, OSError):
-                await proc.wait()
-        except (ProcessLookupError, OSError):
-            pass
+            with suppress(OSError, ProcessLookupError, TimeoutError):
+                await asyncio.wait_for(
+                    proc.wait(),
+                    timeout=_SHELL_TERMINATE_TIMEOUT_SECONDS,
+                )
+        finally:
+            try:
+                if owner_guard is not None:
+                    await owner_guard.terminate()
+            finally:
+                transport = getattr(proc, "_transport", None)
+                if transport is not None:
+                    with suppress(Exception):
+                        transport.close()
+
+    async def _terminate_owned_shell_processes(self) -> None:
+        """Terminate successful commands through retained ownership handles."""
+        windows_jobs = self._owned_shell_jobs
+        self._owned_shell_jobs = []
+
+        for windows_job in reversed(windows_jobs):
+            try:
+                terminated = await asyncio.to_thread(windows_job.terminate)
+            except Exception:
+                logger.warning(
+                    "Failed to terminate retained shell Job during shutdown",
+                    exc_info=True,
+                )
+            else:
+                if not terminated:
+                    logger.warning(
+                        "Retained shell Job did not report clean termination",
+                    )
+
+        try:
+            await self._owned_shell_owner_guards.close()
+        except Exception:
+            logger.warning(
+                "Failed to terminate retained POSIX shell watchdog during shutdown",
+                exc_info=True,
+            )
+
+    async def _shutdown_shell_processes(self) -> None:
+        """Terminate active and retained local shell process trees."""
+        async with self._shell_shutdown_lock:
+            if self._shell_process is not None:
+                await self._kill_shell_process()
+            await self._terminate_owned_shell_processes()
 
     async def _open_url_command(self, command: str, cmd: str) -> None:
         """Open a URL in the browser and display a clickable link.
@@ -9887,10 +10128,11 @@ class DeepAgentsApp(App):
         Returns:
             Payload with goal/rubric channels coerced to known types.
         """
-        from deepagents_code.resume_state import (
-            coerce_goal_proposal_kind,
-            coerce_goal_status,
-        )
+        with _DEEPAGENTS_IMPORT_LOCK:
+            from deepagents_code.resume_state import (
+                coerce_goal_proposal_kind,
+                coerce_goal_status,
+            )
 
         def _as_str(value: object) -> str | None:
             return value if isinstance(value, str) else None
@@ -11487,10 +11729,18 @@ class DeepAgentsApp(App):
     async def _set_rubric_from_file(self, path_arg: str) -> None:
         """Read a rubric file and set it as the sticky rubric."""
         try:
-            parts = shlex.split(path_arg)
+            parts = shlex.split(path_arg, posix=os.name != "nt")
         except ValueError as exc:
             await self._mount_message(ErrorMessage(f"Could not parse path: {exc}"))
             return
+        parts = [
+            part[1:-1]
+            if len(part) >= _QUOTED_PATH_MIN_LENGTH
+            and part[0] == part[-1]
+            and part[0] in {'"', "'"}
+            else part
+            for part in parts
+        ]
         if len(parts) != 1:
             await self._mount_message(AppMessage("Usage: /rubric file <path>"))
             return
@@ -13638,7 +13888,9 @@ class DeepAgentsApp(App):
             )
             return
         from deepagents_code.config import settings
-        from deepagents_code.resume_state import RUBRIC_RESULT_VALUES
+
+        with _DEEPAGENTS_IMPORT_LOCK:
+            from deepagents_code.resume_state import RUBRIC_RESULT_VALUES
         from deepagents_code.tui.textual_adapter import (
             RubricEvaluationEnd,
             execute_task_textual,
@@ -21956,11 +22208,14 @@ async def run_textual_app(
     try:
         await app.run_async()
     finally:
-        # Guarantee server cleanup regardless of how the app exits.
-        # Covers both the pre-started server_proc path and the deferred
-        # server_kwargs path (where the background worker sets _server_proc).
-        if app._server_proc is not None:
-            app._server_proc.stop()
+        try:
+            await app._shutdown_shell_processes()
+        finally:
+            # Guarantee server cleanup regardless of how the app exits.
+            # Covers both the pre-started server_proc path and the deferred
+            # server_kwargs path (where the background worker sets _server_proc).
+            if app._server_proc is not None:
+                app._server_proc.stop()
 
     return AppResult(
         return_code=app.return_code or 0,

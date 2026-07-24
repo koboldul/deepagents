@@ -1348,10 +1348,13 @@ def test_resolve_malformed_skills_dir_env_falls_back(monkeypatch, caplog) -> Non
     """An unresolvable skills-dir env path logs and falls back, never raising."""
     import logging
 
+    def _raise(_path: object) -> None:
+        msg = "unknown user"
+        raise RuntimeError(msg)
+
     opt = get_option("skills.extra_allowed_dirs")
     assert opt is not None
-    # `~nobodyuser_xyz` cannot resolve to a home directory; `expanduser` raises
-    # RuntimeError, which the resolver must catch.
+    monkeypatch.setattr("pathlib.Path.expanduser", _raise)
     monkeypatch.setenv(opt.env_var, "~nobodyuser_xyz/skills")
     with caplog.at_level(logging.WARNING, logger="deepagents_code.config_manifest"):
         value, source = resolve_scalar(opt, toml_data={})
@@ -1359,12 +1362,17 @@ def test_resolve_malformed_skills_dir_env_falls_back(monkeypatch, caplog) -> Non
     assert any("could not resolve" in r.getMessage() for r in caplog.records)
 
 
-def test_resolve_malformed_skills_dir_toml_falls_back(caplog) -> None:
+def test_resolve_malformed_skills_dir_toml_falls_back(monkeypatch, caplog) -> None:
     """An unresolvable skills-dir in config.toml logs and falls back."""
     import logging
 
+    def _raise(_path: object) -> None:
+        msg = "unknown user"
+        raise RuntimeError(msg)
+
     opt = get_option("skills.extra_allowed_dirs")
     assert opt is not None
+    monkeypatch.setattr("pathlib.Path.expanduser", _raise)
     with caplog.at_level(logging.WARNING, logger="deepagents_code.config_manifest"):
         value, source = resolve_scalar(
             opt,

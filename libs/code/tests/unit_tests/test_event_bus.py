@@ -148,7 +148,10 @@ class TestDefaultUnixSocketPath:
         assert path.parent.parent == Path(tempfile.gettempdir())
 
 
-@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="requires Unix sockets")
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(socket, "AF_UNIX"),
+    reason="requires a real Unix domain socket",
+)
 class TestUnixSocketEventSource:
     """Exercise the local socket source end-to-end."""
 

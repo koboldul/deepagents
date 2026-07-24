@@ -163,7 +163,12 @@ class UnixSocketEventSource:
 
         previous_umask = os.umask(0o077)
         try:
-            self._server = await asyncio.start_unix_server(
+            if os.name == "nt":
+                msg = "UnixSocketEventSource is not supported on Windows"
+                raise RuntimeError(msg)
+            from asyncio import start_unix_server
+
+            self._server = await start_unix_server(
                 self._handle_client,
                 path=str(self.path),
                 limit=_MAX_LINE_BYTES,

@@ -3,11 +3,7 @@
 from __future__ import annotations
 
 import locale
-import os
-import time
-from contextlib import contextmanager
 from datetime import datetime
-from typing import TYPE_CHECKING
 
 import pytest
 
@@ -16,27 +12,6 @@ from deepagents_code.formatting import (
     format_message_timestamp,
     uses_24_hour_clock,
 )
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-
-@contextmanager
-def _utc_timezone() -> Iterator[None]:
-    """Pin the process timezone to UTC for the duration of the block."""
-    previous_tz = os.environ.get("TZ")
-    os.environ["TZ"] = "UTC"
-    if hasattr(time, "tzset"):
-        time.tzset()
-    try:
-        yield
-    finally:
-        if previous_tz is None:
-            os.environ.pop("TZ", None)
-        else:
-            os.environ["TZ"] = previous_tz
-        if hasattr(time, "tzset"):
-            time.tzset()
 
 
 class TestFormatDuration:
@@ -118,18 +93,16 @@ class TestFormatMessageTimestamp:
         monkeypatch.setattr(
             "deepagents_code.formatting.uses_24_hour_clock", lambda: False
         )
-        with _utc_timezone():
-            # 2024-01-01 12:00:05 UTC — a fixed past date.
-            assert format_message_timestamp(1_704_110_405.0) == "Jan 1, 12:00:05 PM"
+        timestamp = datetime(2024, 1, 1, 12, 0, 5).astimezone().timestamp()
+        assert format_message_timestamp(timestamp) == "Jan 1, 12:00:05 PM"
 
     def test_24_hour_clock_drops_am_pm(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A 24-hour clock renders time without an AM/PM suffix."""
         monkeypatch.setattr(
             "deepagents_code.formatting.uses_24_hour_clock", lambda: True
         )
-        with _utc_timezone():
-            # 2024-01-01 13:00:05 UTC — a fixed past afternoon time.
-            assert format_message_timestamp(1_704_114_005.0) == "Jan 1, 13:00:05"
+        timestamp = datetime(2024, 1, 1, 13, 0, 5).astimezone().timestamp()
+        assert format_message_timestamp(timestamp) == "Jan 1, 13:00:05"
 
     def test_midnight_12_hour_renders_as_12_am(
         self, monkeypatch: pytest.MonkeyPatch
@@ -138,9 +111,8 @@ class TestFormatMessageTimestamp:
         monkeypatch.setattr(
             "deepagents_code.formatting.uses_24_hour_clock", lambda: False
         )
-        with _utc_timezone():
-            # 2024-01-01 00:00:05 UTC — exercises the `hour % 12 or 12` path.
-            assert format_message_timestamp(1_704_067_205.0) == "Jan 1, 12:00:05 AM"
+        timestamp = datetime(2024, 1, 1, 0, 0, 5).astimezone().timestamp()
+        assert format_message_timestamp(timestamp) == "Jan 1, 12:00:05 AM"
 
     def test_invalid_timestamp_returns_none(self) -> None:
         """An out-of-range timestamp degrades to `None` rather than raising."""

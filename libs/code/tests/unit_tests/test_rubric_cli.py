@@ -65,6 +65,7 @@ class TestResolveRubricText:
     ) -> None:
         # Exercises the `.expanduser()` call, otherwise uncovered.
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         (tmp_path / "rubric.md").write_text("tilde criteria", encoding="utf-8")
         assert _resolve_rubric_text("@~/rubric.md") == "tilde criteria"
 

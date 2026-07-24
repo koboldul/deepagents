@@ -203,6 +203,7 @@ langchain-vercel-sandbox = { path = "../partners/vercel", editable = true }
 
 [tool.ty.environment]
 python-version = "3.11"
+python-platform = "all"
 extra-paths = [
     "../deepagents",
     "../partners/daytona",
@@ -281,7 +282,7 @@ ignore-var-parameters = true
     "PLR6301",  # Method could be a function — test class organization
     "PLW0108",  # Lambda may be unnecessary — fine in test mocks
     "RUF001",   # Ambiguous characters — fine in test strings
-    "RUF076",   # Autouse fixtures enforce suite-wide test isolation
+    # "RUF076", # Not a valid ruff rule code
     "S",        # Security warnings — not applicable to tests
     "SLF",      # Private member access — tests need access to internals
 ]

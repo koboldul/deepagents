@@ -4783,7 +4783,7 @@ class TestCreateModelViaInitImportError:
             pytest.raises(
                 ModelConfigError,
                 match=(
-                    "Install with: uv tool install --reinstall -U "
+                    "Install with: uv --no-config tool install --reinstall -U "
                     f"deepagents-code=={__version__} "
                     "--with langchain-custom_provider --prerelease allow"
                 ),

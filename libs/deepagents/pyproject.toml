@@ -161,6 +161,7 @@ markers = [
 
 [tool.ty.environment]
 python-version = "3.11"
+python-platform = "all"
 
 [tool.ty.rules]
 # Most rules are enabled by default. Enable rules that are disabled by default:

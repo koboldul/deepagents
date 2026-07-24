@@ -840,8 +840,8 @@ async def test_update_slash_command_replaces_success_with_shadow_warning() -> No
         # The warning is mounted as an `ErrorMessage` (red), not a generic
         # `AppMessage`, so it visually stands apart from neutral status text.
         error_msgs = [str(m._content) for m in app.query(ErrorMessage)]
-        assert any("/opt/stale/bin/dcode" in m for m in error_msgs)
-        assert any("/home/user/.local/bin" in m for m in error_msgs)
+        assert any(str(shadow.shadowing_bin) in m for m in error_msgs)
+        assert any(str(shadow.upgraded_bin_dir) in m for m in error_msgs)
 
 
 async def test_update_slash_command_prerelease_unsupported_install_refuses() -> None:

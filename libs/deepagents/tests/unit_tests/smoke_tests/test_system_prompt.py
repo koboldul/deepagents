@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
@@ -142,7 +142,12 @@ def test_system_prompt_with_media_extra(snapshots_dir: Path, *, update_snapshots
     )
 
 
-def test_system_prompt_snapshot_with_routed_backend(snapshots_dir: Path, *, update_snapshots: bool) -> None:
+def test_system_prompt_snapshot_with_routed_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshots_dir: Path,
+    *,
+    update_snapshots: bool,
+) -> None:
     """Snapshot the materialized prompt for all route classifications (issue #3050).
 
     A `CompositeBackend` whose default is a `LocalShellBackend` renders a "Shell
@@ -162,6 +167,8 @@ def test_system_prompt_snapshot_with_routed_backend(snapshots_dir: Path, *, upda
     model = _smoke_model()
     route = FilesystemBackend(root_dir="/work/app", virtual_mode=True)
     legacy = FilesystemBackend(root_dir="/work/legacy", virtual_mode=False)
+    monkeypatch.setattr(route, "cwd", PurePosixPath("/work/app"))
+    monkeypatch.setattr(legacy, "cwd", PurePosixPath("/work/legacy"))
     backend = CompositeBackend(
         default=LocalShellBackend(root_dir=Path.cwd(), virtual_mode=True),
         routes={"/common/": route, "/legacy/": legacy, "/notes/": StateBackend()},
@@ -184,15 +191,12 @@ def test_system_prompt_snapshot_with_routed_backend(snapshots_dir: Path, *, upda
     system_messages = [m for m in messages if isinstance(m, SystemMessage)]
     assert len(system_messages) >= 1
 
-    text = _system_message_as_text(system_messages[0])
-    # `FilesystemBackend.cwd` resolves `root_dir` to an OS-native absolute path,
-    # so on Windows `/work/app` becomes e.g. `C:\work\app`. Redact it back to the
-    # canonical POSIX form recorded in the snapshot to keep the golden file
-    # portable (no-op on POSIX, where the resolved path already matches).
-    text = text.replace(str(route.cwd), "/work/app")
-
     snapshot_path = snapshots_dir / "system_prompt_with_routed_backend.md"
-    _assert_snapshot(snapshot_path, text, update_snapshots=update_snapshots)
+    _assert_snapshot(
+        snapshot_path,
+        _system_message_as_text(system_messages[0]),
+        update_snapshots=update_snapshots,
+    )
 
 
 def test_system_prompt_snapshot_with_sandbox_default(snapshots_dir: Path, *, update_snapshots: bool) -> None:

@@ -13,9 +13,32 @@ New to the package? Start with [`ARCHITECTURE.md`](./ARCHITECTURE.md) for a high
 
 This package uses [`uv`](https://docs.astral.sh/uv/) for environment and dependency management. Install it first if you haven't:
 
+macOS/Linux:
+
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+Windows PowerShell:
+
+```powershell
+winget install --id astral-sh.uv -e
+$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+uv tool install -U --prerelease allow deepagents-code
+uv tool update-shell
+$uvToolBin = (uv tool dir --bin).Trim()
+$env:Path = "$uvToolBin;$env:Path"
+dcode
+```
+
+The second command refreshes `uv` in the current PowerShell. `uv tool
+update-shell` updates future shells, while the tool-bin `PATH` prepend makes
+`dcode` available immediately in this one. Opening a new shell before running
+`uv tool install` also works. See the
+[official uv installation guide](https://docs.astral.sh/uv/getting-started/installation/)
+for trusted alternatives to `winget`.
+
+PowerShell and cmd are supported natively for installing and running Deep Agents Code. WSL remains optional, not required.
 
 Clone the monorepo and bootstrap the `code` package. This creates the virtualenv, installs test dependencies, and installs local git hooks (`pre-commit` + `commit-msg`) so the same checks can run before you push:
 
@@ -26,6 +49,16 @@ make bootstrap
 ```
 
 If you only want to sync dependencies without installing hooks, run `uv sync --group test` instead.
+
+To install the released tool from a checkout on Windows when `uv` is already
+installed, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+The equivalent direct install is
+`uv tool install -U --prerelease allow deepagents-code`.
 
 Run the TUI from `libs/code` in your local checkout:
 
@@ -127,7 +160,7 @@ The tail is fed by an always-on in-memory ring buffer (`_debug_buffer.install_lo
 
 A *local dev install* gives you a persistent `dcode-dev` command that launches your checkout directly. It lives in a dedicated editable venv under `~/.local/share/dcode-dev`, symlinked into `~/.local/bin/dcode-dev`. It can sit alongside a released `dcode` without interfering:
 
-- `dcode` / `deepagents-code` — the released tool, installed via `curl -LsSf https://langch.in/dcode | bash` (the install script).
+- `dcode` / `deepagents-code` — the released tool, installed via `curl -LsSf https://langch.in/dcode | bash` on macOS/Linux or `uv tool install -U --prerelease allow deepagents-code` on Windows after installing `uv` with Windows Package Manager.
 - `dcode-dev` — your local checkout.
 
 That lets you compare released behavior against local, and fall back to a known-good build if your checkout breaks. Either way, the dedicated venv keeps the dev binary's dependency experiments out of the repo's locked `uv sync` environment.

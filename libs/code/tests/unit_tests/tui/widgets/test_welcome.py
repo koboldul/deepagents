@@ -1,5 +1,6 @@
 """Unit tests for the welcome banner widget."""
 
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -119,7 +120,11 @@ def _make_banner(
     Returns:
         A `WelcomeBanner` instance ready for testing.
     """
-    resolved_env: dict[str, str] = {}
+    resolved_env = {
+        key: value
+        for key in ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH")
+        if (value := os.environ.get(key)) is not None
+    }
     if show_model:
         resolved_env[SPLASH_SHOW_MODEL] = "1"
     if show_cwd:
@@ -156,7 +161,8 @@ class TestHomePrefixed:
 
     def test_leaves_non_home_path_unchanged(self) -> None:
         """Paths outside the home directory are returned as-is."""
-        assert _home_prefixed("/tmp/work") == "/tmp/work"
+        path = str(Path("/tmp/work"))
+        assert _home_prefixed(path) == path
 
     def test_exact_home_collapses_to_bare_tilde(self) -> None:
         """The home directory itself renders as `~`, not `~/.`."""
@@ -168,7 +174,8 @@ class TestHomePrefixed:
             "deepagents_code.tui.widgets.welcome.Path.home",
             side_effect=RuntimeError("no home"),
         ):
-            assert _home_prefixed("/srv/app") == "/srv/app"
+            path = str(Path("/srv/app"))
+            assert _home_prefixed(path) == path
 
     def test_falls_back_to_absolute_path_on_value_error(self) -> None:
         """A `ValueError` from path comparison (e.g. embedded NUL) is absorbed."""
@@ -176,7 +183,8 @@ class TestHomePrefixed:
             "deepagents_code.tui.widgets.welcome.Path.home",
             side_effect=ValueError("embedded null byte"),
         ):
-            assert _home_prefixed("/srv/app") == "/srv/app"
+            path = str(Path("/srv/app"))
+            assert _home_prefixed(path) == path
 
 
 class TestLangsmithLinkHelpers:
@@ -567,9 +575,10 @@ class TestDirectoryLine:
 
     def test_shows_directory_when_flag_set(self) -> None:
         """The directory row renders the working directory when enabled."""
-        plain = _make_banner(cwd="/work/project", show_cwd=True)._build_banner().plain
+        cwd = str(Path("/work/project"))
+        plain = _make_banner(cwd=cwd, show_cwd=True)._build_banner().plain
         assert "directory:" in plain
-        assert "/work/project" in plain
+        assert cwd in plain
 
     def test_home_prefixed(self) -> None:
         """The directory is home-prefixed with `~`."""
@@ -584,13 +593,15 @@ class TestDirectoryLine:
 
     def test_update_cwd_refreshes_when_shown(self) -> None:
         """`update_cwd` re-renders (calls `update`) the directory row when enabled."""
-        widget = _make_banner(cwd="/work/project", show_cwd=True)
+        original = str(Path("/work/project"))
+        updated = str(Path("/work/other"))
+        widget = _make_banner(cwd=original, show_cwd=True)
         with patch.object(widget, "update") as mock_update:
-            widget.update_cwd("/work/other")
+            widget.update_cwd(updated)
             mock_update.assert_called_once()
         plain = widget._build_banner().plain
-        assert "/work/other" in plain
-        assert "/work/project" not in plain
+        assert updated in plain
+        assert original not in plain
 
     def test_update_cwd_does_not_render_when_hidden(self) -> None:
         """`update_cwd` tracks the path but skips re-render when the row is off."""

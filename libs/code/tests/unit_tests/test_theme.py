@@ -1259,12 +1259,13 @@ class TestSaveThemePreference:
         # Point to a directory that doesn't exist and can't be created
         config = tmp_path / "readonly" / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
-        # Make parent read-only so mkdir fails
-        (tmp_path / "readonly").mkdir()
-        (tmp_path / "readonly").chmod(0o444)
+
+        def _deny_mkdir(*_args: object, **_kwargs: object) -> None:
+            msg = "read-only"
+            raise PermissionError(msg)
+
+        monkeypatch.setattr("pathlib.Path.mkdir", _deny_mkdir)
         result = save_theme_preference("langchain")
-        # Restore permissions for cleanup
-        (tmp_path / "readonly").chmod(0o755)
         assert result is False
 
 
@@ -1905,12 +1906,13 @@ class TestSaveTerminalThemeMapping:
 
         config = tmp_path / "readonly" / "config.toml"
         monkeypatch.setattr("deepagents_code.model_config.DEFAULT_CONFIG_PATH", config)
-        (tmp_path / "readonly").mkdir()
-        (tmp_path / "readonly").chmod(0o444)
-        try:
-            result = save_terminal_theme_mapping("Apple_Terminal", "langchain")
-        finally:
-            (tmp_path / "readonly").chmod(0o755)
+
+        def _deny_mkdir(*_args: object, **_kwargs: object) -> None:
+            msg = "read-only"
+            raise PermissionError(msg)
+
+        monkeypatch.setattr("pathlib.Path.mkdir", _deny_mkdir)
+        result = save_terminal_theme_mapping("Apple_Terminal", "langchain")
         assert result is False
 
     def test_returns_false_on_atomic_write_failure(

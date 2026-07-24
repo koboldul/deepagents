@@ -1,9 +1,11 @@
 """Unit tests for input parsing utilities."""
 
 from pathlib import Path
+from typing import NoReturn, cast
 
 import pytest
 
+import deepagents_code.input as input_module
 from deepagents_code.input import (
     extract_leading_pasted_file_path,
     normalize_pasted_path,
@@ -12,6 +14,94 @@ from deepagents_code.input import (
     parse_pasted_path_payload,
     parse_single_pasted_file_path,
 )
+
+UNSAFE_WINDOWS_NAMESPACE_INPUTS = (
+    r"\\?\GLOBALROOT\??\UNC\server\share\image.png",
+    r"\\?\GLOBALROOT\GLOBAL??\UNC\server\share\image.png",
+    r"\\?\GLOBAL??\UNC\server\share\image.png",
+    r"\\?\Device\Mup\server\share\image.png",
+    r"\\?\DosDevices\UNC\server\share\image.png",
+    r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\image.png",
+    r"\\?\PIPE\deepagents",
+    r"\\?\C:drive-relative\image.png",
+    r"\\.\C:\Users\Alice\image.png",
+    r"\\.\UNC\server\share\image.png",
+    r"\\.\GLOBALROOT\Device\Mup\server\share\image.png",
+    r"\GLOBAL??\UNC\server\share\image.png",
+    r"\GLOBALROOT\??\UNC\server\share\image.png",
+    r"\??\GLOBALROOT\??\UNC\server\share\image.png",
+    r"\DosDevices\UNC\server\share\image.png",
+)
+
+REMOTE_WINDOWS_PATH_INPUTS = (
+    r"\\server\share\image.png",
+    r"//server/share/image.png",
+    r"\/server\share/image.png",
+    r"/\server/share\image.png",
+    r"\\?\uNc\server\share\image.png",
+    r"//./UNC/server/share/image.png",
+    r"\\??\UNC\server\share\image.png",
+    r"\??\UNC\server\share\image.png",
+    r"\\?\GLOBALROOT\Device\Mup\server\share\image.png",
+    r"\Device\LanmanRedirector\server\share\image.png",
+    r"//?/globalroot/device/WebDavRedirector/server/share/image.png",
+    *UNSAFE_WINDOWS_NAMESPACE_INPUTS,
+    "file://files.example/share/image.png",
+    "FiLe://192.0.2.10/share/image.png",
+    "file://[2001:db8::1]/share/image.png",
+    "file://%66iles.example/share/image.png",
+    "file://%5B2001%3Adb8%3A%3A1%5D/share/image.png",
+    "file:////server/share/image.png",
+    "file:///%2Fserver/share/image.png",
+    "file://localhost/share/image.png",
+    r"C:\local\image.png //server/share/image.png",
+    r'"\\server\share\my image.png" describe this image',
+    "'FiLe://server/share/my%20image.png' describe this image",
+    r"<\\server\share\image.png> describe this image",
+)
+
+LOCAL_WINDOWS_PATH_INPUTS = (
+    (r"C:\Users\Alice\My Pictures\image.png", r"C:\Users\Alice\My Pictures\image.png"),
+    (r"\\?\C:\Users\Alice\image.png", r"\\?\C:\Users\Alice\image.png"),
+    ("file:///C:/Users/Alice/image%20one.png", "C:/Users/Alice/image one.png"),
+    ("FiLe://C:/Users/Alice/image%20one.png", "C:/Users/Alice/image one.png"),
+    ("notes/image.png", "notes/image.png"),
+)
+
+
+def _fail_path_access(*_args: object, **_kwargs: object) -> NoReturn:
+    """Fail when rejected input reaches path construction or filesystem access."""
+    msg = "remote Windows input reached path construction or filesystem access"
+    raise AssertionError(msg)
+
+
+class _RemotePathProbeTrap:
+    """Path-like object whose filesystem attributes fail when accessed."""
+
+    def __init__(self, value: str) -> None:
+        """Store the remote path text without constructing a `Path`."""
+        self.value = value
+
+    def __str__(self) -> str:
+        """Return the remote path text used by the string-only guard."""
+        return self.value
+
+    def __getattr__(self, name: str) -> NoReturn:
+        """Fail if a guarded helper reaches any path operation."""
+        return _fail_path_access(name)
+
+
+def _block_path_access(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every path construction and filesystem probe fail immediately."""
+    for helper_name in (
+        "_resolve_existing_pasted_path",
+        "_resolve_with_unicode_space_variants",
+        "_safe_exists",
+        "_safe_is_dir",
+        "_safe_is_file",
+    ):
+        monkeypatch.setattr(input_module, helper_name, _fail_path_access)
+    monkeypatch.setattr(input_module, "Path", _fail_path_access)
 
 
 def test_parse_file_mentions_with_chinese_sentence(
@@ -250,6 +340,100 @@ def test_parse_file_mentions_handles_bad_tilde_user(
     mock_console.print.assert_called_once()
     call_arg = mock_console.print.call_args[0][0]
     assert "nonexistentuser12345" in call_arg
+
+
+@pytest.mark.parametrize("payload", REMOTE_WINDOWS_PATH_INPUTS)
+def test_remote_windows_paste_inputs_never_touch_paths(
+    payload: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every pasted-path entrypoint must reject remote input before path access."""
+    _block_path_access(monkeypatch)
+
+    assert parse_pasted_file_paths(payload) == []
+    assert parse_pasted_path_payload(payload) is None
+    assert parse_pasted_path_payload(payload, allow_leading_path=True) is None
+    assert parse_single_pasted_file_path(payload) is None
+    assert extract_leading_pasted_file_path(payload) is None
+    assert normalize_pasted_path(payload) is None
+
+
+@pytest.mark.parametrize("payload", UNSAFE_WINDOWS_NAMESPACE_INPUTS)
+def test_windows_namespace_bypasses_fail_closed_without_filesystem_probes(
+    payload: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Object-manager and unproven extended namespaces fail before path access."""
+    _block_path_access(monkeypatch)
+
+    assert input_module._is_remote_windows_path(payload) is True
+    assert parse_pasted_file_paths(payload) == []
+    assert parse_pasted_path_payload(payload) is None
+    assert parse_pasted_path_payload(payload, allow_leading_path=True) is None
+    assert parse_single_pasted_file_path(payload) is None
+    assert extract_leading_pasted_file_path(payload) is None
+    assert normalize_pasted_path(payload) is None
+
+
+@pytest.mark.parametrize(
+    "remote_path",
+    [
+        r"\\server\share\file.txt",
+        r"//server/share/file.txt",
+        r"\\?\UNC\server\share\file.txt",
+        r"\\?\GLOBALROOT\??\UNC\server\share\file.txt",
+        r"\\.\C:\Users\Alice\file.txt",
+        r"\Device\Mup\server\share\file.txt",
+        "file://files.example/share/file.txt",
+        "file://%66iles.example/share/file.txt",
+        "file://[2001:db8::1]/share/file.txt",
+    ],
+)
+def test_remote_windows_file_mentions_never_touch_paths(
+    remote_path: str, monkeypatch: pytest.MonkeyPatch, mocker
+) -> None:
+    """Remote `@file` mentions must be rejected before path construction."""
+    mock_console = mocker.patch("deepagents_code.input.console")
+    _block_path_access(monkeypatch)
+    text = f"inspect @{remote_path}"
+
+    unchanged, files = parse_file_mentions(text)
+
+    assert unchanged == text
+    assert files == []
+    mock_console.print.assert_called_once()
+
+
+def test_remote_windows_path_probe_helpers_never_probe() -> None:
+    """Defense-in-depth probe helpers must reject an existing remote `Path`."""
+    remote_path = cast("Path", _RemotePathProbeTrap(r"\\server\share\file.txt"))
+
+    assert input_module._safe_exists(remote_path) is False
+    assert input_module._safe_is_file(remote_path) is False
+    assert input_module._safe_is_dir(remote_path) is False
+    assert input_module._resolve_existing_pasted_path(remote_path) is None
+    assert input_module._resolve_with_unicode_space_variants(remote_path) is None
+
+
+@pytest.mark.parametrize(("payload", "expected"), LOCAL_WINDOWS_PATH_INPUTS)
+def test_normalize_pasted_path_allows_local_windows_inputs(
+    payload: str,
+    expected: str,
+) -> None:
+    """Local drives, drive file URIs, and relative paths must remain accepted."""
+    assert normalize_pasted_path(payload) == Path(expected)
+
+
+def test_remote_unc_and_file_authorities_are_unsupported_on_every_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remote paths are rejected before probing, independent of host platform."""
+    _block_path_access(monkeypatch)
+
+    for payload in (
+        r"\\server\share\file.txt",
+        "file://server/share/file.txt",
+    ):
+        assert input_module._is_remote_windows_path(payload) is True
+        assert normalize_pasted_path(payload) is None
 
 
 def test_parse_pasted_file_paths_with_quoted_paths(tmp_path: Path) -> None:

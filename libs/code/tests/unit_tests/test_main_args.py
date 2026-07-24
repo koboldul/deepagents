@@ -1569,6 +1569,7 @@ class TestThreadsListCwdFilter:
         project = tmp_path / "repo"
         project.mkdir()
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
 
         mock_list = self._run_threads_list("--cwd", "~/repo")
 
@@ -1730,7 +1731,7 @@ class TestRecentAgentIsValid:
         """Existing `~/.deepagents/<name>/` resolves to True."""
         from deepagents_code.main import _recent_agent_is_valid
 
-        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
         (tmp_path / ".deepagents" / "coder").mkdir(parents=True)
 
         assert _recent_agent_is_valid("coder") is True
@@ -1739,7 +1740,7 @@ class TestRecentAgentIsValid:
         """Missing dir → False, no exception."""
         from deepagents_code.main import _recent_agent_is_valid
 
-        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
 
         assert _recent_agent_is_valid("ghost") is False
 
@@ -2265,7 +2266,8 @@ class TestInstallExtraSubcommand:
         assert code == 0
         text = self._printed_text(console_mock)
         assert "Installed extra 'quickjs'" in text
-        assert "tail -f /tmp/deepagents-install.log" in text
+        assert str(Path("/tmp/deepagents-install.log")) in text
+        assert ("Get-Content -Wait" if sys.platform == "win32" else "tail -f") in text
 
     def test_failure_renders_log_path_and_manual_command(self) -> None:
         """A failed install surfaces both the log path and manual script command."""
@@ -2277,7 +2279,7 @@ class TestInstallExtraSubcommand:
         text = self._printed_text(console_mock)
         assert "Install failed" in text
         assert "resolver: conflict" in text
-        assert "/tmp/deepagents-install.log" in text
+        assert str(Path("/tmp/deepagents-install.log")) in text
         assert "curl -LsSf https://langch.in/dcode" in text
         assert "DEEPAGENTS_CODE_EXTRAS=quickjs bash" in text
         assert "quickjs" in text
@@ -2332,7 +2334,7 @@ class TestInstallExtraSubcommand:
         text = self._printed_text(console_mock)
         assert "RuntimeError" in text
         assert "disk full" in text
-        assert "/tmp/deepagents-install.log" in text
+        assert str(Path("/tmp/deepagents-install.log")) in text
         assert "curl -LsSf https://langch.in/dcode" in text
         assert "DEEPAGENTS_CODE_EXTRAS=quickjs bash" in text
         assert "quickjs" in text
@@ -2435,7 +2437,8 @@ class TestInstallPackageSubcommand:
         perform_mock.assert_awaited_once()
         text = self._printed_text(console_mock)
         assert "Installed package 'langchain-custom'" in text
-        assert "tail -f /tmp/deepagents-install.log" in text
+        assert str(Path("/tmp/deepagents-install.log")) in text
+        assert ("Get-Content -Wait" if sys.platform == "win32" else "tail -f") in text
 
     def test_package_non_interactive_without_yes_refuses(self) -> None:
         """Non-TTY stdin + no --yes must exit 2 without installing."""
@@ -2487,7 +2490,7 @@ class TestInstallPackageSubcommand:
         text = self._printed_text(console_mock)
         assert "Install failed" in text
         assert "resolver: conflict" in text
-        assert "/tmp/deepagents-install.log" in text
+        assert str(Path("/tmp/deepagents-install.log")) in text
         # The raw `uv tool` command is never surfaced to the user.
         assert "uv tool" not in text
 

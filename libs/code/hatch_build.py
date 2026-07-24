@@ -49,7 +49,7 @@ class CustomBuildHook(BuildHookInterface):
         )
         # `_TARGET` is gitignored, so hatchling excludes it from the build by
         # default; registering it as an artifact force-includes it in the dist.
-        build_data.setdefault("artifacts", []).append(str(_TARGET))
+        build_data.setdefault("artifacts", []).append(_TARGET.as_posix())
 
     def finalize(
         self,

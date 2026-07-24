@@ -80,7 +80,7 @@ async def test_update_progress_screen_copies_log_path_only_in_details(
 
 async def test_update_progress_screen_renders_markup_path_plainly(tmp_path) -> None:
     """Dynamic command and log path text must not be parsed as Rich markup."""
-    log_path = tmp_path / "[/red]" / "update.log"
+    log_path = tmp_path / "[red]" / "update.log"
     screen = UpdateProgressScreen(
         latest="2.0.0",
         command="echo [/red]",
@@ -97,7 +97,7 @@ async def test_update_progress_screen_renders_markup_path_plainly(tmp_path) -> N
         command = screen.query(Static).filter(".up-details").first()
         log = screen.query(Static).filter(".up-log").first()
         assert "[/red]" in str(command.render())
-        assert "[/red]" in str(log.render())
+        assert "[red]" in str(log.render())
 
 
 async def test_update_progress_screen_close_waits_until_done(tmp_path) -> None:

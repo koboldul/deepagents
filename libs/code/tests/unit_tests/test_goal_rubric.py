@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.backends.local_shell import LocalShellBackend
 from deepagents.backends.protocol import FileInfo, LsResult
 from langchain.agents import create_agent
@@ -1001,6 +1002,43 @@ class TestCreateGoalCriteriaAgent:
             for item in kwargs["middleware"]
         )
 
+    def test_virtual_backend_normalizes_direct_windows_repository_root(self) -> None:
+        model = MagicMock()
+        backend = MagicMock()
+        backend.virtual_mode = True
+        filesystem = MagicMock()
+        graph = MagicMock()
+        graph.with_config.return_value = "configured-graph"
+
+        with (
+            patch(
+                "deepagents.middleware.FilesystemMiddleware",
+                return_value=filesystem,
+            ),
+            patch("langchain.agents.create_agent", return_value=graph) as create_agent,
+            patch(
+                "langchain.agents.middleware.HumanInTheLoopMiddleware",
+                side_effect=lambda **kwargs: SimpleNamespace(**kwargs),
+            ),
+        ):
+            result = create_goal_criteria_agent(
+                model=model,
+                repository_backend=backend,
+                repository_root=r"C:\Users\Owner\Repository",
+                context_tools=[],
+            )
+
+        assert result == "configured-graph"
+        kwargs = create_agent.call_args.kwargs
+        assert "repository root `/`" in kwargs["system_prompt"]
+        assert "C:\\" not in kwargs["system_prompt"]
+        budget = next(
+            item
+            for item in kwargs["middleware"]
+            if isinstance(item, _RepositoryToolBudgetMiddleware)
+        )
+        assert budget._root == "/"
+
     @staticmethod
     def _async_hitl(*, auto_mode_enabled: bool = True) -> AsyncApprovalHITLMiddleware:
         from deepagents_code.agent import AsyncApprovalHITLMiddleware
@@ -1365,6 +1403,120 @@ class TestRepositoryPathGuards:
         backend.ls.return_value = LsResult(entries=[])
         backend.als = AsyncMock(return_value=LsResult(entries=[]))
         return backend
+
+    @pytest.mark.parametrize(
+        ("path", "case_variant"),
+        [
+            (r"c:\Users\Owner\Repository\README.md", "drive"),
+            (r"C:\users\owner\repository\README.md", "directory"),
+        ],
+    )
+    def test_windows_containment_accepts_case_variants(
+        self, path: str, case_variant: str
+    ) -> None:
+        """Windows drive and directory case do not change containment."""
+        middleware = _RepositoryToolBudgetMiddleware(
+            self._backend(),
+            root=r"C:\Users\Owner\Repository",
+        )
+
+        assert middleware._safe_path(path), case_variant
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            r"C:\Users\Owner\Repository-escape\secret.txt",
+            r"D:\Users\Owner\Repository\secret.txt",
+            r"C:\Users\Owner\Repository\..\secret.txt",
+        ],
+    )
+    def test_windows_containment_rejects_escapes(self, path: str) -> None:
+        """Prefix, drive, and traversal escapes remain outside the repository."""
+        middleware = _RepositoryToolBudgetMiddleware(
+            self._backend(),
+            root=r"C:\Users\Owner\Repository",
+        )
+
+        assert not middleware._safe_path(path)
+
+    def test_windows_entry_size_matches_case_insensitively(self) -> None:
+        """Preflight metadata keeps Windows containment's case semantics."""
+        middleware = _RepositoryToolBudgetMiddleware(
+            self._backend(),
+            root=r"C:\Users\Owner\Repository",
+        )
+        entries: list[FileInfo] = [
+            {
+                "path": r"C:\Users\Owner\Repository\README.md",
+                "is_dir": False,
+                "size": 42,
+            }
+        ]
+
+        assert (
+            middleware._entry_size(
+                entries,
+                r"c:\users\owner\repository\readme.md",
+            )
+            == 42
+        )
+
+    def test_virtual_windows_root_forwards_only_posix_paths(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A host drive root is translated before the virtual backend sees it."""
+        repository = tmp_path / "repository"
+        repository.mkdir()
+        (repository / "README.md").write_text("criteria context", encoding="utf-8")
+        backend = FilesystemBackend(root_dir=repository, virtual_mode=True)
+        middleware = _RepositoryToolBudgetMiddleware(
+            backend,
+            root=r"C:\Users\Owner\Repository",
+        )
+        handler = MagicMock(
+            return_value=ToolMessage(content="ok", tool_call_id="windows")
+        )
+
+        result = middleware.wrap_tool_call(
+            TestRepositoryToolBudgetMiddleware._request(
+                call_id="windows",
+                path=r"c:\users\owner\repository\README.md",
+            ),
+            handler,
+        )
+
+        assert isinstance(result, ToolMessage)
+        bounded = handler.call_args.args[0]
+        assert bounded.tool_call["args"]["file_path"] == "/README.md"
+        read_result = backend.read(bounded.tool_call["args"]["file_path"])
+        assert read_result.error is None
+        assert read_result.file_data is not None
+        assert read_result.file_data["content"] == "criteria context"
+
+    def test_virtual_windows_root_rejects_drive_escape_before_backend(
+        self,
+    ) -> None:
+        backend = self._backend()
+        backend.virtual_mode = True
+        middleware = _RepositoryToolBudgetMiddleware(
+            backend,
+            root=r"C:\Users\Owner\Repository",
+        )
+        handler = MagicMock()
+
+        result = middleware.wrap_tool_call(
+            TestRepositoryToolBudgetMiddleware._request(
+                call_id="escape",
+                path=r"C:\Users\Owner\Repository-escape\README.md",
+            ),
+            handler,
+        )
+
+        assert isinstance(result, ToolMessage)
+        assert result.status == "error"
+        handler.assert_not_called()
+        backend.ls.assert_not_called()
 
     @pytest.mark.parametrize("name", ["read_file", "ls", "glob", "grep"])
     @pytest.mark.parametrize(

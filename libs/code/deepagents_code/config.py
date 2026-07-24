@@ -92,6 +92,9 @@ _singleton_lock = threading.Lock()
 _dotenv_loaded_values: dict[str, str] = {}
 """Environment values injected by our dotenv loader and safe to refresh later."""
 
+_project_dotenv_loaded_values: dict[str, str] = {}
+"""Subset of managed environment values injected by the project `.env`."""
+
 _orphaned_tracing_disabled_notice: str | None = None
 """One-shot TUI notice populated when bootstrap disables orphaned tracing."""
 
@@ -155,10 +158,9 @@ checking which category it belongs to:
 `PYTHONPATH` into agent `execute` commands through the carrier var; the carrier
 is only meant to relay a value the user set in their launch environment.
 
-Matching is exact and case-sensitive: the protected consumers (the dynamic
-linker, bash, CPython) read these names only in their canonical case, so a
-lowercase `bash_env` injected into the environment is inert. Any future entry
-that some consumer reads case-insensitively would need a different check.
+Matching is exact on POSIX, where the protected consumers read canonical names,
+and case-insensitive on Windows, where environment lookup itself is
+case-insensitive.
 """
 
 _PROJECT_DOTENV_DENIED_ENV_KEYS = frozenset(
@@ -188,6 +190,12 @@ legitimate, trusted sources and continue to set them. The loader reads plain
 """
 
 
+def _dotenv_key_is_denied(key: str, denied: frozenset[str]) -> bool:
+    """Return whether a dotenv key is denied on the active platform."""
+    candidate = key.upper() if os.name == "nt" else key
+    return candidate in denied
+
+
 def _find_dotenv_from_start_path(start_path: Path) -> Path | None:
     """Find the nearest `.env` file from an explicit start path upward.
 
@@ -214,6 +222,19 @@ try:
     _GLOBAL_DOTENV_PATH = Path.home() / ".deepagents" / ".env"
 except RuntimeError:
     _GLOBAL_DOTENV_PATH = Path("/nonexistent/.deepagents/.env")
+
+
+def _project_dotenv_applied_keys() -> frozenset[str]:
+    """Return canonical keys whose current values came from the project `.env`.
+
+    Only names are exposed so security-sensitive subprocess builders can remove
+    untrusted project inputs without gaining access to dotenv values.
+    """
+    return frozenset(
+        key.upper()
+        for key, value in _project_dotenv_loaded_values.items()
+        if _dotenv_loaded_values.get(key) == value and os.environ.get(key) == value
+    )
 
 
 def _preview_dotenv_environ(*, start_path: Path | None = None) -> dict[str, str]:
@@ -249,11 +270,13 @@ def _preview_dotenv_environ(*, start_path: Path | None = None) -> dict[str, str]
         for key, value in values.items():
             if value is None or key in env:
                 continue
-            if key in _DOTENV_DENIED_ENV_KEYS:
+            if _dotenv_key_is_denied(key, _DOTENV_DENIED_ENV_KEYS):
                 # Log the key only — the value is attacker-controlled.
                 logger.debug("Ignoring denied env key %r from %s", key, dotenv_path)
                 continue
-            if is_project and key in _PROJECT_DOTENV_DENIED_ENV_KEYS:
+            if is_project and _dotenv_key_is_denied(
+                key, _PROJECT_DOTENV_DENIED_ENV_KEYS
+            ):
                 # Mirror `_load_dotenv`: a project `.env` cannot preview-set a
                 # user-level MCP trust decision (the global `.env`/shell can).
                 logger.debug(
@@ -350,6 +373,7 @@ def _load_dotenv(
             if os.environ.get(key) == value:
                 os.environ.pop(key)
         _dotenv_loaded_values.clear()
+        _project_dotenv_loaded_values.clear()
 
     def apply_dotenv(dotenv_path: Path, *, is_project: bool) -> bool:
         values = dotenv.dotenv_values(dotenv_path=dotenv_path)
@@ -357,11 +381,13 @@ def _load_dotenv(
         for key, value in values.items():
             if value is None or key in os.environ:
                 continue
-            if key in _DOTENV_DENIED_ENV_KEYS:
+            if _dotenv_key_is_denied(key, _DOTENV_DENIED_ENV_KEYS):
                 # Log the key only — the value is attacker-controlled.
                 logger.debug("Ignoring denied env key %r from %s", key, dotenv_path)
                 continue
-            if is_project and key in _PROJECT_DOTENV_DENIED_ENV_KEYS:
+            if is_project and _dotenv_key_is_denied(
+                key, _PROJECT_DOTENV_DENIED_ENV_KEYS
+            ):
                 # A committed project `.env` must not set a user-level MCP trust
                 # decision; the global `.env` and shell may (is_project=False).
                 logger.debug(
@@ -370,6 +396,8 @@ def _load_dotenv(
                 continue
             os.environ[key] = value
             _dotenv_loaded_values[key] = value
+            if is_project:
+                _project_dotenv_loaded_values[key] = value
             applied = True
         return applied
 

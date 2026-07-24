@@ -85,10 +85,10 @@ When a tool result is too large, it may be offloaded into the filesystem instead
 
 ## Execute Tool `execute`
 
-You have access to an `execute` tool for running shell commands in a sandboxed environment.
+You have access to an `execute` tool for running commands in the backend-configured shell and working directory.
 Use this tool to run commands, scripts, tests, builds, and other shell operations.
 
-- execute: run a shell command in the sandbox (returns output and exit code)
+- execute: run a command in the configured shell (returns output and exit code)
 
 ## Shell paths vs. virtual paths
 

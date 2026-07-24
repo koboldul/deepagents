@@ -2,9 +2,17 @@
 
 import asyncio
 import io
+import os
+import shlex
+import shutil
 import signal
+import subprocess
 import sys
+import time
+import uuid
 from collections.abc import AsyncIterator, Iterator, Sequence
+from contextlib import suppress
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -18,11 +26,14 @@ if TYPE_CHECKING:
 from rich.style import Style
 from rich.text import Text
 
+from deepagents_code import _posix_shell as posix_shell_module
+from deepagents_code._posix_shell import _PosixOwnerGuard
 from deepagents_code._tool_stream import (
     TOOL_OUTPUT_TRUNCATION_MARKER,
     UNRENDERABLE_TOOL_OUTPUT,
     ToolCallBuffer,
 )
+from deepagents_code.client import non_interactive as non_interactive_module
 from deepagents_code.client.non_interactive import (
     _MAX_HITL_ITERATIONS,
     HITLIterationLimitError,
@@ -39,6 +50,7 @@ from deepagents_code.client.non_interactive import (
     _run_agent_loop,
     _run_startup_command,
     _start_langsmith_thread_url_lookup,
+    _StartupProcessRegistry,
     run_non_interactive,
 )
 from deepagents_code.config import SHELL_ALLOW_ALL, ModelResult
@@ -1591,8 +1603,157 @@ class TestMaxTurns:
         assert result == 124
 
 
+def _windows_pid_is_running(pid: int) -> bool:
+    """Return whether a Windows process is still active."""
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    )
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(
+        process_query_limited_information,
+        False,
+        pid,
+    )
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        return (
+            bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)))
+            and exit_code.value == still_active
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+async def _wait_for_windows_pid_exit(
+    pid: int,
+    *,
+    wait_seconds: float = 2.0,
+) -> bool:
+    """Wait for a Windows process to stop running."""
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if not _windows_pid_is_running(pid):
+            return True
+        await asyncio.sleep(0.02)
+    return not _windows_pid_is_running(pid)
+
+
+def _posix_pid_is_running(pid: int) -> bool:
+    """Return whether a POSIX process still exists and is not a zombie."""
+    stat_path = Path("/proc") / str(pid) / "stat"
+    try:
+        if stat_path.read_text(encoding="utf-8").split()[2] == "Z":
+            return False
+    except (IndexError, OSError):
+        pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+async def _wait_for_pid_exit(pid: int, *, wait_seconds: float = 2.0) -> bool:
+    """Wait for a process to exit on the current platform."""
+    if sys.platform == "win32":
+        return await _wait_for_windows_pid_exit(pid, wait_seconds=wait_seconds)
+
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if not _posix_pid_is_running(pid):
+            return True
+        await asyncio.sleep(0.02)
+    return not _posix_pid_is_running(pid)
+
+
+async def _wait_for_file(path: Path, *, wait_seconds: float = 5.0) -> None:
+    """Wait for a subprocess to create `path`."""
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if await asyncio.to_thread(path.exists):
+            return
+        await asyncio.sleep(0.02)
+    msg = f"Timed out waiting for {path}"
+    raise AssertionError(msg)
+
+
+def _cleanup_windows_process_tree(pid: int) -> None:
+    """Best-effort cleanup for a failed Windows process-tree assertion."""
+    windows_dir = os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR")
+    executable = (
+        str(Path(windows_dir) / "System32" / "taskkill.exe")
+        if windows_dir
+        else "taskkill.exe"
+    )
+    with suppress(OSError, subprocess.TimeoutExpired):
+        subprocess.run(
+            [executable, "/PID", str(pid), "/T", "/F"],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+
+
+def _posix_group_exits_after_sigterm(_process_group_id: int, sig: int) -> None:
+    """Simulate a process group disappearing during the SIGTERM grace period."""
+    if sig == 0:
+        raise ProcessLookupError
+
+
+def _mock_posix_owner_guard(*, alive: bool = False) -> MagicMock:
+    """Return an async-compatible POSIX owner guard test double."""
+    owner_guard = MagicMock()
+    owner_guard.is_alive.return_value = alive
+    owner_guard.has_processes.return_value = alive
+    owner_guard.close = AsyncMock()
+    owner_guard.terminate = AsyncMock()
+    return owner_guard
+
+
+@pytest.fixture
+def startup_process_dir() -> Iterator[Path]:
+    """Create project-local scratch space for real subprocess tests."""
+    parent = Path.cwd() / ".test-startup-processes"
+    path = parent / uuid.uuid4().hex
+    path.mkdir(parents=True)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+        with suppress(OSError):
+            parent.rmdir()
+
+
 class TestRunStartupCommand:
     """Tests for `_run_startup_command` (`--startup-cmd`)."""
+
+    @pytest.fixture(autouse=True)
+    def _posix_process_symbols(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Provide POSIX-only symbols for tests that simulate macOS."""
+        if not hasattr(os, "killpg"):
+            monkeypatch.setattr(os, "killpg", None, raising=False)
+        if not hasattr(signal, "SIGKILL"):
+            monkeypatch.setattr(signal, "SIGKILL", 9, raising=False)
 
     async def test_successful_command_prints_stdout(self) -> None:
         """Exit 0 with stdout — output should be routed through the console."""
@@ -1605,6 +1766,141 @@ class TestRunStartupCommand:
         assert "Running startup command: echo hello-startup" in output
         assert "hello-startup" in output
         assert "Warning" not in output
+
+    async def test_successful_background_child_is_killed_on_headless_shutdown(
+        self,
+        startup_process_dir: Path,
+    ) -> None:
+        """A successful startup root's 60s child remains owned until shutdown."""
+        pid_file = startup_process_dir / "successful-startup-descendant.pid"
+        parent_code = (
+            "import subprocess, sys; from pathlib import Path; "
+            "child = subprocess.Popen("
+            "[sys.executable, '-c', 'import time; time.sleep(60)'], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+            "stderr=subprocess.DEVNULL); "
+            f"Path({str(pid_file)!r}).write_text(str(child.pid), encoding='utf-8')"
+        )
+        argv = [sys.executable, "-c", parent_code]
+        command = (
+            subprocess.list2cmdline(argv)
+            if sys.platform == "win32"
+            else shlex.join(argv)
+        )
+        registry = _StartupProcessRegistry()
+        console = Console(file=io.StringIO(), width=200, highlight=False)
+        descendant_pid: int | None = None
+
+        try:
+            await _run_startup_command(
+                command,
+                console,
+                quiet=False,
+                process_registry=registry,
+            )
+            await _wait_for_file(pid_file)
+            descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+            if sys.platform == "win32":
+                assert _windows_pid_is_running(descendant_pid)
+            else:
+                assert _posix_pid_is_running(descendant_pid)
+
+            await registry.close()
+
+            exited = await _wait_for_pid_exit(descendant_pid)
+        finally:
+            await registry.close()
+            if descendant_pid is not None:
+                if sys.platform == "win32" and _windows_pid_is_running(descendant_pid):
+                    _cleanup_windows_process_tree(descendant_pid)
+                elif sys.platform != "win32" and _posix_pid_is_running(descendant_pid):
+                    with suppress(OSError):
+                        os.kill(descendant_pid, signal.SIGKILL)
+
+        assert exited
+
+    async def test_retained_cleanup_skips_reused_pgid_after_watchdog_loss(
+        self,
+    ) -> None:
+        """A dead startup watchdog prevents delayed signaling of a reused PGID."""
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.wait = AsyncMock(return_value=0)
+        proc._transport = MagicMock()
+        watchdog = MagicMock()
+        watchdog.returncode = 0
+        watchdog.wait = AsyncMock(return_value=0)
+        watchdog._transport = MagicMock()
+        owner_guard = _PosixOwnerGuard(93, watchdog, 1234)
+        registry = _StartupProcessRegistry()
+
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch("deepagents_code._posix_shell.os.write") as write,
+            patch("deepagents_code._posix_shell.os.close"),
+            patch("os.killpg") as killpg,
+        ):
+            await registry.retain(proc, None, owner_guard)
+            await registry.close()
+            await registry.close()
+
+        write.assert_not_called()
+        killpg.assert_not_called()
+        watchdog.wait.assert_awaited_once_with()
+        proc.wait.assert_not_awaited()
+
+    async def test_headless_early_exit_kills_successful_startup_descendant(
+        self,
+        startup_process_dir: Path,
+    ) -> None:
+        """The real headless owner cleans startup children on pre-server exit."""
+        pid_file = startup_process_dir / "early-exit-startup-descendant.pid"
+        parent_code = (
+            "import subprocess, sys; from pathlib import Path; "
+            "child = subprocess.Popen("
+            "[sys.executable, '-c', 'import time; time.sleep(60)'], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+            "stderr=subprocess.DEVNULL); "
+            f"Path({str(pid_file)!r}).write_text(str(child.pid), encoding='utf-8')"
+        )
+        argv = [sys.executable, "-c", parent_code]
+        command = (
+            subprocess.list2cmdline(argv)
+            if sys.platform == "win32"
+            else shlex.join(argv)
+        )
+        descendant_pid: int | None = None
+
+        try:
+            with (
+                patch(
+                    "deepagents_code.plugins.adapters.skills.discover_plugin_skill_sources_and_roots",
+                    return_value=([], []),
+                ),
+                patch(
+                    "deepagents_code.skills.invocation.discover_skills_and_roots",
+                    return_value=([], []),
+                ),
+            ):
+                result = await run_non_interactive(
+                    message="task",
+                    initial_skill="missing",
+                    startup_cmd=command,
+                    quiet=True,
+                )
+
+            assert result == 1
+            descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+            exited = await _wait_for_pid_exit(descendant_pid)
+        finally:
+            if descendant_pid is not None:
+                if sys.platform == "win32" and _windows_pid_is_running(descendant_pid):
+                    _cleanup_windows_process_tree(descendant_pid)
+                elif sys.platform != "win32" and _posix_pid_is_running(descendant_pid):
+                    with suppress(OSError):
+                        os.kill(descendant_pid, signal.SIGKILL)
+
+        assert exited
 
     @pytest.mark.skipif(sys.platform == "win32", reason="`false` is POSIX-only")
     async def test_non_zero_exit_warns_but_does_not_raise(self) -> None:
@@ -1636,8 +1932,11 @@ class TestRunStartupCommand:
         console = Console(file=buf, width=200, highlight=False)
 
         # Unbalanced/unknown markup would raise `MarkupError` if parsed.
+        command = f'"{sys.executable}" -c "print(\'[INFO] starting [1/3]\')"'
         await _run_startup_command(
-            "printf '[INFO] starting [1/3]\\n'", console, quiet=False
+            command,
+            console,
+            quiet=False,
         )
 
         output = buf.getvalue()
@@ -1660,15 +1959,82 @@ class TestRunStartupCommand:
         buf = io.StringIO()
         console = Console(file=buf, width=200, highlight=False)
 
-        with patch(
-            "asyncio.create_subprocess_shell",
-            side_effect=OSError("boom"),
+        with (
+            patch(
+                "asyncio.create_subprocess_shell",
+                side_effect=OSError("boom"),
+            ),
+            patch.object(
+                non_interactive_module,
+                "_start_posix_shell_process",
+                new=AsyncMock(side_effect=OSError("boom")),
+            ),
         ):
             await _run_startup_command("whatever", console, quiet=False)
 
         output = buf.getvalue()
         assert "Warning" in output
         assert "failed to launch" in output
+
+    async def test_posix_launch_opens_gate_after_watchdog_ready(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The command cannot execute before its ownership watchdog is armed."""
+        process = MagicMock()
+        process.pid = 12345
+        owner_guard = _mock_posix_owner_guard()
+        events: list[tuple[str, object]] = []
+
+        def start_guard(process_group_id: int) -> MagicMock:
+            events.append(("watchdog", process_group_id))
+            return owner_guard
+
+        def write(file_descriptor: int, payload: bytes) -> int:
+            events.append(("write", (file_descriptor, bytes(payload))))
+            return len(payload)
+
+        with (
+            patch.object(
+                posix_shell_module.os,
+                "pipe",
+                side_effect=[(10, 11), (12, 13)],
+            ),
+            patch.object(posix_shell_module.os, "close"),
+            patch.object(posix_shell_module.os, "write", side_effect=write),
+            patch.object(
+                posix_shell_module,
+                "_serialize_environment",
+                return_value=b"environment",
+            ),
+            patch.object(
+                posix_shell_module.asyncio,
+                "create_subprocess_exec",
+                new=AsyncMock(return_value=process),
+            ) as create_process,
+            patch.object(
+                posix_shell_module,
+                "_start_posix_owner_guard",
+                new=AsyncMock(side_effect=start_guard),
+            ),
+        ):
+            (
+                started_process,
+                started_guard,
+            ) = await posix_shell_module._start_posix_shell_process(
+                "printf ready",
+                cwd=str(tmp_path),
+            )
+
+        assert started_process is process
+        assert started_guard is owner_guard
+        assert create_process.call_args.kwargs["start_new_session"] is True
+        assert create_process.call_args.kwargs["pass_fds"] == (10, 12)
+        assert events == [
+            ("watchdog", 12345),
+            ("write", (13, b"environment")),
+            ("write", (11, b"G")),
+        ]
 
     async def test_timeout_kills_process_group_on_posix(self) -> None:
         """Timeouts should terminate the whole POSIX process group."""
@@ -1681,16 +2047,29 @@ class TestRunStartupCommand:
         mock_proc.returncode = None
         mock_proc.pid = 12345
         mock_proc.kill = MagicMock()
+        mock_proc._transport = MagicMock()
 
         with (
-            patch("asyncio.create_subprocess_shell", return_value=mock_proc),
+            patch.object(
+                non_interactive_module,
+                "_start_posix_shell_process",
+                new=AsyncMock(
+                    return_value=(mock_proc, _mock_posix_owner_guard()),
+                ),
+            ) as start_process,
             patch.object(sys, "platform", "darwin"),
-            patch("os.getpgid", return_value=12345),
-            patch("os.killpg") as mock_killpg,
+            patch(
+                "os.killpg",
+                side_effect=_posix_group_exits_after_sigterm,
+            ) as mock_killpg,
         ):
             await _run_startup_command("sleep 999", console, quiet=False)
 
-        mock_killpg.assert_called_once_with(12345, signal.SIGTERM)
+        start_process.assert_awaited_once_with("sleep 999")
+        assert mock_killpg.call_args_list == [
+            call(12345, signal.SIGTERM),
+            call(12345, 0),
+        ]
         mock_proc.kill.assert_not_called()
         assert "timed out" in buf.getvalue()
 
@@ -1705,80 +2084,432 @@ class TestRunStartupCommand:
         mock_proc.returncode = None
         mock_proc.pid = 12345
         mock_proc.kill = MagicMock()
+        mock_proc._transport = MagicMock()
 
         with (
-            patch("asyncio.create_subprocess_shell", return_value=mock_proc),
+            patch.object(
+                non_interactive_module,
+                "_start_posix_shell_process",
+                new=AsyncMock(
+                    return_value=(mock_proc, _mock_posix_owner_guard()),
+                ),
+            ),
             patch.object(sys, "platform", "darwin"),
-            patch("os.getpgid", return_value=12345),
-            patch("os.killpg") as mock_killpg,
+            patch(
+                "os.killpg",
+                side_effect=_posix_group_exits_after_sigterm,
+            ) as mock_killpg,
             pytest.raises(asyncio.CancelledError),
         ):
             await _run_startup_command("sleep 999", console, quiet=False)
 
-        mock_killpg.assert_called_once_with(12345, signal.SIGTERM)
+        assert mock_killpg.call_args_list == [
+            call(12345, signal.SIGTERM),
+            call(12345, 0),
+        ]
         mock_proc.kill.assert_not_called()
         assert "timed out" not in buf.getvalue()
+
+    async def test_posix_error_cleans_known_group_after_root_exit(self) -> None:
+        """Runtime errors still clean the known group after the root exits."""
+        buf = io.StringIO()
+        console = Console(file=buf, width=200, highlight=False)
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate = AsyncMock(side_effect=OSError("pipe read failed"))
+        mock_proc.wait = AsyncMock(return_value=0)
+        mock_proc.returncode = 0
+        mock_proc.pid = 12345
+        mock_proc.kill = MagicMock()
+        mock_proc._transport = MagicMock()
+
+        with (
+            patch.object(
+                non_interactive_module,
+                "_start_posix_shell_process",
+                new=AsyncMock(
+                    return_value=(mock_proc, _mock_posix_owner_guard()),
+                ),
+            ),
+            patch.object(sys, "platform", "darwin"),
+            patch(
+                "os.killpg",
+                side_effect=_posix_group_exits_after_sigterm,
+            ) as mock_killpg,
+            pytest.raises(OSError, match="pipe read failed"),
+        ):
+            await _run_startup_command("command", console, quiet=False)
+
+        assert mock_killpg.call_args_list == [
+            call(12345, signal.SIGTERM),
+            call(12345, 0),
+        ]
+        mock_proc.kill.assert_not_called()
 
     async def test_timeout_escalates_to_sigkill_when_sigterm_ignored(self) -> None:
         """If SIGTERM + 5s wait also times out, SIGKILL must follow."""
         buf = io.StringIO()
         console = Console(file=buf, width=200, highlight=False)
 
-        # First `communicate` raises TimeoutError (hit 60s limit).
-        # First `wait` raises TimeoutError (hit 5s post-SIGTERM grace).
-        # Second `wait` returns normally (post-SIGKILL reap).
+        # `communicate` reaches the startup limit; the group grace expires,
+        # SIGKILL follows, and the root is then reaped normally.
         mock_proc = AsyncMock()
         mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
-        mock_proc.wait = AsyncMock(side_effect=[TimeoutError(), None])
+        mock_proc.wait = AsyncMock(return_value=None)
         mock_proc.returncode = None
         mock_proc.pid = 12345
         mock_proc.kill = MagicMock()
+        mock_proc._transport = MagicMock()
 
         with (
-            patch("asyncio.create_subprocess_shell", return_value=mock_proc),
+            patch.object(
+                non_interactive_module,
+                "_start_posix_shell_process",
+                new=AsyncMock(
+                    return_value=(mock_proc, _mock_posix_owner_guard()),
+                ),
+            ),
             patch.object(sys, "platform", "darwin"),
-            patch("os.getpgid", return_value=12345),
             patch("os.killpg") as mock_killpg,
+            patch.object(
+                non_interactive_module,
+                "_wait_for_startup_process_group_exit",
+                new=AsyncMock(side_effect=[False, True]),
+            ),
         ):
             await _run_startup_command("sleep 999", console, quiet=False)
 
         assert mock_killpg.call_args_list == [
             call(12345, signal.SIGTERM),
-            call(12345, signal.SIGKILL),
+            call(12345, getattr(signal, "SIGKILL", 9)),
         ]
         mock_proc.kill.assert_not_called()
         assert "timed out" in buf.getvalue()
 
-    async def test_timeout_uses_proc_kill_on_windows(self) -> None:
-        """Windows has no process groups; fall back to `proc.kill()`."""
+    async def test_windows_launch_assigns_suspended_root_before_communicate(
+        self,
+    ) -> None:
+        """Windows execution begins after assignment and retains the Job."""
+        buf = io.StringIO()
+        console = Console(file=buf, width=200, highlight=False)
+        registry = _StartupProcessRegistry()
+
+        mock_proc = AsyncMock()
+        order: list[str] = []
+        mock_proc.communicate = AsyncMock(
+            side_effect=lambda: order.append("communicate") or (b"ok", b"")
+        )
+        mock_proc.returncode = 0
+        mock_proc.pid = 12345
+        mock_proc._transport = MagicMock()
+        windows_job = MagicMock()
+
+        def create_process(
+            *_args: str,
+            **_kwargs: object,
+        ) -> asyncio.subprocess.Process:
+            order.append("create-suspended")
+            return mock_proc
+
+        def assign_process(
+            proc: asyncio.subprocess.Process,
+        ) -> object:
+            assert proc is mock_proc
+            order.append("assign-and-resume")
+            return windows_job
+
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch(
+                "asyncio.create_subprocess_shell",
+                side_effect=create_process,
+            ) as create,
+            patch(
+                "deepagents_code.update_check._assign_windows_job_and_resume",
+                side_effect=assign_process,
+            ) as assign,
+        ):
+            await _run_startup_command(
+                "echo ok",
+                console,
+                quiet=False,
+                process_registry=registry,
+            )
+
+        from deepagents_code.update_check import _WINDOWS_CREATE_SUSPENDED
+
+        assert create.call_args.kwargs["creationflags"] == _WINDOWS_CREATE_SUSPENDED
+        assert "start_new_session" not in create.call_args.kwargs
+        assign.assert_awaited_once_with(mock_proc)
+        assert order == [
+            "create-suspended",
+            "assign-and-resume",
+            "communicate",
+        ]
+        assert registry._processes == [(mock_proc, windows_job, None)]
+        windows_job.close.assert_not_called()
+        mock_proc._transport.close.assert_called_once_with()
+        assert "ok" in buf.getvalue()
+
+    async def test_timeout_terminates_windows_job(self) -> None:
+        """Windows timeout cleanup closes the owned Job, not only the root."""
         buf = io.StringIO()
         console = Console(file=buf, width=200, highlight=False)
 
         mock_proc = AsyncMock()
         mock_proc.communicate = AsyncMock(side_effect=TimeoutError())
-        mock_proc.wait = AsyncMock()
         mock_proc.returncode = None
         mock_proc.pid = 12345
-        mock_proc.kill = MagicMock()
+        mock_proc._transport = MagicMock()
+        windows_job = MagicMock()
+        terminate_tree = AsyncMock()
 
         with (
-            patch("asyncio.create_subprocess_shell", return_value=mock_proc),
             patch.object(sys, "platform", "win32"),
-            patch("os.killpg") as mock_killpg,
+            patch.object(
+                non_interactive_module,
+                "_start_startup_process",
+                new=AsyncMock(return_value=(mock_proc, windows_job, None)),
+            ),
+            patch(
+                "deepagents_code.update_check._terminate_windows_process_tree",
+                terminate_tree,
+            ),
         ):
             await _run_startup_command("sleep 999", console, quiet=False)
 
-        mock_proc.kill.assert_called_once()
-        mock_killpg.assert_not_called()
+        terminate_tree.assert_awaited_once_with(mock_proc, windows_job)
+        windows_job.close.assert_not_called()
+        mock_proc._transport.close.assert_called_once_with()
         assert "timed out" in buf.getvalue()
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows process-tree regression",
+    )
+    async def test_windows_timeout_kills_descendant(
+        self,
+        startup_process_dir: Path,
+    ) -> None:
+        """A startup timeout kills a real descendant in the owned Job."""
+        pid_file = startup_process_dir / "descendant.pid"
+        child_code = "import time; time.sleep(30)"
+        parent_code = (
+            "import subprocess, sys, time; from pathlib import Path; "
+            "child = subprocess.Popen("
+            f"[sys.executable, '-c', {child_code!r}]); "
+            f"Path({str(pid_file)!r}).write_text("
+            "str(child.pid), encoding='utf-8'); "
+            "time.sleep(30)"
+        )
+        command = subprocess.list2cmdline([sys.executable, "-c", parent_code])
+        buf = io.StringIO()
+        console = Console(file=buf, width=200, highlight=False)
+        started_processes: list[asyncio.subprocess.Process] = []
+        real_start = non_interactive_module._start_startup_process
+
+        async def start_after_descendant_ready(
+            startup_command: str,
+        ) -> tuple[asyncio.subprocess.Process, Any, Any]:
+            proc, windows_job, posix_owner_guard = await real_start(startup_command)
+            started_processes.append(proc)
+            await _wait_for_file(pid_file)
+            return proc, windows_job, posix_owner_guard
+
+        descendant_pid: int | None = None
+        root_proc: asyncio.subprocess.Process | None = None
+        try:
+            started = time.monotonic()
+            with (
+                patch.object(
+                    non_interactive_module,
+                    "_start_startup_process",
+                    new=start_after_descendant_ready,
+                ),
+                patch.object(
+                    non_interactive_module,
+                    "_STARTUP_COMMAND_TIMEOUT_SECONDS",
+                    0.01,
+                ),
+            ):
+                await asyncio.wait_for(
+                    _run_startup_command(command, console, quiet=False),
+                    timeout=8,
+                )
+            elapsed = time.monotonic() - started
+            root_proc = started_processes[0]
+            descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+            descendant_exited = await _wait_for_windows_pid_exit(descendant_pid)
+        finally:
+            if root_proc is not None and root_proc.returncode is None:
+                _cleanup_windows_process_tree(root_proc.pid)
+                with suppress(OSError, TimeoutError):
+                    await asyncio.wait_for(root_proc.wait(), timeout=2)
+            if descendant_pid is not None and _windows_pid_is_running(descendant_pid):
+                _cleanup_windows_process_tree(descendant_pid)
+
+        assert elapsed < 3.0
+        assert root_proc.returncode is not None
+        assert descendant_exited
+        assert "timed out" in buf.getvalue()
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows process-tree regression",
+    )
+    async def test_windows_cancellation_kills_descendant(
+        self,
+        startup_process_dir: Path,
+    ) -> None:
+        """Cancelling startup kills a real descendant and reaps the root."""
+        pid_file = startup_process_dir / "descendant.pid"
+        child_code = "import time; time.sleep(30)"
+        parent_code = (
+            "import subprocess, sys, time; from pathlib import Path; "
+            "child = subprocess.Popen("
+            f"[sys.executable, '-c', {child_code!r}]); "
+            f"Path({str(pid_file)!r}).write_text("
+            "str(child.pid), encoding='utf-8'); "
+            "time.sleep(30)"
+        )
+        command = subprocess.list2cmdline([sys.executable, "-c", parent_code])
+        console = Console(file=io.StringIO(), width=200, highlight=False)
+        started_processes: list[asyncio.subprocess.Process] = []
+        real_start = non_interactive_module._start_startup_process
+
+        async def capture_start(
+            startup_command: str,
+        ) -> tuple[asyncio.subprocess.Process, Any, Any]:
+            proc, windows_job, posix_owner_guard = await real_start(startup_command)
+            started_processes.append(proc)
+            return proc, windows_job, posix_owner_guard
+
+        descendant_pid: int | None = None
+        root_proc: asyncio.subprocess.Process | None = None
+        task: asyncio.Task[None] | None = None
+        try:
+            with patch.object(
+                non_interactive_module,
+                "_start_startup_process",
+                new=capture_start,
+            ):
+                task = asyncio.create_task(
+                    _run_startup_command(command, console, quiet=False)
+                )
+                await _wait_for_file(pid_file)
+                root_proc = started_processes[0]
+                descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+                started = time.monotonic()
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                elapsed = time.monotonic() - started
+            descendant_exited = await _wait_for_windows_pid_exit(descendant_pid)
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            if root_proc is not None and root_proc.returncode is None:
+                _cleanup_windows_process_tree(root_proc.pid)
+                with suppress(OSError, TimeoutError):
+                    await asyncio.wait_for(root_proc.wait(), timeout=2)
+            if descendant_pid is not None and _windows_pid_is_running(descendant_pid):
+                _cleanup_windows_process_tree(descendant_pid)
+
+        assert elapsed < 3.0
+        assert root_proc.returncode is not None
+        assert descendant_exited
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows process-tree regression",
+    )
+    async def test_windows_error_after_root_exit_kills_descendant(
+        self,
+        startup_process_dir: Path,
+    ) -> None:
+        """Exceptional cleanup remains authoritative after the root exits."""
+        pid_file = startup_process_dir / "descendant.pid"
+        child_code = "import time; time.sleep(30)"
+        parent_code = (
+            "import subprocess, sys; from pathlib import Path; "
+            "child = subprocess.Popen("
+            f"[sys.executable, '-c', {child_code!r}], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+            "stderr=subprocess.DEVNULL); "
+            f"Path({str(pid_file)!r}).write_text("
+            "str(child.pid), encoding='utf-8'); "
+            "print('root-finished', flush=True)"
+        )
+        command = subprocess.list2cmdline([sys.executable, "-c", parent_code])
+        console = MagicMock(spec=Console)
+        started_processes: list[asyncio.subprocess.Process] = []
+        real_start = non_interactive_module._start_startup_process
+
+        async def capture_start(
+            startup_command: str,
+        ) -> tuple[asyncio.subprocess.Process, Any, Any]:
+            proc, windows_job, posix_owner_guard = await real_start(startup_command)
+            started_processes.append(proc)
+            return proc, windows_job, posix_owner_guard
+
+        def fail_on_root_output(renderable: object, **_kwargs: object) -> None:
+            text = renderable.plain if isinstance(renderable, Text) else str(renderable)
+            if not started_processes or text != "root-finished":
+                return
+            root_proc = started_processes[0]
+            assert root_proc.returncode is not None
+            child_pid = int(pid_file.read_text(encoding="utf-8"))
+            assert _windows_pid_is_running(child_pid)
+            msg = "startup output rendering failed"
+            raise RuntimeError(msg)
+
+        console.print.side_effect = fail_on_root_output
+        descendant_pid: int | None = None
+        root_proc: asyncio.subprocess.Process | None = None
+        try:
+            with (
+                patch.object(
+                    non_interactive_module,
+                    "_start_startup_process",
+                    new=capture_start,
+                ),
+                pytest.raises(
+                    RuntimeError,
+                    match="startup output rendering failed",
+                ),
+            ):
+                await asyncio.wait_for(
+                    _run_startup_command(command, console, quiet=False),
+                    timeout=5,
+                )
+            root_proc = started_processes[0]
+            descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+            descendant_exited = await _wait_for_windows_pid_exit(descendant_pid)
+        finally:
+            if root_proc is None and started_processes:
+                root_proc = started_processes[0]
+            if root_proc is not None and root_proc.returncode is None:
+                _cleanup_windows_process_tree(root_proc.pid)
+                with suppress(OSError, TimeoutError):
+                    await asyncio.wait_for(root_proc.wait(), timeout=2)
+            if descendant_pid is None and pid_file.exists():
+                descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+            if descendant_pid is not None and _windows_pid_is_running(descendant_pid):
+                _cleanup_windows_process_tree(descendant_pid)
+
+        assert root_proc.returncode is not None
+        assert descendant_exited
 
     async def test_empty_command_is_not_executed(self) -> None:
         """Whitespace-only `--startup-cmd` should be treated as unset."""
         buf = io.StringIO()
         console = Console(file=buf, width=200, highlight=False)
 
-        with patch(
-            "asyncio.create_subprocess_shell",
+        with patch.object(
+            non_interactive_module,
+            "_start_posix_shell_process",
             new=AsyncMock(),
         ) as mock_spawn:
             # `run_non_interactive` strips and skips when empty; replicate

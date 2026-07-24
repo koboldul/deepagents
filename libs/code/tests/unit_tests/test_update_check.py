@@ -3,24 +3,31 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import os
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
 import tomllib
+import warnings
 from collections.abc import Mapping, Sequence  # noqa: TC003
+from contextlib import suppress
 from itertools import starmap
 from pathlib import Path
+from typing import TextIO
 from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 import pytest
 from packaging.version import InvalidVersion, Version
 
+import deepagents_code.config as config_module
+import deepagents_code.update_check as update_check_module
 from deepagents_code._version import __version__
 from deepagents_code.extras_info import ExtrasIntrospectionError, installed_extra_names
 from deepagents_code.update_check import (
@@ -37,9 +44,11 @@ from deepagents_code.update_check import (
     _parse_version,
     _prerelease_constraints_file,
     _prerelease_pin_requirements,
+    _resolve_trusted_path_executable,
     _run_install_subprocess,
     _terminate_install_process,
     _uv_tool_bin_dir,
+    _WindowsJobObject,
     cleanup_update_logs,
     clear_resume_auto_update_deferral,
     clear_startup_auto_update_failure,
@@ -101,6 +110,172 @@ from deepagents_code.update_check import (
     upgrade_command,
     upgrade_install_command,
 )
+
+
+def _test_executable() -> str:
+    """Return a real interpreter outside the package virtual environment."""
+    executable = getattr(sys, "_base_executable", None) or sys.executable
+    return str(Path(executable).resolve())
+
+
+def _python_argv(code: str) -> tuple[str, ...]:
+    """Build structured arguments that run Python on the host platform."""
+    return (_test_executable(), "-c", code)
+
+
+def _reset_dotenv_tracking() -> None:
+    """Remove values and provenance applied by direct dotenv-loader tests."""
+    for key, value in tuple(config_module._dotenv_loaded_values.items()):
+        if os.environ.get(key) == value:
+            os.environ.pop(key)
+    config_module._dotenv_loaded_values.clear()
+    config_module._project_dotenv_loaded_values.clear()
+
+
+def _shell_arg(value: str) -> str:
+    """Quote one expected shell argument for the host platform."""
+    return subprocess.list2cmdline([value]) if os.name == "nt" else shlex.quote(value)
+
+
+def _split_shell_command(command: str) -> list[str]:
+    """Split a generated host-shell command into argument values."""
+    parts = shlex.split(command, posix=os.name != "nt")
+    return [
+        part[1:-1]
+        if len(part) >= 2 and part[0] == part[-1] and part[0] in {'"', "'"}
+        else part
+        for part in parts
+    ]
+
+
+def _windows_pid_is_running(pid: int) -> bool:
+    """Return whether a Windows process is still active."""
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    )
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(
+        process_query_limited_information,
+        False,
+        pid,
+    )
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        return (
+            bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)))
+            and exit_code.value == still_active
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+async def _wait_for_windows_pid_exit(
+    pid: int,
+    *,
+    wait_seconds: float = 2.0,
+) -> bool:
+    """Wait for a Windows process to stop running."""
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if not _windows_pid_is_running(pid):
+            return True
+        await asyncio.sleep(0.02)
+    return not _windows_pid_is_running(pid)
+
+
+async def _wait_for_file(path: Path, *, wait_seconds: float = 5.0) -> None:
+    """Wait for a subprocess to create `path`."""
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if await asyncio.to_thread(path.exists):
+            return
+        await asyncio.sleep(0.02)
+    msg = f"Timed out waiting for {path}"
+    raise AssertionError(msg)
+
+
+def _cleanup_windows_process_tree(pid: int) -> None:
+    """Best-effort cleanup for a failed Windows process-tree assertion."""
+    windows_dir = os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR")
+    executable = (
+        str(Path(windows_dir) / "System32" / "taskkill.exe")
+        if windows_dir
+        else "taskkill.exe"
+    )
+    with suppress(OSError, subprocess.TimeoutExpired):
+        subprocess.run(
+            [executable, "/PID", str(pid), "/T", "/F"],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+
+
+def _posix_pid_is_running(pid: int) -> bool:
+    """Return whether a POSIX process still exists."""
+    stat_path = Path("/proc") / str(pid) / "stat"
+    try:
+        if stat_path.read_text(encoding="utf-8").split()[2] == "Z":
+            return False
+    except (IndexError, OSError):
+        pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+async def _wait_for_process_exit(pid: int, *, wait_seconds: float = 2.0) -> bool:
+    """Wait for a process to stop running on the host platform."""
+    if os.name == "nt":
+        return await _wait_for_windows_pid_exit(pid, wait_seconds=wait_seconds)
+
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if not _posix_pid_is_running(pid):
+            return True
+        await asyncio.sleep(0.02)
+    return not _posix_pid_is_running(pid)
+
+
+async def _cleanup_started_process(proc: asyncio.subprocess.Process) -> None:
+    """Best-effort cleanup for a failed subprocess lifecycle assertion."""
+    if proc.returncode is not None:
+        return
+    if os.name == "nt":
+        _cleanup_windows_process_tree(proc.pid)
+    else:
+        killpg = getattr(os, "killpg", None)
+        sigkill = getattr(signal, "SIGKILL", None)
+        if callable(killpg) and isinstance(sigkill, int):
+            with suppress(OSError):
+                killpg(proc.pid, sigkill)
+        else:
+            with suppress(OSError):
+                proc.kill()
+    with suppress(TimeoutError):
+        await asyncio.wait_for(proc.wait(), timeout=2)
 
 
 @pytest.fixture
@@ -175,6 +350,552 @@ def _write_uv_receipt(
         f"[tool]\n{python_line}requirements = [{requirements}]\n",
         encoding="utf-8",
     )
+
+
+class TestTrustedExecutableResolution:
+    """Security regressions for updater package-manager executable lookup."""
+
+    @staticmethod
+    def _add_executable(directory: Path, name: str, *, suffix: str = "") -> Path:
+        executable = directory / f"{name}{suffix}"
+        executable.write_bytes(b"MZ" if os.name == "nt" else b"#!/bin/sh\n")
+        if os.name != "nt":
+            executable.chmod(0o755)
+        return executable
+
+    def test_skips_empty_relative_and_project_path_entries(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        project = tmp_path / "project"
+        project_bin = project / "bin"
+        trusted_bin = tmp_path / "trusted"
+        project_bin.mkdir(parents=True)
+        (project / ".git").mkdir()
+        trusted_bin.mkdir()
+        suffix = ".exe" if os.name == "nt" else ""
+        self._add_executable(project, "uv", suffix=suffix)
+        self._add_executable(project_bin, "uv", suffix=suffix)
+        expected = self._add_executable(trusted_bin, "uv", suffix=suffix)
+        monkeypatch.chdir(project)
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join(
+                ("", ".", "bin", str(project), str(project_bin), str(trusted_bin))
+            ),
+        )
+        if os.name == "nt":
+            monkeypatch.setenv("PATHEXT", ".CMD;.EXE")
+
+        resolved = _resolve_trusted_path_executable("uv")
+
+        assert resolved is not None
+        assert Path(resolved).is_absolute()
+        assert expected.samefile(resolved)
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX executable semantics")
+    def test_posix_home_without_project_allows_user_tool(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A marker-free home directory does not reject `~/.local` tools."""
+        home = tmp_path / "home"
+        tool_bin = home / ".local" / "bin"
+        tool_bin.mkdir(parents=True)
+        expected = self._add_executable(tool_bin, "uv")
+        monkeypatch.chdir(home)
+        monkeypatch.setenv("PATH", str(tool_bin))
+        monkeypatch.setenv("DEEPAGENTS_CODE_SERVER_PROJECT_ROOT", str(home))
+        monkeypatch.setenv("DEEPAGENTS_CODE_SERVER_CWD", str(tmp_path / "elsewhere"))
+
+        resolved = _resolve_trusted_path_executable("uv")
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows executable semantics")
+    def test_windows_home_without_project_allows_user_tool(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A marker-free home directory does not reject `~/.agency` tools."""
+        home = tmp_path / "home"
+        tool_bin = home / ".agency" / "bin"
+        tool_bin.mkdir(parents=True)
+        expected = self._add_executable(tool_bin, "uv", suffix=".exe")
+        monkeypatch.chdir(home)
+        monkeypatch.setenv("PATH", str(tool_bin))
+        monkeypatch.setenv("PATHEXT", ".EXE")
+        monkeypatch.setenv("DEEPAGENTS_CODE_SERVER_PROJECT_ROOT", str(home))
+        monkeypatch.setenv("DEEPAGENTS_CODE_SERVER_CWD", str(tmp_path / "elsewhere"))
+
+        resolved = _resolve_trusted_path_executable("uv")
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX executable semantics")
+    def test_posix_project_marker_rejects_project_tool(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A nearby POSIX project marker excludes repository executables."""
+        home = tmp_path / "home"
+        project = home / "work" / "project"
+        project_bin = project / "bin"
+        trusted_bin = home / ".local" / "bin"
+        project_bin.mkdir(parents=True)
+        trusted_bin.mkdir(parents=True)
+        (project / "pyproject.toml").write_text("[project]\nname='demo'\n")
+        self._add_executable(project_bin, "uv")
+        expected = self._add_executable(trusted_bin, "uv")
+        monkeypatch.chdir(project)
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join((str(project_bin), str(trusted_bin))),
+        )
+
+        resolved = _resolve_trusted_path_executable("uv")
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows executable semantics")
+    def test_windows_project_marker_rejects_project_tool(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A nearby Windows project marker excludes repository executables."""
+        home = tmp_path / "home"
+        project = home / "work" / "project"
+        project_bin = project / "bin"
+        trusted_bin = home / ".local" / "bin"
+        project_bin.mkdir(parents=True)
+        trusted_bin.mkdir(parents=True)
+        (project / "package.json").write_text("{}\n")
+        self._add_executable(project_bin, "uv", suffix=".exe")
+        expected = self._add_executable(trusted_bin, "uv", suffix=".exe")
+        monkeypatch.chdir(project)
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join((str(project_bin), str(trusted_bin))),
+        )
+        monkeypatch.setenv("PATHEXT", ".EXE")
+
+        resolved = _resolve_trusted_path_executable("uv")
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    def test_vcs_root_wins_over_nested_project_marker(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An enclosing VCS root protects tools above a nested project file."""
+        project = tmp_path / "project"
+        project_bin = project / "bin"
+        nested = project / "packages" / "demo"
+        trusted_bin = tmp_path / "trusted"
+        project_bin.mkdir(parents=True)
+        nested.mkdir(parents=True)
+        trusted_bin.mkdir()
+        (project / ".git").mkdir()
+        (nested / "pyproject.toml").write_text("[project]\nname='demo'\n")
+        suffix = ".exe" if os.name == "nt" else ""
+        self._add_executable(project_bin, "uv", suffix=suffix)
+        expected = self._add_executable(trusted_bin, "uv", suffix=suffix)
+        monkeypatch.chdir(nested)
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join((str(project_bin), str(trusted_bin))),
+        )
+        if os.name == "nt":
+            monkeypatch.setenv("PATHEXT", ".EXE")
+
+        resolved = _resolve_trusted_path_executable("uv")
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    def test_git_worktree_file_marks_vcs_root(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A regular worktree `.git` pointer establishes the VCS boundary."""
+        project = tmp_path / "worktree"
+        project_bin = project / "bin"
+        nested = project / "src" / "nested"
+        trusted_bin = tmp_path / "trusted"
+        git_dir = tmp_path / "git-data" / "worktrees" / "demo"
+        project_bin.mkdir(parents=True)
+        nested.mkdir(parents=True)
+        trusted_bin.mkdir()
+        git_dir.mkdir(parents=True)
+        (project / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+        suffix = ".exe" if os.name == "nt" else ""
+        self._add_executable(project_bin, "uv", suffix=suffix)
+        expected = self._add_executable(trusted_bin, "uv", suffix=suffix)
+        monkeypatch.chdir(nested)
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join((str(project_bin), str(trusted_bin))),
+        )
+        if os.name == "nt":
+            monkeypatch.setenv("PATHEXT", ".EXE")
+
+        resolved = _resolve_trusted_path_executable("uv")
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    def test_project_env_server_root_cannot_shrink_vcs_boundary(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Project-controlled server transport values cannot bless repo tools."""
+        project = tmp_path / "project"
+        project_bin = project / "bin"
+        nested = project / "nested"
+        trusted_bin = tmp_path / "trusted"
+        project_bin.mkdir(parents=True)
+        nested.mkdir()
+        trusted_bin.mkdir()
+        (project / ".git").mkdir()
+        malicious_root = nested
+        (project / ".env").write_text(
+            "DEEPAGENTS_CODE_SERVER_PROJECT_ROOT="
+            f"{malicious_root}\n"
+            f"DEEPAGENTS_CODE_SERVER_CWD={trusted_bin}\n",
+            encoding="utf-8",
+        )
+        suffix = ".exe" if os.name == "nt" else ""
+        self._add_executable(project_bin, "uv", suffix=suffix)
+        expected = self._add_executable(trusted_bin, "uv", suffix=suffix)
+        monkeypatch.chdir(nested)
+        monkeypatch.setenv(
+            "DEEPAGENTS_CODE_SERVER_PROJECT_ROOT",
+            str(malicious_root),
+        )
+        monkeypatch.setenv("DEEPAGENTS_CODE_SERVER_CWD", str(trusted_bin))
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join((str(project_bin), str(trusted_bin))),
+        )
+        if os.name == "nt":
+            monkeypatch.setenv("PATHEXT", ".EXE")
+
+        resolved = _resolve_trusted_path_executable("uv")
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows executable semantics")
+    def test_windows_accepts_uv_exe_and_ignores_script_pathext(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        script_bin = tmp_path / "scripts"
+        native_bin = tmp_path / "native"
+        script_bin.mkdir()
+        native_bin.mkdir()
+        self._add_executable(script_bin, "uv", suffix=".cmd")
+        expected = self._add_executable(native_bin, "uv", suffix=".ExE")
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join((str(script_bin), str(native_bin))),
+        )
+        monkeypatch.setenv("PATHEXT", ".CMD;.BAT;.PS1")
+
+        resolved = _resolve_trusted_path_executable("uv")
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows executable semantics")
+    @pytest.mark.parametrize("suffix", [".exe", ".com"])
+    def test_windows_accepts_native_application_files(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        suffix: str,
+    ) -> None:
+        native_bin = tmp_path / "native"
+        native_bin.mkdir()
+        expected = self._add_executable(native_bin, "uv", suffix=suffix)
+        monkeypatch.setenv("PATH", str(native_bin))
+
+        resolved = _resolve_trusted_path_executable("uv")
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows executable semantics")
+    @pytest.mark.parametrize("suffix", [".cmd", ".bat", ".ps1", ".py"])
+    def test_windows_rejects_script_executables(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        suffix: str,
+    ) -> None:
+        script_bin = tmp_path / "scripts"
+        script_bin.mkdir()
+        self._add_executable(script_bin, "uv", suffix=suffix)
+        monkeypatch.setenv("PATH", str(script_bin))
+        monkeypatch.setenv("PATHEXT", ".COM;.EXE;.CMD;.BAT;.PS1;.PY")
+
+        assert _resolve_trusted_path_executable("uv") is None
+        assert _resolve_trusted_path_executable(f"uv{suffix}") is None
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows executable semantics")
+    def test_windows_rejects_symlinked_native_executable(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        native_bin = tmp_path / "native"
+        native_bin.mkdir()
+        target = self._add_executable(native_bin, "real-uv", suffix=".exe")
+        candidate = native_bin / "uv.exe"
+        try:
+            candidate.symlink_to(target)
+        except OSError as exc:
+            pytest.skip(f"Windows symlink creation unavailable: {exc}")
+        monkeypatch.setenv("PATH", str(native_bin))
+
+        assert _resolve_trusted_path_executable("uv") is None
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows executable semantics")
+    def test_windows_rejects_reparse_path_to_native_executable(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        real_bin = tmp_path / "real-bin"
+        linked_bin = tmp_path / "linked-bin"
+        real_bin.mkdir()
+        self._add_executable(real_bin, "uv", suffix=".exe")
+        try:
+            linked_bin.symlink_to(real_bin, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"Windows directory symlink creation unavailable: {exc}")
+        monkeypatch.setenv("PATH", str(linked_bin))
+
+        assert _resolve_trusted_path_executable("uv") is None
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX executable semantics")
+    def test_posix_accepts_brew_executable(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        trusted_bin = tmp_path / "trusted"
+        trusted_bin.mkdir()
+        expected = self._add_executable(trusted_bin, "brew")
+        monkeypatch.setenv("PATH", str(trusted_bin))
+
+        resolved = _resolve_trusted_path_executable("brew")
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX executable semantics")
+    def test_posix_keeps_executable_symlink_support(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        real_bin = tmp_path / "real-bin"
+        path_bin = tmp_path / "path-bin"
+        real_bin.mkdir()
+        path_bin.mkdir()
+        target = self._add_executable(real_bin, "brew")
+        candidate = path_bin / "brew"
+        candidate.symlink_to(target)
+        monkeypatch.setenv("PATH", str(path_bin))
+
+        resolved = _resolve_trusted_path_executable("brew")
+
+        assert resolved is not None
+        assert candidate.samefile(resolved)
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows executable semantics")
+    async def test_windows_cmd_metacharacter_injection_is_rejected(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A `.cmd` package manager never receives cmd.exe metacharacters."""
+        script_bin = tmp_path / "scripts"
+        script_bin.mkdir()
+        (script_bin / "uv.cmd").write_text(
+            "@echo off\r\nexit /b 0\r\n",
+            encoding="utf-8",
+        )
+        injected = tmp_path / "injected.txt"
+        payload = f"safe&echo injected>{injected}"
+        monkeypatch.setenv("PATH", str(script_bin))
+        monkeypatch.setenv("PATHEXT", ".CMD;.EXE")
+
+        with patch.object(
+            update_check_module.asyncio,
+            "create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as create:
+            success, output = await _run_install_subprocess(
+                ("uv", "tool", "install", payload),
+                progress=None,
+                log_path=tmp_path / "install.log",
+            )
+
+        assert success is False
+        assert "trusted PATH location" in output
+        create.assert_not_awaited()
+        assert not injected.exists()
+
+    async def test_no_trusted_executable_fails_before_process_creation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        project = tmp_path / "project"
+        project_bin = project / "bin"
+        project_bin.mkdir(parents=True)
+        (project / ".git").mkdir()
+        suffix = ".exe" if os.name == "nt" else ""
+        self._add_executable(project, "uv", suffix=suffix)
+        self._add_executable(project_bin, "uv", suffix=suffix)
+        monkeypatch.chdir(project)
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join(("", ".", "bin", str(project), str(project_bin))),
+        )
+        if os.name == "nt":
+            monkeypatch.setenv("PATHEXT", ".EXE")
+
+        with (
+            patch.object(
+                update_check_module,
+                "_resolve_trusted_path_executable",
+                wraps=_resolve_trusted_path_executable,
+            ) as resolve,
+            patch.object(
+                update_check_module.asyncio,
+                "create_subprocess_exec",
+                new_callable=AsyncMock,
+            ) as create,
+        ):
+            success, output = await _run_install_subprocess(
+                ("uv", "--version"),
+                progress=None,
+                log_path=project / "install.log",
+            )
+
+        assert success is False
+        assert "trusted PATH location" in output
+        assert "absolute" in output
+        assert "outside the active project" in output
+        resolve.assert_called_once_with("uv")
+        create.assert_not_awaited()
+
+    async def test_taskkill_never_falls_back_to_bare_executable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("SYSTEMROOT", raising=False)
+        monkeypatch.delenv("WINDIR", raising=False)
+
+        with patch.object(
+            update_check_module.asyncio,
+            "create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as create:
+            await update_check_module._taskkill_windows_process_tree(1234)
+
+        create.assert_not_awaited()
+
+    def test_taskkill_rejects_project_controlled_systemroot(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        project = tmp_path / "project"
+        system32 = project / "System32"
+        system32.mkdir(parents=True)
+        (project / ".git").mkdir()
+        self._add_executable(
+            system32,
+            "taskkill",
+            suffix=".exe",
+        )
+        monkeypatch.chdir(project)
+        monkeypatch.setenv("SYSTEMROOT", str(project))
+
+        assert update_check_module._windows_taskkill_path() is None
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows cwd lookup semantics")
+    async def test_windows_cwd_uv_never_reaches_create_process(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        project = tmp_path / "project"
+        trusted_bin = tmp_path / "trusted"
+        project.mkdir()
+        (project / ".git").mkdir()
+        trusted_bin.mkdir()
+        self._add_executable(project, "uv", suffix=".exe")
+        expected = self._add_executable(trusted_bin, "uv", suffix=".exe")
+        monkeypatch.chdir(project)
+        monkeypatch.setenv("PATH", str(trusted_bin))
+        monkeypatch.setenv("PATHEXT", ".EXE")
+        proc = MagicMock()
+
+        with (
+            patch.object(
+                update_check_module,
+                "_resolve_trusted_path_executable",
+                wraps=_resolve_trusted_path_executable,
+            ) as resolve,
+            patch.object(
+                update_check_module.asyncio,
+                "create_subprocess_exec",
+                new_callable=AsyncMock,
+                return_value=proc,
+            ) as create,
+            patch.object(
+                update_check_module,
+                "_assign_windows_job_and_resume",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                update_check_module,
+                "_wait_for_install_process",
+                new=AsyncMock(return_value=(0, False)),
+            ),
+        ):
+            success, output = await _run_install_subprocess(
+                ("uv", "--version"),
+                progress=None,
+                log_path=project / "install.log",
+            )
+
+        assert success is True
+        assert output == ""
+        launched = create.await_args
+        assert launched is not None
+        launched_executable = Path(launched.args[0])
+        assert launched_executable.is_absolute()
+        assert expected.samefile(launched_executable)
+        resolve.assert_called_once_with("uv")
 
 
 class TestParseVersion:
@@ -2001,7 +2722,13 @@ class TestDetectShadowedDcode:
         assert "earlier on your PATH" in rendered
         command = format_shadowed_dcode_fix_command(shadow)
         assert command.replace("\n", "\n  ") in rendered
-        assert "hash -r" in rendered
+        if os.name == "nt":
+            assert "PowerShell:" in rendered
+            assert "cmd.exe:" in rendered
+            assert "$env:PATH" in rendered
+            assert "%PATH%" in rendered
+        else:
+            assert "hash -r" in rendered
         assert "rm " not in rendered
 
     def test_warning_text_quotes_fix_command_path(self, tmp_path) -> None:
@@ -2013,26 +2740,108 @@ class TestDetectShadowedDcode:
 
         rendered = format_shadowed_dcode_warning(shadow)
         command = format_shadowed_dcode_fix_command(shadow)
-        quoted_bin_dir = shlex.quote(str(shadow.upgraded_bin_dir))
 
-        assert (
-            command
-            == f"export PATH={quoted_bin_dir}:$PATH\nhash -r 2>/dev/null || true"
-        )
+        if os.name == "nt":
+            quoted_bin_dir = str(shadow.upgraded_bin_dir).replace("'", "''")
+            assert command == (
+                "PowerShell:\n"
+                f"  $env:PATH = '{quoted_bin_dir};' + $env:PATH\n"
+                "cmd.exe:\n"
+                f'  set "PATH={shadow.upgraded_bin_dir};%PATH%"'
+            )
+        else:
+            quoted_bin_dir = shlex.quote(str(shadow.upgraded_bin_dir))
+            assert (
+                command
+                == f"export PATH={quoted_bin_dir}:$PATH\nhash -r 2>/dev/null || true"
+            )
         assert command.replace("\n", "\n  ") in rendered
 
-    def test_windows_fix_command_uses_powershell_literal_path(self, tmp_path) -> None:
-        """PowerShell paths must not expand `$` or evaluate subexpressions."""
+    def test_windows_fix_commands_quote_both_shell_forms(self, tmp_path) -> None:
+        """Both Windows shell commands safely contain spaces and metacharacters."""
         shadow = ShadowedDcode(
             shadowing_bin=tmp_path / "old-bin" / "dcode",
-            upgraded_bin_dir=tmp_path / "uv $dcode's $(bin)",
+            upgraded_bin_dir=tmp_path / "uv $dcode's $(bin) & caret^ %PATH%",
         )
 
         with patch("deepagents_code.update_check.os.name", "nt"):
             command = format_shadowed_dcode_fix_command(shadow)
 
-        quoted_bin_dir = str(shadow.upgraded_bin_dir).replace("'", "''")
-        assert command == f"$env:PATH = '{quoted_bin_dir};' + $env:PATH"
+        bin_dir = str(shadow.upgraded_bin_dir)
+        powershell_path = bin_dir.replace("'", "''")
+        assert command == (
+            "PowerShell:\n"
+            f"  $env:PATH = '{powershell_path};' + $env:PATH\n"
+            "cmd.exe:\n"
+            f'  for %# in (%) do @set "PATH='
+            f'{bin_dir.replace("%", "%#")};%PATH%"'
+        )
+
+    @pytest.mark.skipif(os.name != "nt", reason="requires native Windows shells")
+    def test_windows_fix_commands_execute_with_metacharacters(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Both rendered commands prepend the literal Windows directory."""
+        upgraded_bin_dir = tmp_path / "uv $dcode's $(bin) & caret^ %PATH%"
+        upgraded_bin_dir.mkdir()
+        shadow = ShadowedDcode(
+            shadowing_bin=tmp_path / "old-bin" / "dcode",
+            upgraded_bin_dir=upgraded_bin_dir,
+        )
+        lines = format_shadowed_dcode_fix_command(shadow).splitlines()
+        powershell_command = lines[1].strip()
+        cmd_command = lines[3].strip()
+
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        assert powershell is not None
+        powershell_result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-Command",
+                f"{powershell_command}; [Console]::Write($env:PATH)",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert powershell_result.returncode == 0, powershell_result.stderr
+        assert (
+            powershell_result.stdout.split(os.pathsep, 1)[0].casefold()
+            == str(upgraded_bin_dir).casefold()
+        )
+
+        cmd_result = subprocess.run(
+            [
+                os.environ.get("COMSPEC", "cmd.exe"),
+                "/d",
+                "/v:off",
+                "/q",
+            ],
+            input=f"{cmd_command}\r\nset PATH\r\nexit\r\n",
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert cmd_result.returncode == 0, cmd_result.stderr
+        expected_prefix = f"path={upgraded_bin_dir}{os.pathsep}".casefold()
+        assert expected_prefix in cmd_result.stdout.casefold()
+
+    def test_posix_fix_command_remains_unchanged(self, tmp_path) -> None:
+        """Linux and macOS keep the existing POSIX remediation command."""
+        shadow = ShadowedDcode(
+            shadowing_bin=tmp_path / "old-bin" / "dcode",
+            upgraded_bin_dir=tmp_path / "uv bin's dir",
+        )
+
+        with patch("deepagents_code.update_check.os.name", "posix"):
+            command = format_shadowed_dcode_fix_command(shadow)
+
+        quoted_bin_dir = shlex.quote(str(shadow.upgraded_bin_dir))
+        assert command == (
+            f"export PATH={quoted_bin_dir}:$PATH\nhash -r 2>/dev/null || true"
+        )
 
     def test_canonicalize_failure_continues_to_deepagents_code_name(
         self, tmp_path
@@ -2183,8 +2992,8 @@ class TestUpdateLogs:
             # depend on a real `uv-receipt.toml`; the assertion is about
             # log-creation failure surfacing through.
             patch(
-                "deepagents_code.update_check.upgrade_install_command",
-                return_value="printf 'ok\\n'",
+                "deepagents_code.update_check._upgrade_install_argv",
+                return_value=_python_argv("print('ok')"),
             ),
         ):
             success, output = await perform_upgrade(log_path=log_path)
@@ -2208,8 +3017,8 @@ class TestUpdateLogs:
             # out so the test can focus on the log-close-failure assertion
             # rather than fight with the broad `pathlib.Path.open` mock.
             patch(
-                "deepagents_code.update_check.upgrade_install_command",
-                return_value="printf 'ok\\n'",
+                "deepagents_code.update_check._upgrade_install_argv",
+                return_value=_python_argv("print('ok')"),
             ),
             patch("pathlib.Path.open", opener),
         ):
@@ -2267,7 +3076,14 @@ class TestUpdateLogs:
         await_args = run_mock.await_args
         assert await_args is not None
         assert await_args.args[0] == (
-            "uv tool install -U deepagents-code --prerelease allow"
+            "uv",
+            "--no-config",
+            "tool",
+            "install",
+            "-U",
+            "deepagents-code",
+            "--prerelease",
+            "allow",
         )
 
     async def test_perform_upgrade_uses_targeted_constraints_for_target_dependency(
@@ -2292,11 +3108,10 @@ class TestUpdateLogs:
         )
         seen: dict[str, object] = {}
 
-        def _capture(cmd: str, **_kwargs: object) -> tuple[bool, str]:
-            args = shlex.split(cmd)
-            idx = args.index("--constraints")
-            constraints_path = Path(args[idx + 1])
-            seen["cmd"] = cmd
+        def _capture(argv: Sequence[str], **_kwargs: object) -> tuple[bool, str]:
+            idx = argv.index("--constraints")
+            constraints_path = Path(argv[idx + 1])
+            seen["argv"] = tuple(argv)
             seen["existed_during_run"] = constraints_path.exists()
             seen["contents"] = constraints_path.read_text(encoding="utf-8")
             seen["path"] = constraints_path
@@ -2329,10 +3144,12 @@ class TestUpdateLogs:
             success, _output = await perform_upgrade(target_version="1.1.0")
 
         assert success is True
-        cmd = str(seen["cmd"])
-        assert "deepagents-code==1.1.0" in cmd
-        assert "--prerelease if-necessary-or-explicit" in cmd
-        assert "--prerelease allow" not in cmd
+        argv = seen["argv"]
+        assert isinstance(argv, tuple)
+        assert "deepagents-code==1.1.0" in argv
+        prerelease_index = argv.index("--prerelease")
+        assert argv[prerelease_index + 1] == "if-necessary-or-explicit"
+        assert "allow" not in argv
         # Constraints file is present during the subprocess, removed afterwards.
         assert seen["existed_during_run"] is True
         assert seen["contents"] == "deepagents==0.7.0a7\n"
@@ -2386,12 +3203,12 @@ class TestUpdateLogs:
         assert success is True
         await_args = run_mock.await_args
         assert await_args is not None
-        cmd = str(await_args.args[0])
-        assert "--python 3.13" in cmd
-        assert "'deepagents-code[litellm,openai]==1.1.0'" in cmd
-        assert "--with langchain-custom" in cmd
-        assert "--prerelease if-necessary-or-explicit" in cmd
-        assert "--prerelease allow" not in cmd
+        argv = await_args.args[0]
+        assert argv[argv.index("--python") + 1] == "3.13"
+        assert "deepagents-code[litellm,openai]==1.1.0" in argv
+        assert argv[argv.index("--with") + 1] == "langchain-custom"
+        assert argv[argv.index("--prerelease") + 1] == "if-necessary-or-explicit"
+        assert "allow" not in argv
 
     async def test_perform_upgrade_fallback_uses_targeted_constraints(
         self, cache_file
@@ -2428,11 +3245,18 @@ class TestUpdateLogs:
         run_mock.assert_awaited_once()
         await_args = run_mock.await_args
         assert await_args is not None
-        cmd = str(await_args.args[0])
-        assert cmd.startswith("uv tool install -U deepagents-code==1.1.0")
-        assert "--constraints " in cmd
-        assert "--prerelease if-necessary-or-explicit" in cmd
-        assert "--prerelease allow" not in cmd
+        argv = await_args.args[0]
+        assert argv[:6] == (
+            "uv",
+            "--no-config",
+            "tool",
+            "install",
+            "-U",
+            "deepagents-code==1.1.0",
+        )
+        assert "--constraints" in argv
+        assert argv[argv.index("--prerelease") + 1] == "if-necessary-or-explicit"
+        assert "allow" not in argv
 
     async def test_perform_upgrade_constraints_file_failure_leaves_install(
         self, cache_file
@@ -2503,7 +3327,14 @@ class TestUpdateLogs:
         await_args = run_mock.await_args
         assert await_args is not None
         assert await_args.args[0] == (
-            "uv tool install -U deepagents-code --prerelease allow"
+            "uv",
+            "--no-config",
+            "tool",
+            "install",
+            "-U",
+            "deepagents-code",
+            "--prerelease",
+            "allow",
         )
 
     async def test_perform_upgrade_uses_unpinned_uv_install_by_default(self) -> None:
@@ -2546,7 +3377,14 @@ class TestUpdateLogs:
         run_mock.assert_awaited_once()
         await_args = run_mock.await_args
         assert await_args is not None
-        assert await_args.args[0] == "uv tool install -U deepagents-code"
+        assert await_args.args[0] == (
+            "uv",
+            "--no-config",
+            "tool",
+            "install",
+            "-U",
+            "deepagents-code",
+        )
 
     async def test_perform_upgrade_preserves_installed_extras(self) -> None:
         """An upgrade must not silently drop the user's installed extras.
@@ -2587,7 +3425,12 @@ class TestUpdateLogs:
         await_args = run_mock.await_args
         assert await_args is not None
         assert await_args.args[0] == (
-            "uv tool install -U 'deepagents-code[nvidia,quickjs]'"
+            "uv",
+            "--no-config",
+            "tool",
+            "install",
+            "-U",
+            "deepagents-code[nvidia,quickjs]",
         )
 
     async def test_perform_upgrade_falls_back_when_receipt_introspection_fails(
@@ -2621,7 +3464,14 @@ class TestUpdateLogs:
         run_mock.assert_awaited_once()
         await_args = run_mock.await_args
         assert await_args is not None
-        assert await_args.args[0] == "uv tool install -U deepagents-code"
+        assert await_args.args[0] == (
+            "uv",
+            "--no-config",
+            "tool",
+            "install",
+            "-U",
+            "deepagents-code",
+        )
 
     async def test_perform_upgrade_fallback_warns_user_about_dropped_extras(
         self,
@@ -2688,7 +3538,10 @@ class TestUpdateLogs:
                 "deepagents_code.update_check.detect_install_method",
                 return_value="brew",
             ),
-            patch("deepagents_code.update_check.shutil.which", return_value=None),
+            patch(
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=None,
+            ),
             patch(
                 "deepagents_code.update_check._run_install_subprocess",
                 new_callable=AsyncMock,
@@ -2697,7 +3550,7 @@ class TestUpdateLogs:
             success, output = await perform_upgrade()
 
         assert success is False
-        assert output == "brew not found on PATH."
+        assert "`brew` not found in a trusted PATH location." in output
         run_mock.assert_not_awaited()
 
     def test_upgrade_command_prerelease(self) -> None:
@@ -2709,7 +3562,7 @@ class TestUpdateLogs:
         """
         assert (
             upgrade_command(include_prereleases=True)
-            == "uv tool install -U deepagents-code --prerelease allow"
+            == "uv --no-config tool install -U deepagents-code --prerelease allow"
         )
 
     def test_upgrade_command_pins_target_with_prerelease_deps(self) -> None:
@@ -2719,7 +3572,8 @@ class TestUpdateLogs:
                 include_prereleases=True,
                 version="1.1.0",
             )
-            == "uv tool install -U deepagents-code==1.1.0 --prerelease allow"
+            == "uv --no-config tool install -U "
+            "deepagents-code==1.1.0 --prerelease allow"
         )
 
     def test_dependency_refresh_command_pins_current_version(
@@ -2734,7 +3588,7 @@ class TestUpdateLogs:
         ):
             assert (
                 dependency_refresh_command(version="1.2.3")
-                == "uv tool install -U deepagents-code==1.2.3"
+                == "uv --no-config tool install -U deepagents-code==1.2.3"
             )
 
     def test_dependency_refresh_command_preserves_extras(
@@ -2752,8 +3606,9 @@ class TestUpdateLogs:
                     version="1.2.3",
                     include_prereleases=True,
                 )
-                == "uv tool install -U "
-                "'deepagents-code[nvidia,quickjs]==1.2.3' --prerelease allow"
+                == "uv --no-config tool install -U "
+                f"{_shell_arg('deepagents-code[nvidia,quickjs]==1.2.3')} "
+                "--prerelease allow"
             )
 
     def test_dependency_refresh_command_preserves_with_packages(
@@ -2775,7 +3630,7 @@ class TestUpdateLogs:
             return_value=frozenset(),
         ):
             assert dependency_refresh_command(version="1.2.3") == (
-                "uv tool install -U deepagents-code==1.2.3 "
+                "uv --no-config tool install -U deepagents-code==1.2.3 "
                 "--with langchain-custom --with langchain.another_provider"
             )
 
@@ -2795,7 +3650,7 @@ class TestUpdateLogs:
             return_value=frozenset(),
         ):
             assert dependency_refresh_command(version="1.2.3") == (
-                "uv tool install -U --python 3.13 deepagents-code==1.2.3"
+                "uv --no-config tool install -U --python 3.13 deepagents-code==1.2.3"
             )
 
     def test_dependency_refresh_command_quotes_uv_python(
@@ -2814,7 +3669,8 @@ class TestUpdateLogs:
             return_value=frozenset(),
         ):
             assert dependency_refresh_command(version="1.2.3") == (
-                "uv tool install -U --python '/opt/Python 3.13/bin/python' "
+                "uv --no-config tool install -U --python "
+                f"{_shell_arg('/opt/Python 3.13/bin/python')} "
                 "deepagents-code==1.2.3 --with langchain-custom"
             )
 
@@ -2895,9 +3751,9 @@ class TestUpdateLogs:
                 include_prereleases=True,
                 python="/opt/Dcode Python/bin/python",
             ) == (
-                "uv pip install --dry-run --python "
-                "'/opt/Dcode Python/bin/python' -U "
-                "'deepagents-code[quickjs]==1.2.3' langchain-custom "
+                f"uv --no-config pip install --dry-run --python "
+                f"{_shell_arg('/opt/Dcode Python/bin/python')} -U "
+                f"{_shell_arg('deepagents-code[quickjs]==1.2.3')} langchain-custom "
                 "--prerelease allow"
             )
 
@@ -2910,7 +3766,10 @@ class TestUpdateLogs:
                 "deepagents_code.update_check.detect_install_method",
                 return_value="uv",
             ),
-            patch("shutil.which", return_value="/usr/bin/uv"),
+            patch(
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=_test_executable(),
+            ),
             patch(
                 "deepagents_code.extras_info.installed_extra_names",
                 return_value=frozenset(),
@@ -2932,8 +3791,15 @@ class TestUpdateLogs:
         await_args = run_mock.await_args
         assert await_args is not None
         assert await_args.args[0] == (
-            f"uv pip install --dry-run --python {shlex.quote(sys.executable)} "
-            f"-U deepagents-code=={__version__}"
+            "uv",
+            "--no-config",
+            "pip",
+            "install",
+            "--dry-run",
+            "--python",
+            sys.executable,
+            "-U",
+            f"deepagents-code=={__version__}",
         )
 
     async def test_perform_dependency_refresh_uses_pinned_uv_command(self) -> None:
@@ -2943,7 +3809,10 @@ class TestUpdateLogs:
                 "deepagents_code.update_check.detect_install_method",
                 return_value="uv",
             ),
-            patch("shutil.which", return_value="/usr/bin/uv"),
+            patch(
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=_test_executable(),
+            ),
             patch(
                 "deepagents_code.extras_info.installed_extra_names",
                 return_value=frozenset(),
@@ -2969,7 +3838,12 @@ class TestUpdateLogs:
         await_args = run_mock.await_args
         assert await_args is not None
         assert await_args.args[0] == (
-            f"uv tool install -U deepagents-code=={__version__}"
+            "uv",
+            "--no-config",
+            "tool",
+            "install",
+            "-U",
+            f"deepagents-code=={__version__}",
         )
 
     async def test_perform_dependency_refresh_reports_with_package_errors(
@@ -2981,9 +3855,12 @@ class TestUpdateLogs:
                 "deepagents_code.update_check.detect_install_method",
                 return_value="uv",
             ),
-            patch("shutil.which", return_value="/usr/bin/uv"),
             patch(
-                "deepagents_code.update_check.dependency_refresh_command",
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=_test_executable(),
+            ),
+            patch(
+                "deepagents_code.update_check._dependency_refresh_argv",
                 side_effect=ToolRequirementIntrospectionError("receipt broken"),
             ),
         ):
@@ -3054,7 +3931,10 @@ class TestUpdateLogs:
                 "deepagents_code.update_check.detect_install_method",
                 return_value="uv",
             ),
-            patch("shutil.which", return_value=None),
+            patch(
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=None,
+            ),
             patch(
                 "deepagents_code.update_check._run_install_subprocess",
                 new_callable=AsyncMock,
@@ -3063,7 +3943,7 @@ class TestUpdateLogs:
             success, output = await perform_dependency_refresh()
 
         assert success is False
-        assert "`uv` not found on PATH." in output
+        assert "`uv` not found in a trusted PATH location." in output
         run_mock.assert_not_awaited()
 
     def test_prerelease_upgrade_supported_for_uv(self) -> None:
@@ -3111,7 +3991,10 @@ class TestUpgradeInstallCommand:
             "deepagents_code.extras_info.installed_extra_names",
             return_value=frozenset(),
         ):
-            assert upgrade_install_command() == "uv tool install -U deepagents-code"
+            assert (
+                upgrade_install_command()
+                == "uv --no-config tool install -U deepagents-code"
+            )
 
     def test_pins_target_version_when_requested(self, tmp_path, monkeypatch) -> None:
         """Target pins prevent prerelease dependency mode from floating the app."""
@@ -3125,7 +4008,9 @@ class TestUpgradeInstallCommand:
                 version="1.1.0",
                 include_prereleases=True,
             ) == (
-                "uv tool install -U 'deepagents-code[openai]==1.1.0' --prerelease allow"
+                f"uv --no-config tool install -U "
+                f"{_shell_arg('deepagents-code[openai]==1.1.0')} "
+                "--prerelease allow"
             )
 
     def test_preserves_extras_and_prerelease(self, tmp_path, monkeypatch) -> None:
@@ -3137,7 +4022,8 @@ class TestUpgradeInstallCommand:
             return_value=frozenset({"quickjs", "nvidia"}),
         ):
             assert upgrade_install_command(include_prereleases=True) == (
-                "uv tool install -U 'deepagents-code[nvidia,quickjs]' "
+                f"uv --no-config tool install -U "
+                f"{_shell_arg('deepagents-code[nvidia,quickjs]')} "
                 "--prerelease allow"
             )
 
@@ -3160,10 +4046,15 @@ class TestUpgradeInstallCommand:
         ):
             cmd = upgrade_install_command(
                 include_prereleases=True,
-                constraints_path=Path("/tmp/pins.txt"),
+                constraints_path=tmp_path / "pins.txt",
                 prerelease_strategy="if-necessary-or-explicit",
             )
-        assert "--constraints /tmp/pins.txt" in cmd
+        expected_path = (
+            subprocess.list2cmdline([str(tmp_path / "pins.txt")])
+            if os.name == "nt"
+            else shlex.quote(str(tmp_path / "pins.txt"))
+        )
+        assert f"--constraints {expected_path}" in cmd
         assert "--prerelease if-necessary-or-explicit" in cmd
         assert "--prerelease allow" not in cmd
 
@@ -3185,7 +4076,7 @@ class TestUpgradeInstallCommand:
                 constraints_path=spaced,
                 prerelease_strategy="if-necessary-or-explicit",
             )
-        assert f"--constraints {shlex.quote(str(spaced))}" in cmd
+        assert f"--constraints {_shell_arg(str(spaced))}" in cmd
         assert f"--constraints {spaced}" not in cmd
 
     def test_preserves_with_packages(self, tmp_path, monkeypatch) -> None:
@@ -3204,7 +4095,7 @@ class TestUpgradeInstallCommand:
             return_value=frozenset(),
         ):
             assert upgrade_install_command() == (
-                "uv tool install -U deepagents-code "
+                "uv --no-config tool install -U deepagents-code "
                 "--with langchain-custom --with langchain.another_provider"
             )
 
@@ -3226,7 +4117,8 @@ class TestUpgradeInstallCommand:
             return_value=frozenset(),
         ):
             assert upgrade_install_command() == (
-                "uv tool install -U --python '/opt/Python 3.13/bin/python' "
+                "uv --no-config tool install -U --python "
+                f"{_shell_arg('/opt/Python 3.13/bin/python')} "
                 "deepagents-code --with langchain-custom"
             )
 
@@ -3489,8 +4381,9 @@ class TestInstallExtraCommand:
         )
 
         assert install_extra_recovery_command("quickjs") == (
-            "uv tool install --reinstall -U --python '/opt/Python 3.13/bin/python' "
-            f"'deepagents-code[nvidia,quickjs]=={__version__}' "
+            f"uv --no-config tool install --reinstall -U --python "
+            f"{_shell_arg('/opt/Python 3.13/bin/python')} "
+            f"{_shell_arg(f'deepagents-code[nvidia,quickjs]=={__version__}')} "
             "--with langchain-custom --prerelease allow"
         )
 
@@ -3549,8 +4442,9 @@ class TestInstallExtraCommand:
         assert _install_extra_uv_tool_command(
             "baseten", distribution_name="deepagents-code"
         ) == (
-            "uv tool install --reinstall -U "
-            f"'deepagents-code[baseten,nvidia]=={__version__}' --prerelease allow"
+            "uv --no-config tool install --reinstall -U "
+            f"{_shell_arg(f'deepagents-code[baseten,nvidia]=={__version__}')} "
+            "--prerelease allow"
         )
 
     def test_uv_install_extra_command_dedupes_existing_extra(
@@ -3570,8 +4464,9 @@ class TestInstallExtraCommand:
         assert _install_extra_uv_tool_command(
             "nvidia", distribution_name="deepagents-code"
         ) == (
-            "uv tool install --reinstall -U "
-            f"'deepagents-code[nvidia]=={__version__}' --prerelease allow"
+            "uv --no-config tool install --reinstall -U "
+            f"{_shell_arg(f'deepagents-code[nvidia]=={__version__}')} "
+            "--prerelease allow"
         )
 
     def test_uv_install_extra_command_drops_composite_extras(
@@ -3596,8 +4491,9 @@ class TestInstallExtraCommand:
         assert _install_extra_uv_tool_command(
             "baseten", distribution_name="deepagents-code"
         ) == (
-            "uv tool install --reinstall -U "
-            f"'deepagents-code[baseten,nvidia]=={__version__}' --prerelease allow"
+            "uv --no-config tool install --reinstall -U "
+            f"{_shell_arg(f'deepagents-code[baseten,nvidia]=={__version__}')} "
+            "--prerelease allow"
         )
 
     def test_uv_install_extra_command_preserves_receipt_python_and_with_packages(
@@ -3623,8 +4519,9 @@ class TestInstallExtraCommand:
         )
 
         assert command == (
-            "uv tool install --reinstall -U --python '/opt/Python 3.13/bin/python' "
-            f"'deepagents-code[baseten,nvidia]=={__version__}' "
+            f"uv --no-config tool install --reinstall -U --python "
+            f"{_shell_arg('/opt/Python 3.13/bin/python')} "
+            f"{_shell_arg(f'deepagents-code[baseten,nvidia]=={__version__}')} "
             "--with langchain-custom --prerelease allow"
         )
 
@@ -3675,7 +4572,7 @@ class TestInstallPackageCommand:
         assert install_package_command(
             "langchain-custom", distribution_name="deepagents-code"
         ) == (
-            "uv tool install --reinstall -U "
+            "uv --no-config tool install --reinstall -U "
             f"deepagents-code=={__version__} --with langchain-custom "
             "--prerelease allow"
         )
@@ -3693,7 +4590,7 @@ class TestInstallPackageCommand:
         assert install_package_command(
             "langchain.custom_provider", distribution_name="deepagents-code"
         ) == (
-            "uv tool install --reinstall -U "
+            "uv --no-config tool install --reinstall -U "
             f"deepagents-code=={__version__} --with langchain.custom_provider "
             "--prerelease allow"
         )
@@ -3717,8 +4614,9 @@ class TestInstallPackageCommand:
         assert install_package_command(
             "langchain-custom", distribution_name="deepagents-code"
         ) == (
-            "uv tool install --reinstall -U "
-            f"'deepagents-code[nvidia]=={__version__}' --with langchain-custom "
+            "uv --no-config tool install --reinstall -U "
+            f"{_shell_arg(f'deepagents-code[nvidia]=={__version__}')} "
+            "--with langchain-custom "
             "--prerelease allow"
         )
 
@@ -3745,8 +4643,10 @@ class TestInstallPackageCommand:
         )
 
         assert command == (
-            "uv tool install --reinstall -U --python '/opt/Python 3.13/bin/python' "
-            f"'deepagents-code[nvidia]=={__version__}' --with langchain-first "
+            f"uv --no-config tool install --reinstall -U --python "
+            f"{_shell_arg('/opt/Python 3.13/bin/python')} "
+            f"{_shell_arg(f'deepagents-code[nvidia]=={__version__}')} "
+            "--with langchain-first "
             "--with langchain-second --prerelease allow"
         )
 
@@ -3767,7 +4667,7 @@ class TestInstallPackageCommand:
         )
 
         assert command == (
-            "uv tool install --reinstall -U "
+            "uv --no-config tool install --reinstall -U "
             f"deepagents-code=={__version__} --with langchain-custom "
             "--prerelease allow"
         )
@@ -3785,7 +4685,8 @@ class TestInstallPackageCommand:
             )
 
         assert command == (
-            "uv tool install --reinstall -U deepagents-code==1.0.0a1 "
+            "uv --no-config tool install --reinstall -U "
+            "deepagents-code==1.0.0a1 "
             "--with langchain-custom --prerelease allow"
         )
 
@@ -3804,7 +4705,7 @@ class TestInstallPackageCommand:
             )
 
         assert command == (
-            "uv tool install --reinstall -U deepagents-code==1.0.0 "
+            "uv --no-config tool install --reinstall -U deepagents-code==1.0.0 "
             "--with langchain-custom --prerelease allow"
         )
 
@@ -3832,7 +4733,7 @@ class TestInstallPackageCommand:
         )
 
         assert command == (
-            "uv tool install --reinstall -U "
+            "uv --no-config tool install --reinstall -U "
             f"deepagents-code=={__version__} --with langchain-zeta "
             "--with langchain-alpha --prerelease allow"
         )
@@ -3987,12 +4888,12 @@ class TestPerformInstallExtra:
                 return_value="uv",
             ),
             patch(
-                "deepagents_code.update_check.shutil.which",
-                return_value="/usr/bin/uv",
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=_test_executable(),
             ),
             patch(
-                "deepagents_code.update_check._install_extra_uv_tool_command",
-                return_value="printf 'ok\\n'",
+                "deepagents_code.update_check._install_extra_uv_tool_argv",
+                return_value=_python_argv("print('ok')"),
             ),
         ):
             success, output = await perform_install_extra("quickjs", log_path=log_path)
@@ -4009,8 +4910,8 @@ class TestPerformInstallExtra:
                 return_value="uv",
             ),
             patch(
-                "deepagents_code.update_check.shutil.which",
-                return_value="/usr/bin/uv",
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=_test_executable(),
             ),
             patch(
                 "deepagents_code.extras_info.installed_extra_names",
@@ -4030,7 +4931,7 @@ class TestPerformInstallExtra:
                 return_value="uv",
             ),
             patch(
-                "deepagents_code.update_check.shutil.which",
+                "deepagents_code.update_check._resolve_trusted_path_executable",
                 return_value=None,
             ),
         ):
@@ -4142,12 +5043,12 @@ class TestPerformInstallPackage:
                 return_value="uv",
             ),
             patch(
-                "deepagents_code.update_check.shutil.which",
-                return_value="/usr/bin/uv",
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=_test_executable(),
             ),
             patch(
-                "deepagents_code.update_check.install_package_command",
-                return_value="printf 'ok\\n'",
+                "deepagents_code.update_check._install_package_argv",
+                return_value=_python_argv("print('ok')"),
             ),
         ):
             success, output = await perform_install_package(
@@ -4164,7 +5065,7 @@ class TestPerformInstallPackage:
                 return_value="uv",
             ),
             patch(
-                "deepagents_code.update_check.shutil.which",
+                "deepagents_code.update_check._resolve_trusted_path_executable",
                 return_value=None,
             ),
         ):
@@ -4189,8 +5090,8 @@ class TestPerformInstallPackage:
                 return_value="uv",
             ),
             patch(
-                "deepagents_code.update_check.shutil.which",
-                return_value="/usr/bin/uv",
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=_test_executable(),
             ),
             patch(
                 "deepagents_code.extras_info.installed_extra_names",
@@ -4223,8 +5124,8 @@ class TestPerformInstallPackage:
                 return_value="uv",
             ),
             patch(
-                "deepagents_code.update_check.shutil.which",
-                return_value="/usr/bin/uv",
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=_test_executable(),
             ),
             patch(
                 "deepagents_code.extras_info.installed_extra_names",
@@ -4249,8 +5150,8 @@ class TestPerformInstallPackage:
                 return_value="uv",
             ),
             patch(
-                "deepagents_code.update_check.shutil.which",
-                return_value="/usr/bin/uv",
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=_test_executable(),
             ),
             patch("deepagents_code.update_check.__version__", "not-a-version"),
         ):
@@ -4267,6 +5168,243 @@ class TestRunInstallSubprocessFailureModes:
     public entry point of its own.
     """
 
+    async def test_uses_state_cwd_and_curated_environment(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The child cannot inherit project package sources or startup hooks."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "pyproject.toml").write_text("[project]\nname='hostile'\n")
+        (project / "uv.toml").write_text(
+            'index-url = "https://project.invalid/simple"\n'
+        )
+        project_bin = project / "bin"
+        trusted_bin = tmp_path / "trusted-bin"
+        project_bin.mkdir()
+        trusted_bin.mkdir()
+        monkeypatch.chdir(project)
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join((str(project_bin), str(trusted_bin))),
+        )
+
+        forbidden = (
+            "BASH_ENV",
+            "BASHOPTS",
+            "ENV",
+            "PIP_CONFIG_FILE",
+            "PIP_EXTRA_INDEX_URL",
+            "PIP_FIND_LINKS",
+            "PIP_INDEX_URL",
+            "PIP_PROXY",
+            "PIP_TRUSTED_HOST",
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "SHELLOPTS",
+            "UV_ALLOW_INSECURE_HOST",
+            "UV_CONFIG_FILE",
+            "UV_DEFAULT_INDEX",
+            "UV_EXTRA_INDEX_URL",
+            "UV_FIND_LINKS",
+            "UV_INDEX",
+            "UV_INDEX_STRATEGY",
+            "UV_INDEX_URL",
+            "UV_KEYRING_PROVIDER",
+            "UV_NO_INDEX",
+            "VIRTUAL_ENV",
+            "ZDOTDIR",
+        )
+        for name in forbidden:
+            monkeypatch.setenv(name, f"hostile-{name.lower()}")
+
+        proxy = "http://proxy.example.test:8443"
+        no_proxy = "localhost,127.0.0.1"
+        certificate = str(tmp_path / "corporate-ca.pem")
+        monkeypatch.setenv("HTTPS_PROXY", proxy)
+        monkeypatch.setenv("NO_PROXY", no_proxy)
+        monkeypatch.setenv("SSL_CERT_FILE", certificate)
+
+        code = (
+            "import json, os; "
+            f"names = {forbidden!r}; "
+            "print(json.dumps({'cwd': os.getcwd(), "
+            "'forbidden': {name: os.environ.get(name) for name in names}, "
+            "'https_proxy': os.environ.get('HTTPS_PROXY'), "
+            "'no_proxy': os.environ.get('NO_PROXY'), "
+            "'ssl_cert_file': os.environ.get('SSL_CERT_FILE'), "
+            "'path': os.environ.get('PATH')}))"
+        )
+        success, output = await _run_install_subprocess(
+            _python_argv(code),
+            progress=None,
+            log_path=project / "install.log",
+        )
+
+        assert success is True, output
+        payload = json.loads(output)
+        expected_cwd = (
+            update_check_module.model_config.DEFAULT_STATE_DIR / "install"
+        ).resolve()
+        child_cwd = await asyncio.to_thread(Path(payload["cwd"]).resolve)
+        assert child_cwd == expected_cwd
+        assert set(payload["forbidden"].values()) == {None}
+        assert payload["https_proxy"] == proxy
+        assert payload["no_proxy"] == no_proxy
+        assert payload["ssl_cert_file"] == certificate
+        assert str(project_bin) not in payload["path"].split(os.pathsep)
+        assert str(trusted_bin) in payload["path"].split(os.pathsep)
+
+    async def test_project_dotenv_values_are_removed_from_install_subprocess(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Updater children never receive allowlisted project `.env` values."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "pyproject.toml").write_text("[project]\nname='hostile'\n")
+        project_values = {
+            "HTTPS_PROXY": "http://project-proxy.invalid:8443",
+            "SSL_CERT_FILE": str(tmp_path / "project-ca.pem"),
+            "UV_TOOL_DIR": str(tmp_path / "project-tool-dir"),
+            "UV_TOOL_BIN_DIR": str(tmp_path / "project-tool-bin"),
+            "UV_CACHE_DIR": str(tmp_path / "project-cache"),
+            "PATH": str(tmp_path / "project-path"),
+        }
+        (project / ".env").write_text(
+            "\n".join(
+                f"{key}={json.dumps(value)}" for key, value in project_values.items()
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        for key in project_values:
+            monkeypatch.delenv(key, raising=False)
+
+        _reset_dotenv_tracking()
+        try:
+            assert config_module._load_dotenv(start_path=project)
+            for key, value in project_values.items():
+                if key != "PATH":
+                    assert os.environ[key] == value
+            assert os.environ.get("PATH") != project_values["PATH"]
+            assert config_module._project_dotenv_applied_keys() == (
+                set(project_values) - {"PATH"}
+            )
+
+            code = (
+                "import json, os; "
+                f"names = {tuple(project_values)!r}; "
+                "print(json.dumps({name: os.environ.get(name) for name in names}))"
+            )
+            success, output = await _run_install_subprocess(
+                _python_argv(code),
+                progress=None,
+                log_path=tmp_path / "install.log",
+            )
+
+            assert success is True, output
+            assert set(json.loads(output).values()) == {None}
+        finally:
+            _reset_dotenv_tracking()
+
+    async def test_shell_and_global_dotenv_values_remain_in_install_subprocess(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Trusted launch and user-global proxy, TLS, and uv paths remain."""
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "pyproject.toml").write_text("[project]\nname='trusted'\n")
+        trusted_bin = tmp_path / "trusted-bin"
+        trusted_bin.mkdir()
+        global_values = {
+            "SSL_CERT_FILE": str(tmp_path / "global-ca.pem"),
+            "UV_TOOL_DIR": str(tmp_path / "global-tool-dir"),
+            "UV_TOOL_BIN_DIR": str(tmp_path / "global-tool-bin"),
+            "UV_CACHE_DIR": str(tmp_path / "global-cache"),
+        }
+        global_dotenv = tmp_path / "global.env"
+        global_dotenv.write_text(
+            "\n".join(
+                f"{key}={json.dumps(value)}" for key, value in global_values.items()
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(config_module, "_GLOBAL_DOTENV_PATH", global_dotenv)
+        for key in global_values:
+            monkeypatch.delenv(key, raising=False)
+        shell_proxy = "http://launch-proxy.example.test:8443"
+        monkeypatch.setenv("HTTPS_PROXY", shell_proxy)
+        monkeypatch.setenv("PATH", str(trusted_bin))
+
+        _reset_dotenv_tracking()
+        try:
+            assert config_module._load_dotenv(start_path=project)
+            assert config_module._project_dotenv_applied_keys() == frozenset()
+
+            names = (
+                "HTTPS_PROXY",
+                "SSL_CERT_FILE",
+                "UV_TOOL_DIR",
+                "UV_TOOL_BIN_DIR",
+                "UV_CACHE_DIR",
+                "PATH",
+            )
+            code = (
+                "import json, os; "
+                f"names = {names!r}; "
+                "print(json.dumps({name: os.environ.get(name) for name in names}))"
+            )
+            success, output = await _run_install_subprocess(
+                _python_argv(code),
+                progress=None,
+                log_path=tmp_path / "install.log",
+            )
+
+            assert success is True, output
+            payload = json.loads(output)
+            assert payload["HTTPS_PROXY"] == shell_proxy
+            assert payload["SSL_CERT_FILE"] == global_values["SSL_CERT_FILE"]
+            assert payload["UV_TOOL_DIR"] == global_values["UV_TOOL_DIR"]
+            assert payload["UV_TOOL_BIN_DIR"] == global_values["UV_TOOL_BIN_DIR"]
+            assert payload["UV_CACHE_DIR"] == global_values["UV_CACHE_DIR"]
+            assert payload["PATH"] == str(trusted_bin.resolve())
+        finally:
+            _reset_dotenv_tracking()
+
+    @pytest.mark.skipif(shutil.which("uv") is None, reason="uv is required")
+    async def test_uv_no_config_ignores_working_and_explicit_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`--no-config` defeats both install-cwd and env-selected uv config."""
+        install_directory = (
+            update_check_module.model_config.DEFAULT_STATE_DIR / "install"
+        )
+        install_directory.mkdir(parents=True)
+        (install_directory / "uv.toml").write_text("not valid toml = [\n")
+        explicit_config = tmp_path / "hostile-uv.toml"
+        explicit_config.write_text("also invalid = [\n")
+        monkeypatch.setenv("UV_CONFIG_FILE", str(explicit_config))
+        executable = shutil.which("uv")
+        assert executable is not None
+
+        success, output = await _run_install_subprocess(
+            ("uv", "--no-config", "--version"),
+            progress=None,
+            log_path=tmp_path / "install.log",
+            executable=executable,
+        )
+
+        assert success is True, output
+        assert output.startswith("uv ")
+
     async def test_timeout_kills_process(self, tmp_path) -> None:
         """A subprocess that exceeds `_UPGRADE_TIMEOUT` is killed and reported."""
         log_path = tmp_path / "install.log"
@@ -4277,17 +5415,399 @@ class TestRunInstallSubprocessFailureModes:
                 return_value="uv",
             ),
             patch(
-                "deepagents_code.update_check.shutil.which",
-                return_value="/usr/bin/uv",
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=_test_executable(),
             ),
             patch(
-                "deepagents_code.update_check._install_extra_uv_tool_command",
-                return_value="sleep 5",
+                "deepagents_code.update_check._install_extra_uv_tool_argv",
+                return_value=_python_argv("import time; time.sleep(5)"),
             ),
         ):
             success, output = await perform_install_extra("quickjs", log_path=log_path)
         assert success is False
         assert "timed out" in output
+
+    async def test_windows_termination_closes_job_before_postcheck(self) -> None:
+        """Successful Job termination avoids the slower `taskkill` fallback."""
+        proc = MagicMock()
+        proc.pid = 1234
+        proc.returncode = None
+        proc.wait = AsyncMock(return_value=-9)
+        job = MagicMock(spec=_WindowsJobObject)
+        teardown_order: list[str] = []
+        taskkill = AsyncMock(side_effect=lambda _pid: teardown_order.append("taskkill"))
+
+        def terminate_job() -> bool:
+            teardown_order.append("job")
+            return True
+
+        job.terminate.side_effect = terminate_job
+        with patch.object(
+            update_check_module,
+            "_taskkill_windows_process_tree",
+            taskkill,
+        ):
+            await update_check_module._terminate_windows_process_tree(proc, job)
+
+        taskkill.assert_not_awaited()
+        proc.wait.assert_awaited_once_with()
+        proc.kill.assert_not_called()
+        assert teardown_order == ["job"]
+
+    async def test_windows_termination_taskkills_when_job_close_fails(self) -> None:
+        """A failed Job close falls back to bounded PID-scoped `taskkill`."""
+        proc = MagicMock()
+        proc.pid = 1234
+        proc.returncode = 0
+        proc.wait = AsyncMock(return_value=0)
+        job = MagicMock(spec=_WindowsJobObject)
+        job.terminate.return_value = False
+        taskkill = AsyncMock()
+
+        with patch.object(
+            update_check_module,
+            "_taskkill_windows_process_tree",
+            taskkill,
+        ):
+            await update_check_module._terminate_windows_process_tree(proc, job)
+
+        job.terminate.assert_called_once_with()
+        taskkill.assert_awaited_once_with(proc.pid)
+        proc.wait.assert_awaited_once_with()
+        proc.kill.assert_not_called()
+
+    async def test_windows_termination_taskkills_surviving_job_root(self) -> None:
+        """A root surviving Job close triggers the bounded post-check fallback."""
+        proc = MagicMock()
+        proc.pid = 1234
+        proc.returncode = None
+        proc.wait = AsyncMock(side_effect=[TimeoutError, -9])
+        job = MagicMock(spec=_WindowsJobObject)
+        job.terminate.return_value = True
+        taskkill = AsyncMock()
+
+        with patch.object(
+            update_check_module,
+            "_taskkill_windows_process_tree",
+            taskkill,
+        ):
+            await update_check_module._terminate_windows_process_tree(proc, job)
+
+        taskkill.assert_awaited_once_with(proc.pid)
+        assert proc.wait.await_count == 2
+        proc.kill.assert_not_called()
+
+    async def test_windows_termination_taskkills_without_owned_job(self) -> None:
+        """An unassigned suspended root uses the bounded PID fallback."""
+        proc = MagicMock()
+        proc.pid = 1234
+        proc.returncode = None
+        proc.wait = AsyncMock(return_value=-9)
+        taskkill = AsyncMock()
+
+        with patch.object(
+            update_check_module,
+            "_taskkill_windows_process_tree",
+            taskkill,
+        ):
+            await update_check_module._terminate_windows_process_tree(proc, None)
+
+        taskkill.assert_awaited_once_with(proc.pid)
+        proc.wait.assert_awaited_once_with()
+        proc.kill.assert_not_called()
+
+    async def test_windows_termination_reaps_idempotently(self) -> None:
+        """Repeated cleanup of an exited root stays bounded and skips `taskkill`."""
+        proc = MagicMock()
+        proc.pid = 1234
+        proc.returncode = 0
+        proc.wait = AsyncMock(return_value=0)
+        taskkill = AsyncMock()
+
+        with patch.object(
+            update_check_module,
+            "_taskkill_windows_process_tree",
+            taskkill,
+        ):
+            await update_check_module._terminate_windows_process_tree(proc, None)
+            await update_check_module._terminate_windows_process_tree(proc, None)
+
+        taskkill.assert_not_awaited()
+        proc.kill.assert_not_called()
+        assert proc.wait.await_count == 2
+
+    async def test_windows_job_assignment_precedes_resume(self) -> None:
+        """A suspended updater resumes only after its Job assignment succeeds."""
+        proc = MagicMock()
+        proc._transport._proc._handle = 5678
+        job = MagicMock(spec=_WindowsJobObject)
+        order: list[str] = []
+
+        def create_job(_process_handle: int) -> _WindowsJobObject:
+            order.append("assign")
+            return job
+
+        with (
+            patch.object(
+                update_check_module._WindowsJobObject,
+                "create_for_process_handle",
+                side_effect=create_job,
+            ) as create,
+            patch.object(
+                update_check_module,
+                "_resume_windows_process",
+                side_effect=lambda _handle: order.append("resume"),
+            ) as resume,
+        ):
+            result = await update_check_module._assign_windows_job_and_resume(proc)
+
+        create.assert_called_once_with(5678)
+        resume.assert_called_once_with(5678)
+        assert result is job
+        assert order == ["assign", "resume"]
+
+    async def test_windows_job_assignment_failure_fails_closed(self) -> None:
+        """An unassigned suspended updater is terminated and reaped."""
+        proc = MagicMock()
+        proc._transport._proc._handle = 5678
+        terminate = AsyncMock()
+
+        with (
+            patch.object(
+                update_check_module._WindowsJobObject,
+                "create_for_process_handle",
+                side_effect=OSError("assignment failed"),
+            ),
+            patch.object(
+                update_check_module,
+                "_terminate_windows_process_tree",
+                terminate,
+            ),
+            pytest.raises(OSError, match="assignment failed"),
+        ):
+            await update_check_module._assign_windows_job_and_resume(proc)
+
+        terminate.assert_awaited_once_with(proc, None)
+        proc._transport.close.assert_called_once_with()
+
+    async def test_windows_resume_failure_fails_closed(self) -> None:
+        """A resume failure terminates the assigned suspended updater."""
+        proc = MagicMock()
+        proc._transport._proc._handle = 5678
+        job = MagicMock(spec=_WindowsJobObject)
+        terminate = AsyncMock()
+
+        with (
+            patch.object(
+                update_check_module._WindowsJobObject,
+                "create_for_process_handle",
+                return_value=job,
+            ),
+            patch.object(
+                update_check_module,
+                "_resume_windows_process",
+                side_effect=OSError("resume failed"),
+            ),
+            patch.object(
+                update_check_module,
+                "_terminate_windows_process_tree",
+                terminate,
+            ),
+            pytest.raises(OSError, match="resume failed"),
+        ):
+            await update_check_module._assign_windows_job_and_resume(proc)
+
+        terminate.assert_awaited_once_with(proc, job)
+        proc._transport.close.assert_called_once_with()
+
+    async def test_windows_install_launch_is_suspended_before_management(
+        self,
+    ) -> None:
+        """Updater creation requests suspension before assigning its Job."""
+        proc = MagicMock()
+        job = MagicMock(spec=_WindowsJobObject)
+        order: list[str] = []
+
+        def create_process(
+            *_args: str,
+            **_kwargs: object,
+        ) -> asyncio.subprocess.Process:
+            order.append("create-suspended")
+            return proc
+
+        def assign_process(
+            candidate: asyncio.subprocess.Process,
+        ) -> _WindowsJobObject:
+            assert candidate is proc
+            order.append("assign-and-resume")
+            return job
+
+        with (
+            patch.object(update_check_module.os, "name", "nt"),
+            patch.object(
+                update_check_module.asyncio,
+                "create_subprocess_exec",
+                side_effect=create_process,
+            ) as create,
+            patch.object(
+                update_check_module,
+                "_assign_windows_job_and_resume",
+                side_effect=assign_process,
+            ) as assign,
+        ):
+            result = await update_check_module._start_install_process(
+                (_test_executable(), "--version")
+            )
+
+        assert create.await_args is not None
+        assert create.await_args.args[0] == _test_executable()
+        assert (
+            create.call_args.kwargs["creationflags"]
+            == update_check_module._WINDOWS_CREATE_SUSPENDED
+        )
+        assign.assert_awaited_once_with(proc)
+        assert result == (proc, job)
+        assert order == ["create-suspended", "assign-and-resume"]
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows process-tree regression")
+    async def test_windows_timeout_kills_descendant_promptly(self, tmp_path) -> None:
+        """A timeout after descendant readiness reaps the whole Windows Job."""
+        pid_file = tmp_path / "descendant.pid"
+        ready_file = tmp_path / "descendant.ready"
+        parent_code = (
+            "import subprocess, sys, time; from pathlib import Path; "
+            "child = subprocess.Popen("
+            "[sys.executable, '-c', 'import time; time.sleep(30)']); "
+            f"Path({str(pid_file)!r}).write_text("
+            "str(child.pid), encoding='utf-8'); "
+            f"Path({str(ready_file)!r}).touch(); "
+            "time.sleep(30)"
+        )
+        started_processes: list[asyncio.subprocess.Process] = []
+        real_wait = update_check_module._wait_for_install_process
+
+        async def wait_after_descendant_ready(
+            proc: asyncio.subprocess.Process,
+            *,
+            output_lines: list[str],
+            log_file: TextIO | None,
+            progress: update_check_module.UpgradeProgressCallback | None,
+            wait_seconds: float,
+            windows_job: _WindowsJobObject | None,
+        ) -> None:
+            started_processes.append(proc)
+            await _wait_for_file(ready_file)
+            await real_wait(
+                proc,
+                output_lines=output_lines,
+                log_file=log_file,
+                progress=progress,
+                wait_seconds=wait_seconds,
+                windows_job=windows_job,
+            )
+
+        proc: asyncio.subprocess.Process | None = None
+        descendant_pid: int | None = None
+        descendant_exited = False
+        try:
+            with (
+                patch("deepagents_code.update_check._UPGRADE_TIMEOUT", 0.0),
+                patch.object(
+                    update_check_module,
+                    "_wait_for_install_process",
+                    side_effect=wait_after_descendant_ready,
+                ),
+            ):
+                success, output = await asyncio.wait_for(
+                    _run_install_subprocess(
+                        _python_argv(parent_code),
+                        progress=None,
+                        log_path=tmp_path / "install.log",
+                    ),
+                    timeout=10,
+                )
+
+            assert len(started_processes) == 1
+            proc = started_processes[0]
+            descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+            descendant_exited = await _wait_for_windows_pid_exit(descendant_pid)
+        finally:
+            if descendant_pid is not None and _windows_pid_is_running(descendant_pid):
+                _cleanup_windows_process_tree(descendant_pid)
+            if proc is not None and proc.returncode is None:
+                await _cleanup_started_process(proc)
+
+        assert success is False
+        assert "timed out" in output
+        assert proc is not None
+        assert proc.returncode is not None
+        assert descendant_exited
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows suspended-launch regression")
+    async def test_windows_assignment_failure_never_runs_or_holds_pipes(
+        self,
+        tmp_path,
+    ) -> None:
+        """Unavailable assignment reaps an early-exit root without pipe delay."""
+        pid_file = tmp_path / "descendant.pid"
+        parent_code = (
+            "import subprocess, sys; from pathlib import Path; "
+            "child = subprocess.Popen("
+            "[sys.executable, '-c', 'import time; time.sleep(30)']); "
+            f"Path({str(pid_file)!r}).write_text("
+            "str(child.pid), encoding='utf-8')"
+        )
+
+        def unavailable_job(_process_handle: int) -> _WindowsJobObject:
+            time.sleep(0.25)
+            assert not pid_file.exists()
+            msg = "Job assignment unavailable"
+            raise OSError(msg)
+
+        started = time.monotonic()
+        try:
+            with patch.object(
+                _WindowsJobObject,
+                "create_for_process_handle",
+                side_effect=unavailable_job,
+            ):
+                success, output = await _run_install_subprocess(
+                    _python_argv(parent_code),
+                    progress=None,
+                    log_path=tmp_path / "install.log",
+                )
+        finally:
+            if pid_file.exists():
+                _cleanup_windows_process_tree(int(pid_file.read_text(encoding="utf-8")))
+
+        assert success is False
+        assert "OSError: Job assignment unavailable" in output
+        assert time.monotonic() - started < 4.0
+        assert not pid_file.exists()
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows argv regression")
+    async def test_windows_metacharacter_path_is_not_interpreted_by_cmd(
+        self,
+        tmp_path,
+    ) -> None:
+        """An ampersand in a structured update argument remains literal."""
+        target = tmp_path / "a&b" / "pins.txt"
+        target.parent.mkdir()
+        success, output = await _run_install_subprocess(
+            (
+                *_python_argv(
+                    "import sys; from pathlib import Path; "
+                    "Path(sys.argv[1]).write_text('literal', encoding='utf-8')"
+                ),
+                str(target),
+            ),
+            progress=None,
+            log_path=tmp_path / "install.log",
+        )
+
+        assert success is True, output
+        assert target.read_text(encoding="utf-8") == "literal"
+        assert f'"{target}"' in (tmp_path / "install.log").read_text(encoding="utf-8")
 
     async def test_timeout_kills_process_group_after_shell_exits(
         self, tmp_path
@@ -4303,12 +5823,16 @@ class TestRunInstallSubprocessFailureModes:
                 return_value="uv",
             ),
             patch(
-                "deepagents_code.update_check.shutil.which",
-                return_value="/usr/bin/uv",
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=_test_executable(),
             ),
             patch(
-                "deepagents_code.update_check._install_extra_uv_tool_command",
-                return_value="sleep 5 & exit 0",
+                "deepagents_code.update_check._install_extra_uv_tool_argv",
+                return_value=_python_argv(
+                    "import subprocess, sys; "
+                    "subprocess.Popen([sys.executable, '-c', "
+                    "'import time; time.sleep(5)'])"
+                ),
             ),
             patch("deepagents_code.update_check.os.killpg", wraps=os.killpg) as killpg,
         ):
@@ -4334,7 +5858,11 @@ class TestRunInstallSubprocessFailureModes:
         with patch("deepagents_code.update_check.os.killpg", wraps=os.killpg) as killpg:
             task = asyncio.ensure_future(
                 _run_install_subprocess(
-                    "echo ready; sleep 30", progress=progress, log_path=log_path
+                    _python_argv(
+                        "import time; print('ready', flush=True); time.sleep(30)"
+                    ),
+                    progress=progress,
+                    log_path=log_path,
                 )
             )
             # Cancel only once the subprocess is actually running (it emitted a
@@ -4348,6 +5876,154 @@ class TestRunInstallSubprocessFailureModes:
         # killed via the process group rather than orphaned.
         killpg.assert_called_once()
         assert killpg.call_args.args[1] == signal.SIGKILL
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows cancellation regression")
+    async def test_windows_cancellation_reaps_root_and_descendant(
+        self,
+        tmp_path,
+    ) -> None:
+        """Cancelling an update reaps its root and contained descendant."""
+        pid_file = tmp_path / "descendant.pid"
+        parent_code = (
+            "import subprocess, sys, time; from pathlib import Path; "
+            "child = subprocess.Popen("
+            "[sys.executable, '-c', 'import time; time.sleep(30)']); "
+            f"Path({str(pid_file)!r}).write_text("
+            "str(child.pid), encoding='utf-8'); "
+            "print('ready', flush=True); "
+            "time.sleep(30)"
+        )
+        started = asyncio.Event()
+        started_processes: list[asyncio.subprocess.Process] = []
+        real_start = update_check_module._start_install_process
+
+        async def capture_process(
+            argv: tuple[str, ...],
+        ) -> tuple[asyncio.subprocess.Process, _WindowsJobObject | None]:
+            proc, windows_job = await real_start(argv)
+            started_processes.append(proc)
+            return proc, windows_job
+
+        def progress(line: str) -> None:
+            if line.rstrip("\r") == "ready":
+                started.set()
+
+        descendant_pid: int | None = None
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            with patch.object(
+                update_check_module,
+                "_start_install_process",
+                side_effect=capture_process,
+            ):
+                task = asyncio.create_task(
+                    _run_install_subprocess(
+                        _python_argv(parent_code),
+                        progress=progress,
+                        log_path=tmp_path / "install.log",
+                    )
+                )
+                await asyncio.wait_for(started.wait(), timeout=5)
+                proc = started_processes[0]
+                descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+
+                cancel_started = time.monotonic()
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                elapsed = time.monotonic() - cancel_started
+
+            descendant_exited = await _wait_for_windows_pid_exit(descendant_pid)
+        finally:
+            if descendant_pid is not None and _windows_pid_is_running(descendant_pid):
+                _cleanup_windows_process_tree(descendant_pid)
+            if proc is not None and proc.returncode is None:
+                await _cleanup_started_process(proc)
+
+        assert elapsed < 3.0
+        assert proc is not None
+        assert proc.returncode is not None
+        assert descendant_exited
+
+    async def test_progress_oserror_terminates_tree_and_reaps_process(
+        self,
+        tmp_path,
+    ) -> None:
+        """A progress callback failure cannot leak the updater process tree."""
+        pid_file = tmp_path / "descendant.pid"
+        parent_code = (
+            "import subprocess, sys, time; from pathlib import Path; "
+            "child = subprocess.Popen("
+            "[sys.executable, '-c', 'import time; time.sleep(30)']); "
+            f"Path({str(pid_file)!r}).write_text("
+            "str(child.pid), encoding='utf-8'); "
+            "print('ready', flush=True); "
+            "time.sleep(30)"
+        )
+        started_processes: list[asyncio.subprocess.Process] = []
+        real_start = update_check_module._start_install_process
+
+        async def capture_process(
+            argv: tuple[str, ...],
+        ) -> tuple[asyncio.subprocess.Process, _WindowsJobObject | None]:
+            proc, windows_job = await real_start(argv)
+            started_processes.append(proc)
+            return proc, windows_job
+
+        def progress(line: str) -> None:
+            if line.rstrip("\r") == "ready":
+                msg = "progress callback failed"
+                raise OSError(msg)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with patch.object(
+                update_check_module,
+                "_start_install_process",
+                side_effect=capture_process,
+            ):
+                success, output = await _run_install_subprocess(
+                    _python_argv(parent_code),
+                    progress=progress,
+                    log_path=tmp_path / "install.log",
+                )
+
+            assert len(started_processes) == 1
+            proc = started_processes[0]
+            root_reaped = proc.returncode is not None
+            transport = getattr(proc, "_transport", None)
+            transport_closed = transport is not None and transport.is_closing()
+            descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+            descendant_exited = await _wait_for_process_exit(descendant_pid)
+
+            if not descendant_exited:
+                if os.name == "nt":
+                    _cleanup_windows_process_tree(descendant_pid)
+                else:
+                    with suppress(OSError):
+                        os.kill(descendant_pid, signal.SIGKILL)
+            if not root_reaped:
+                await _cleanup_started_process(proc)
+            if transport is not None and not transport_closed:
+                transport.close()
+
+            started_processes.clear()
+            del proc
+            del transport
+            gc.collect()
+
+        lifecycle_warnings = [
+            warning
+            for warning in caught
+            if "transport" in str(warning.message).lower()
+            or "event loop is closed" in str(warning.message).lower()
+        ]
+        assert success is False
+        assert "OSError: progress callback failed" in output
+        assert root_reaped
+        assert descendant_exited
+        assert transport_closed
+        assert lifecycle_warnings == []
 
     async def test_terminate_falls_back_to_direct_kill_on_permission_error(
         self,
@@ -4411,7 +6087,7 @@ class TestRunInstallSubprocessFailureModes:
         transport = MagicMock()
         proc._transport = transport
         # Patch `killpg` so the fake pid never signals a real process group.
-        with patch("deepagents_code.update_check.os.killpg"):
+        with patch("deepagents_code.update_check.os.killpg", create=True):
             await _terminate_install_process(proc)
         transport.close.assert_called_once_with()
 
@@ -4428,21 +6104,112 @@ class TestRunInstallSubprocessFailureModes:
                 return_value="uv",
             ),
             patch(
-                "deepagents_code.update_check.shutil.which",
-                return_value="/usr/bin/uv",
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=_test_executable(),
             ),
             patch(
-                "deepagents_code.update_check._install_extra_uv_tool_command",
+                "deepagents_code.update_check._install_extra_uv_tool_argv",
                 return_value=(
-                    "uv tool install --reinstall -U 'deepagents-code[quickjs]'"
+                    "uv",
+                    "--no-config",
+                    "tool",
+                    "install",
+                    "-U",
+                    "deepagents-code",
                 ),
             ),
-            patch("asyncio.create_subprocess_shell", side_effect=_raise),
+            patch("asyncio.create_subprocess_exec", side_effect=_raise),
         ):
             success, output = await perform_install_extra("quickjs", log_path=log_path)
         assert success is False
         assert "FileNotFoundError" in output
         assert "No such file" in output
+
+    async def test_nonzero_exit_never_releases_owned_windows_job(
+        self,
+        tmp_path,
+    ) -> None:
+        """A failed root is terminated through its Job instead of released."""
+        proc = MagicMock()
+        proc.returncode = 9
+        job = MagicMock(spec=_WindowsJobObject)
+        terminate = AsyncMock()
+
+        with (
+            patch.object(
+                update_check_module,
+                "_start_install_process",
+                new=AsyncMock(return_value=(proc, job)),
+            ),
+            patch.object(
+                update_check_module,
+                "_wait_for_install_process",
+                new=AsyncMock(return_value=(9, False)),
+            ),
+            patch.object(
+                update_check_module,
+                "_terminate_install_process",
+                terminate,
+            ),
+        ):
+            success, output = await _run_install_subprocess(
+                ("uv", "--version"),
+                progress=None,
+                log_path=tmp_path / "install.log",
+                executable=_test_executable(),
+            )
+
+        assert success is False
+        assert output == ""
+        terminate.assert_awaited_once_with(proc, windows_job=job)
+        job.close.assert_not_called()
+
+    async def test_nonzero_early_root_exit_reaps_long_lived_descendant(
+        self,
+        tmp_path,
+    ) -> None:
+        """A root exiting nonzero cannot orphan a pipe-holding child."""
+        pid_file = tmp_path / "descendant.pid"
+        parent_code = (
+            "import subprocess, sys; from pathlib import Path; "
+            "child = subprocess.Popen("
+            "[sys.executable, '-c', 'import time; time.sleep(30)']); "
+            f"Path({str(pid_file)!r}).write_text("
+            "str(child.pid), encoding='utf-8'); "
+            "print('root failed', flush=True); "
+            "raise SystemExit(7)"
+        )
+        descendant_pid: int | None = None
+        descendant_running_on_return = True
+        try:
+            started = time.monotonic()
+            with patch("deepagents_code.update_check._UPGRADE_TIMEOUT", 10):
+                success, output = await _run_install_subprocess(
+                    _python_argv(parent_code),
+                    progress=None,
+                    log_path=tmp_path / "install.log",
+                )
+            elapsed = time.monotonic() - started
+            descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+            descendant_running_on_return = (
+                _windows_pid_is_running(descendant_pid)
+                if os.name == "nt"
+                else _posix_pid_is_running(descendant_pid)
+            )
+            descendant_exited = await _wait_for_process_exit(descendant_pid)
+        finally:
+            if descendant_pid is not None:
+                if os.name == "nt" and _windows_pid_is_running(descendant_pid):
+                    _cleanup_windows_process_tree(descendant_pid)
+                elif os.name != "nt" and _posix_pid_is_running(descendant_pid):
+                    with suppress(OSError):
+                        os.kill(descendant_pid, signal.SIGKILL)
+
+        assert success is False
+        assert "root failed" in output
+        assert elapsed < 3.0
+        assert not descendant_running_on_return
+        assert descendant_exited
 
     async def test_nonzero_exit_returns_combined_output(self, tmp_path) -> None:
         """A failing subprocess returns False with stderr in the output."""
@@ -4453,12 +6220,14 @@ class TestRunInstallSubprocessFailureModes:
                 return_value="uv",
             ),
             patch(
-                "deepagents_code.update_check.shutil.which",
-                return_value="/usr/bin/uv",
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value=_test_executable(),
             ),
             patch(
-                "deepagents_code.update_check._install_extra_uv_tool_command",
-                return_value="sh -c 'printf boom 1>&2; exit 1'",
+                "deepagents_code.update_check._install_extra_uv_tool_argv",
+                return_value=_python_argv(
+                    "import sys; print('boom', file=sys.stderr); raise SystemExit(1)"
+                ),
             ),
         ):
             success, output = await perform_install_extra("quickjs", log_path=log_path)
@@ -5544,6 +7313,7 @@ class TestTargetedPrereleaseResolution:
 
         cmd = [
             "uv",
+            "--no-config",
             "pip",
             "install",
             "--dry-run",

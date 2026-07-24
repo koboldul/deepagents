@@ -260,8 +260,8 @@ class TestListSkillsCollisionLogging:
         assert name == "shared-skill"
         assert prev_label == "user"
         assert new_label == "project"
-        assert str(user_dir) in str(prev_path)
-        assert str(project_dir) in str(new_path)
+        assert user_dir.as_posix() in str(prev_path)
+        assert project_dir.as_posix() in str(new_path)
 
     def test_distinct_skills_do_not_log(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture

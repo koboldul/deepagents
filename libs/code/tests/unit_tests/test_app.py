@@ -5,20 +5,23 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-import locale
 import logging
 import os
+import shlex
 import signal
+import subprocess
+import sys
 import threading
 import time
 import webbrowser
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+    from collections.abc import Awaitable, Callable, Iterator
 
     from langchain_core.messages import HumanMessage
     from textual.pilot import Pilot
@@ -45,6 +48,7 @@ from textual.widget import Widget
 from textual.widgets import Checkbox, Input, Static
 
 from deepagents_code._constants import SYSTEM_MESSAGE_PREFIX
+from deepagents_code._posix_shell import _PosixOwnerGuard
 from deepagents_code._session_stats import SessionStats
 from deepagents_code._version import CHANGELOG_URL, __version__
 from deepagents_code.app import (
@@ -64,6 +68,7 @@ from deepagents_code.app import (
     _parse_rubric_max_iterations,
     _ThreadHistoryPayload,
     _warn_discarded_goal_channels,
+    run_textual_app,
 )
 from deepagents_code.event_bus import ExternalEvent
 from deepagents_code.media_utils import ImageData, VideoData
@@ -105,6 +110,168 @@ async def _wait_for_branch(app: DeepAgentsApp, branch: str) -> None:
             return
         await asyncio.sleep(0.01)
     msg = f"Timed out waiting for branch {branch!r}"
+    raise AssertionError(msg)
+
+
+def _windows_pid_is_running(pid: int) -> bool:
+    """Return whether a Windows process is still active."""
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    )
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(
+        process_query_limited_information,
+        wintypes.BOOL(0),
+        pid,
+    )
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        return (
+            bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)))
+            and exit_code.value == still_active
+        )
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+async def _wait_for_windows_pid_exit(
+    pid: int,
+    *,
+    wait_seconds: float = 2.0,
+) -> bool:
+    """Wait for a Windows process to stop running."""
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if not _windows_pid_is_running(pid):
+            return True
+        await asyncio.sleep(0.02)
+    return not _windows_pid_is_running(pid)
+
+
+def _posix_pid_is_running(pid: int) -> bool:
+    """Return whether a POSIX process still exists and is not a zombie."""
+    stat_path = Path("/proc") / str(pid) / "stat"
+    try:
+        if stat_path.read_text(encoding="utf-8").split()[2] == "Z":
+            return False
+    except (IndexError, OSError):
+        pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+async def _wait_for_pid_exit(pid: int, *, wait_seconds: float = 2.0) -> bool:
+    """Wait for a process to exit on the current platform."""
+    if sys.platform == "win32":
+        return await _wait_for_windows_pid_exit(pid, wait_seconds=wait_seconds)
+
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if not _posix_pid_is_running(pid):
+            return True
+        await asyncio.sleep(0.02)
+    return not _posix_pid_is_running(pid)
+
+
+async def _wait_for_pid_file(path: Path, *, wait_seconds: float = 5.0) -> int:
+    """Wait for a subprocess to publish a parseable PID in `path`."""
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if await asyncio.to_thread(path.exists):
+            try:
+                content = await asyncio.to_thread(path.read_text, encoding="utf-8")
+                return int(content.strip())
+            except (OSError, ValueError):
+                pass
+        await asyncio.sleep(0.02)
+    msg = f"Timed out waiting for {path}"
+    raise AssertionError(msg)
+
+
+def _cleanup_windows_process_tree(pid: int) -> None:
+    """Best-effort cleanup for a failed Windows process-tree assertion."""
+    windows_dir = os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR")
+    executable = (
+        str(Path(windows_dir) / "System32" / "taskkill.exe")
+        if windows_dir
+        else "taskkill.exe"
+    )
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+        subprocess.run(
+            [executable, "/PID", str(pid), "/T", "/F"],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+
+
+def _posix_group_exits_after_sigterm(_process_group_id: int, sig: int) -> None:
+    """Simulate a process group disappearing during the SIGTERM grace period."""
+    if sig == 0:
+        raise ProcessLookupError
+
+
+def _mock_posix_owner_guard(*, alive: bool = False) -> MagicMock:
+    """Return an async-compatible POSIX owner guard test double."""
+    owner_guard = MagicMock()
+    owner_guard.is_alive.return_value = alive
+    owner_guard.has_processes.return_value = alive
+    owner_guard.close = AsyncMock()
+    owner_guard.terminate = AsyncMock()
+    return owner_guard
+
+
+async def _wait_for_session_state(app: DeepAgentsApp) -> None:
+    """Wait for post-paint session state initialization."""
+    for _ in range(100):
+        if app._session_state is not None:
+            return
+        await asyncio.sleep(0.01)
+    msg = "Timed out waiting for session state initialization"
+    raise AssertionError(msg)
+
+
+async def _wait_for_startup_idle(app: DeepAgentsApp) -> None:
+    """Wait until no-server app startup can no longer mutate test state."""
+    for _ in range(200):
+        task = app._startup_task
+        if (task is None or task.done()) and not app._startup_sequence_running:
+            return
+        await asyncio.sleep(0.01)
+    msg = "Timed out waiting for app startup to become idle"
+    raise AssertionError(msg)
+
+
+async def _wait_for_completion(chat: ChatInput) -> None:
+    """Wait for asynchronous slash-command suggestions to populate."""
+    for _ in range(100):
+        if chat._current_suggestions:
+            return
+        await asyncio.sleep(0.01)
+    msg = "Timed out waiting for completion suggestions"
     raise AssertionError(msg)
 
 
@@ -3735,9 +3902,11 @@ class TestMessageQueue:
 
     async def test_initial_prompt_shown_as_queued_while_connecting(self) -> None:
         """`-m` prompt renders as queued immediately, before `ServerReady`."""
-        app = DeepAgentsApp(initial_prompt="hello world")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "hello world"
             app._connecting = True
 
             await app._show_initial_prompt_as_queued()
@@ -3756,9 +3925,11 @@ class TestMessageQueue:
 
     async def test_initial_prompt_placeholder_replaced_on_submission(self) -> None:
         """Submitting the `-m` prompt drops the placeholder and sends the message."""
-        app = DeepAgentsApp(initial_prompt="hello world")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "hello world"
             app._connecting = True
             await app._show_initial_prompt_as_queued()
             await pilot.pause()
@@ -3780,9 +3951,11 @@ class TestMessageQueue:
         self,
     ) -> None:
         """A ready server can submit while placeholder setup is yielding."""
-        app = DeepAgentsApp(initial_prompt="hello world")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "hello world"
             app._connecting = True
             dismiss_started = asyncio.Event()
             resume_dismissal = asyncio.Event()
@@ -3817,9 +3990,11 @@ class TestMessageQueue:
 
     async def test_initial_prompt_anchors_direct_mounts_above_it(self) -> None:
         """Transient startup output stays above the initial placeholder."""
-        app = DeepAgentsApp(initial_prompt="hello world")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "hello world"
             app._connecting = True
             await app._show_initial_prompt_as_queued()
             messages = app.query_one("#messages", Container)
@@ -3837,9 +4012,11 @@ class TestMessageQueue:
         """Stored startup output stays above the initial placeholder."""
         from deepagents_code.app import _MESSAGE_BOTTOM_SPACER_ID
 
-        app = DeepAgentsApp(initial_prompt="hello world")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "hello world"
             app._connecting = True
             await app._show_initial_prompt_as_queued()
             output = AppMessage("Running startup command")
@@ -3857,9 +4034,12 @@ class TestMessageQueue:
 
     async def test_initial_prompt_placeholder_skipped_for_skill(self) -> None:
         """Skills render differently and keep their existing startup path."""
-        app = DeepAgentsApp(initial_prompt="hello world", initial_skill="review")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "hello world"
+            app._initial_skill = "review"
             app._connecting = True
 
             await app._show_initial_prompt_as_queued()
@@ -3892,9 +4072,12 @@ class TestMessageQueue:
 
     async def test_initial_prompt_placeholder_skipped_for_goal(self) -> None:
         """Goals render differently and keep their existing startup path."""
-        app = DeepAgentsApp(initial_prompt="hello world", initial_goal="ship it")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "hello world"
+            app._initial_goal = "ship it"
             app._connecting = True
 
             await app._show_initial_prompt_as_queued()
@@ -3905,9 +4088,11 @@ class TestMessageQueue:
 
     async def test_initial_prompt_placeholder_skipped_for_blank_prompt(self) -> None:
         """A whitespace-only `-m` prompt must not mount a placeholder."""
-        app = DeepAgentsApp(initial_prompt="   ")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "   "
             app._connecting = True
 
             await app._show_initial_prompt_as_queued()
@@ -3920,9 +4105,11 @@ class TestMessageQueue:
         self,
     ) -> None:
         """The placeholder is only for the connect window; skip once ready."""
-        app = DeepAgentsApp(initial_prompt="hello world")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "hello world"
             # `_connecting` is already False for a no-server test app.
 
             await app._show_initial_prompt_as_queued()
@@ -3933,9 +4120,11 @@ class TestMessageQueue:
 
     async def test_initial_prompt_placeholder_is_idempotent(self) -> None:
         """A second call is a no-op; the placeholder is never duplicated."""
-        app = DeepAgentsApp(initial_prompt="hello world")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "hello world"
             app._connecting = True
 
             await app._show_initial_prompt_as_queued()
@@ -3950,9 +4139,11 @@ class TestMessageQueue:
 
     async def test_initial_prompt_placeholder_counts_with_pending(self) -> None:
         """Placeholder depth is additive with genuinely queued messages."""
-        app = DeepAgentsApp(initial_prompt="hello world")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "hello world"
             app._connecting = True
             await app._show_initial_prompt_as_queued()
             await pilot.pause()
@@ -3974,9 +4165,11 @@ class TestMessageQueue:
         prompt. Otherwise the queued count stays at 1 until `ServerReady`,
         which then submits work that appeared to have been discarded.
         """
-        app = DeepAgentsApp(initial_prompt="hello world")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "hello world"
             app._connecting = True
             await app._show_initial_prompt_as_queued()
             await pilot.pause()
@@ -3999,9 +4192,11 @@ class TestMessageQueue:
 
     async def test_clear_messages_clears_initial_prompt_placeholder(self) -> None:
         """`_clear_messages` detaches the placeholder, so it must drop the pointer."""
-        app = DeepAgentsApp(initial_prompt="hello world")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "hello world"
             app._connecting = True
             await app._show_initial_prompt_as_queued()
             await pilot.pause()
@@ -4068,9 +4263,11 @@ class TestMessageQueue:
         `child is initial` branch of `_first_mounted_queued_widget` that the
         `_queued_widgets`-based spinner tests never reach.
         """
-        app = DeepAgentsApp(initial_prompt="hello world")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "hello world"
             app._connecting = True
             await app._show_initial_prompt_as_queued()
             await pilot.pause()
@@ -4106,9 +4303,11 @@ class TestMessageQueue:
         flashing it during fast startup; revealing the placeholder means the
         user is now looking at a pending message, so the indicator should show.
         """
-        app = DeepAgentsApp(initial_prompt="hello world")
+        app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            app._initial_prompt = "hello world"
             app._connecting = True
             app._defer_connection_status_display = True
 
@@ -4709,26 +4908,34 @@ class TestMessageQueue:
     async def test_interrupt_dismisses_completion_without_stopping_agent(self) -> None:
         """Esc should dismiss completion popup without interrupting the agent."""
         app = DeepAgentsApp()
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            app._agent_running = True
-            mock_worker = MagicMock()
-            app._agent_worker = mock_worker
+        with patch.object(
+            app,
+            "_discover_startup_skills",
+            AsyncMock(return_value=True),
+        ):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                await _wait_for_startup_idle(app)
+                app._agent_running = True
+                mock_worker = MagicMock()
+                app._agent_worker = mock_worker
 
-            # Activate completion by typing "/"
-            chat = app._chat_input
-            assert chat is not None
-            assert chat._text_area is not None
-            chat._text_area.text = "/"
-            await pilot.pause()
-            assert chat._current_suggestions  # completion is active
+                # Activate completion by typing "/"
+                chat = app._chat_input
+                assert chat is not None
+                assert chat._text_area is not None
+                chat._text_area.text = "/"
+                await pilot.pause()
+                await pilot.pause()
+                await _wait_for_completion(chat)
+                assert chat._current_suggestions  # completion is active
 
-            # Esc should dismiss completion, NOT cancel the agent
-            app.action_interrupt()
+                # Esc should dismiss completion, NOT cancel the agent
+                app.action_interrupt()
 
-            assert chat._current_suggestions == []
-            mock_worker.cancel.assert_not_called()
-            assert app._agent_running is True
+                assert chat._current_suggestions == []
+                mock_worker.cancel.assert_not_called()
+                assert app._agent_running is True
 
     async def test_interrupt_falls_through_when_no_completion(self) -> None:
         """Esc should interrupt the agent when completion is not active."""
@@ -6784,6 +6991,7 @@ class TestGoalCommand:
         assert payload.goal_criteria_request_active is True
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_session_state(app)
             assert app._session_state is not None
             app._session_state.auto_approve = True
             handle = AsyncMock()
@@ -11414,38 +11622,28 @@ class TestMessageTimestampFooters:
         """
         from deepagents_code.tui.widgets.message_store import MessageData, MessageType
 
-        previous_tz = os.environ.get("TZ")
-        monkeypatch.setenv("TZ", "UTC")
         monkeypatch.setattr(
             "deepagents_code.formatting.uses_24_hour_clock", lambda: False
         )
-        self._sync_tz()
         app = DeepAgentsApp()
         data = MessageData(
             type=MessageType.USER,
             content="hello",
             id="msg-fixed",
-            timestamp=1_704_110_405.0,
+            timestamp=datetime(2024, 1, 1, 12, 0, 5).astimezone().timestamp(),
         )
 
-        try:
-            footer = app._build_message_timestamp_footer(data, visible=False)
+        footer = app._build_message_timestamp_footer(data, visible=False)
 
-            assert footer is not None
-            rendered = footer.render()
-            assert isinstance(rendered, Content)
-            assert rendered.plain == "Jan 1, 12:00:05 PM"
-            assert not footer.has_class("message-timestamp-footer-visible")
+        assert footer is not None
+        rendered = footer.render()
+        assert isinstance(rendered, Content)
+        assert rendered.plain == "Jan 1, 12:00:05 PM"
+        assert not footer.has_class("message-timestamp-footer-visible")
 
-            visible_footer = app._build_message_timestamp_footer(data, visible=True)
-            assert visible_footer is not None
-            assert visible_footer.has_class("message-timestamp-footer-visible")
-        finally:
-            if previous_tz is None:
-                monkeypatch.delenv("TZ", raising=False)
-            else:
-                monkeypatch.setenv("TZ", previous_tz)
-            self._sync_tz()
+        visible_footer = app._build_message_timestamp_footer(data, visible=True)
+        assert visible_footer is not None
+        assert visible_footer.has_class("message-timestamp-footer-visible")
 
     async def test_toggle_positions_footer_after_each_message(self) -> None:
         """Message mounting keeps one footer directly after every message."""
@@ -12799,6 +12997,16 @@ class TestPasteRouting:
 class TestShellCommandInterrupt:
     """Tests for interruptible shell commands (! prefix) using worker pattern."""
 
+    @pytest.fixture(autouse=True)
+    def _posix_process_symbols(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Provide POSIX-only symbols for tests that simulate Linux."""
+        if not hasattr(os, "getpgid"):
+            monkeypatch.setattr(os, "getpgid", None, raising=False)
+        if not hasattr(os, "killpg"):
+            monkeypatch.setattr(os, "killpg", None, raising=False)
+        if not hasattr(signal, "SIGKILL"):
+            monkeypatch.setattr(signal, "SIGKILL", 9, raising=False)
+
     @staticmethod
     def _shell_context_message(
         command: str, output: str, returncode: int = 0
@@ -12865,23 +13073,489 @@ class TestShellCommandInterrupt:
             mock_proc.returncode = None
             mock_proc.pid = 12345
             mock_proc.wait = AsyncMock()
+            mock_proc.terminate = MagicMock()
+            mock_proc.kill = MagicMock()
+            mock_proc._transport = MagicMock()
 
             with (
+                patch.object(sys, "platform", "linux"),
                 patch(
                     "asyncio.create_subprocess_shell",
                     return_value=mock_proc,
                 ),
-                patch("os.killpg") as mock_killpg,
-                patch("os.getpgid", return_value=12345),
+                patch(
+                    "deepagents_code.app._start_posix_shell_process",
+                    new=AsyncMock(
+                        return_value=(mock_proc, _mock_posix_owner_guard()),
+                    ),
+                ),
+                patch(
+                    "os.killpg",
+                    side_effect=_posix_group_exits_after_sigterm,
+                ) as mock_killpg,
                 pytest.raises(asyncio.CancelledError),
             ):
                 await app._run_shell_task("sleep 999")
 
-            mock_killpg.assert_called()
+            mock_killpg.assert_any_call(12345, signal.SIGTERM)
+            mock_killpg.assert_any_call(12345, 0)
             buffered = app._pending_shell_messages
             assert len(buffered) == 1
             assert "sleep 999" in buffered[0].content
             assert "Command interrupted" in buffered[0].content
+
+    async def test_windows_kill_closes_job_without_taskkill(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The app uses its assigned Job without paying `taskkill` startup cost."""
+        app = DeepAgentsApp()
+        proc = MagicMock()
+        proc.pid = 1234
+        proc.returncode = None
+        proc.wait = AsyncMock(return_value=-9)
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        job = MagicMock()
+        teardown_order: list[str] = []
+        taskkill = AsyncMock(side_effect=lambda _pid: teardown_order.append("taskkill"))
+        app._shell_process = proc
+        monkeypatch.setattr(app, "_shell_job", job)
+
+        def terminate_job() -> bool:
+            teardown_order.append("job")
+            return True
+
+        job.terminate.side_effect = terminate_job
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch(
+                "deepagents_code.update_check._taskkill_windows_process_tree",
+                taskkill,
+            ),
+        ):
+            await app._kill_shell_process()
+
+        taskkill.assert_not_awaited()
+        proc.wait.assert_awaited_once_with()
+        proc.kill.assert_not_called()
+        assert teardown_order == ["job"]
+        assert app._shell_job is None
+
+    async def test_windows_kill_taskkills_when_job_close_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The app falls back to PID-scoped `taskkill` after Job close failure."""
+        app = DeepAgentsApp()
+        proc = MagicMock()
+        proc.pid = 1234
+        proc.returncode = 0
+        proc.wait = AsyncMock(return_value=0)
+        job = MagicMock()
+        job.terminate.return_value = False
+        taskkill = AsyncMock()
+        app._shell_process = proc
+        monkeypatch.setattr(app, "_shell_job", job)
+
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch(
+                "deepagents_code.update_check._taskkill_windows_process_tree",
+                taskkill,
+            ),
+        ):
+            await app._kill_shell_process()
+
+        taskkill.assert_awaited_once_with(proc.pid)
+        proc.wait.assert_awaited_once_with()
+        proc.kill.assert_not_called()
+        assert app._shell_job is None
+
+    async def test_windows_kill_terminates_job_after_root_exit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The Job remains authoritative after the root process exits."""
+        app = DeepAgentsApp()
+        proc = MagicMock()
+        proc.pid = 1234
+        proc.returncode = 0
+        proc.wait = AsyncMock(return_value=0)
+        job = MagicMock()
+        job.terminate.return_value = True
+        app._shell_process = proc
+        monkeypatch.setattr(app, "_shell_job", job)
+
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch(
+                "deepagents_code.update_check._taskkill_windows_process_tree",
+                new=AsyncMock(),
+            ) as taskkill,
+        ):
+            await app._kill_shell_process()
+
+        taskkill.assert_not_awaited()
+        job.terminate.assert_called_once_with()
+        job.close.assert_not_called()
+        proc.wait.assert_awaited_once_with()
+        assert app._shell_job is None
+
+    async def test_windows_shell_error_uses_tree_cleanup(self) -> None:
+        """A Windows subprocess read error tears down the live process tree."""
+        from deepagents_code.update_check import _WINDOWS_CREATE_SUSPENDED
+
+        app = DeepAgentsApp()
+        proc = MagicMock()
+        proc.pid = 1234
+        proc.returncode = None
+        job = MagicMock()
+        order: list[str] = []
+
+        def communicate() -> tuple[bytes, bytes]:
+            order.append("communicate")
+            msg = "pipe read failed"
+            raise OSError(msg)
+
+        def assign_process(
+            candidate: asyncio.subprocess.Process,
+        ) -> object:
+            assert candidate is proc
+            order.append("assign-and-resume")
+            return job
+
+        proc.communicate = AsyncMock(side_effect=communicate)
+        kill_shell_process = AsyncMock()
+        mount_message = AsyncMock()
+        cleanup_shell_task = AsyncMock()
+
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch(
+                "asyncio.create_subprocess_shell",
+                return_value=proc,
+            ) as create_process,
+            patch(
+                "deepagents_code.update_check._assign_windows_job_and_resume",
+                side_effect=assign_process,
+            ) as assign,
+            patch.object(app, "_kill_shell_process", kill_shell_process),
+            patch.object(app, "_mount_message", mount_message),
+            patch.object(app, "_cleanup_shell_task", cleanup_shell_task),
+        ):
+            await app._run_shell_task("command", incognito=True)
+
+        assert (
+            create_process.call_args.kwargs["creationflags"]
+            == _WINDOWS_CREATE_SUSPENDED
+        )
+        assign.assert_awaited_once_with(proc)
+        assert order == ["assign-and-resume", "communicate"]
+        kill_shell_process.assert_awaited_once_with()
+        cleanup_shell_task.assert_awaited_once_with(refresh_git_branch=True)
+
+    async def test_windows_job_assignment_failure_fails_closed(self) -> None:
+        """A shell with no assigned Job is killed before command I/O starts."""
+        from deepagents_code.update_check import _WINDOWS_CREATE_SUSPENDED
+
+        app = DeepAgentsApp()
+        proc = MagicMock()
+        proc.pid = 1234
+        proc.returncode = None
+        proc.communicate = AsyncMock()
+        kill_shell_process = AsyncMock()
+        mount_message = AsyncMock()
+        cleanup_shell_task = AsyncMock()
+
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch(
+                "asyncio.create_subprocess_shell",
+                return_value=proc,
+            ) as create_process,
+            patch(
+                "deepagents_code.update_check._assign_windows_job_and_resume",
+                side_effect=OSError("assignment failed"),
+            ) as assign,
+            patch.object(app, "_kill_shell_process", kill_shell_process),
+            patch.object(app, "_mount_message", mount_message),
+            patch.object(app, "_cleanup_shell_task", cleanup_shell_task),
+        ):
+            await app._run_shell_task("command", incognito=True)
+
+        assert (
+            create_process.call_args.kwargs["creationflags"]
+            == _WINDOWS_CREATE_SUSPENDED
+        )
+        assign.assert_awaited_once_with(proc)
+        kill_shell_process.assert_awaited_once_with()
+        proc.communicate.assert_not_awaited()
+        cleanup_shell_task.assert_awaited_once_with(refresh_git_branch=True)
+
+    async def test_successful_shell_descendant_killed_on_app_shutdown(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A successful `!` root's 60s child stays owned until app shutdown."""
+        pid_file = tmp_path / "successful-shell-descendant.pid"
+        parent_code = (
+            "import subprocess, sys; from pathlib import Path; "
+            "child = subprocess.Popen("
+            "[sys.executable, '-c', 'import time; time.sleep(60)'], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+            "stderr=subprocess.DEVNULL); "
+            f"Path({str(pid_file)!r}).write_text(str(child.pid), encoding='utf-8')"
+        )
+        argv = [sys.executable, "-c", parent_code]
+        command = (
+            subprocess.list2cmdline(argv)
+            if sys.platform == "win32"
+            else shlex.join(argv)
+        )
+        app = DeepAgentsApp()
+        descendant_pid: int | None = None
+
+        try:
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app._cwd = str(tmp_path)
+
+                await app._run_shell_task(command, incognito=True)
+                descendant_pid = await _wait_for_pid_file(pid_file)
+                if sys.platform == "win32":
+                    assert _windows_pid_is_running(descendant_pid)
+                    assert app._owned_shell_jobs
+                else:
+                    assert _posix_pid_is_running(descendant_pid)
+                    assert app._owned_shell_owner_guards
+
+                await app._shutdown_shell_processes()
+
+            exited = await _wait_for_pid_exit(descendant_pid)
+        finally:
+            if descendant_pid is not None:
+                if sys.platform == "win32" and _windows_pid_is_running(descendant_pid):
+                    _cleanup_windows_process_tree(descendant_pid)
+                elif sys.platform != "win32" and _posix_pid_is_running(descendant_pid):
+                    with contextlib.suppress(OSError):
+                        os.kill(descendant_pid, signal.SIGKILL)
+
+        assert exited
+
+    async def test_retained_posix_cleanup_skips_reused_pgid_after_watchdog_loss(
+        self,
+    ) -> None:
+        """A dead retained watchdog never falls back to its root's reused PGID."""
+        app = DeepAgentsApp()
+        watchdog = MagicMock()
+        watchdog.returncode = 0
+        watchdog.wait = AsyncMock(return_value=0)
+        watchdog._transport = MagicMock()
+        owner_guard = _PosixOwnerGuard(91, watchdog, 1234)
+
+        with (
+            patch("deepagents_code._posix_shell.os.write") as write,
+            patch("deepagents_code._posix_shell.os.close"),
+            patch("os.killpg") as killpg,
+        ):
+            retained = await app._owned_shell_owner_guards.retain(owner_guard)
+            await app._terminate_owned_shell_processes()
+            await app._terminate_owned_shell_processes()
+
+        assert not retained
+        write.assert_not_called()
+        killpg.assert_not_called()
+        watchdog.wait.assert_awaited_once_with()
+        assert len(app._owned_shell_owner_guards) == 0
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows Job lifecycle regression",
+    )
+    async def test_successful_shell_without_descendants_releases_job(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A completed foreground command does not retain an empty Job handle."""
+        app = DeepAgentsApp()
+        command = subprocess.list2cmdline([sys.executable, "-c", "print('done')"])
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._cwd = str(tmp_path)
+
+            await app._run_shell_task(command, incognito=True)
+
+        assert app._shell_job is None
+        assert app._owned_shell_jobs == []
+
+    async def test_run_textual_app_always_runs_shell_shutdown(self) -> None:
+        """The production app wrapper drains retained shell ownership on exit."""
+        app = MagicMock()
+        app.run_async = AsyncMock()
+        app._shutdown_shell_processes = AsyncMock()
+        app._server_proc = None
+        app.return_code = 0
+        app._lc_thread_id = "thread-id"
+        app._session_stats = SessionStats()
+        app._update_available = (False, None)
+
+        with patch("deepagents_code.app.DeepAgentsApp", return_value=app):
+            result = await run_textual_app()
+
+        app.run_async.assert_awaited_once_with()
+        app._shutdown_shell_processes.assert_awaited_once_with()
+        assert result.thread_id == "thread-id"
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows process-tree regression",
+    )
+    async def test_windows_cancellation_kills_descendant_promptly(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Cancelling a shell worker kills descendants and reaps the root."""
+        pid_file = tmp_path / "descendant.pid"
+        parent_code = (
+            "import subprocess, sys, time; from pathlib import Path; "
+            "child = subprocess.Popen("
+            "[sys.executable, '-c', 'import time; time.sleep(30)']); "
+            f"Path({str(pid_file)!r}).write_text("
+            "str(child.pid), encoding='utf-8'); "
+            "time.sleep(30)"
+        )
+        command = subprocess.list2cmdline([sys.executable, "-c", parent_code])
+        app = DeepAgentsApp()
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._cwd = str(tmp_path)
+            task = asyncio.create_task(app._run_shell_task(command, incognito=True))
+            descendant_pid = await _wait_for_pid_file(pid_file)
+            root_proc = app._shell_process
+            assert root_proc is not None
+
+            started = time.monotonic()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            elapsed = time.monotonic() - started
+
+        exited = await _wait_for_windows_pid_exit(descendant_pid)
+        if not exited:
+            _cleanup_windows_process_tree(descendant_pid)
+        assert elapsed < 3.0
+        assert root_proc.returncode is not None
+        assert exited
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="Windows process-tree regression",
+    )
+    async def test_windows_output_error_after_root_exit_kills_descendant(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Exceptional teardown terminates the Job after its root exits."""
+        pid_file = tmp_path / "descendant.pid"
+        parent_code = (
+            "import subprocess, sys; from pathlib import Path; "
+            "child = subprocess.Popen("
+            "[sys.executable, '-c', 'import time; time.sleep(30)'], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+            "stderr=subprocess.DEVNULL); "
+            f"Path({str(pid_file)!r}).write_text("
+            "str(child.pid), encoding='utf-8')"
+        )
+        command = subprocess.list2cmdline([sys.executable, "-c", parent_code])
+        app = DeepAgentsApp()
+        app._cwd = str(tmp_path)
+        mount_message = AsyncMock()
+        cleanup_shell_task = AsyncMock()
+        descendant_pid: int | None = None
+
+        def fail_after_root_exit() -> None:
+            root_process = app._shell_process
+            assert root_process is not None
+            assert root_process.returncode is not None
+            assert pid_file.exists()
+            child_pid = int(pid_file.read_text(encoding="utf-8"))
+            assert _windows_pid_is_running(child_pid)
+            msg = "output rendering failed"
+            raise OSError(msg)
+
+        try:
+            started = time.monotonic()
+            with (
+                patch.object(
+                    app,
+                    "_schedule_git_branch_refresh",
+                    side_effect=fail_after_root_exit,
+                ),
+                patch.object(app, "_mount_message", mount_message),
+                patch.object(app, "_cleanup_shell_task", cleanup_shell_task),
+            ):
+                await asyncio.wait_for(
+                    app._run_shell_task(command, incognito=True),
+                    timeout=5,
+                )
+            elapsed = time.monotonic() - started
+            descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+            exited = await _wait_for_windows_pid_exit(descendant_pid)
+        finally:
+            if descendant_pid is None and pid_file.exists():
+                descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+            if descendant_pid is not None and _windows_pid_is_running(descendant_pid):
+                _cleanup_windows_process_tree(descendant_pid)
+
+        assert elapsed < 3.0
+        assert exited
+        assert app._shell_job is None
+        cleanup_shell_task.assert_awaited_once_with(refresh_git_branch=True)
+
+    async def test_posix_output_error_after_root_exit_cleans_known_group(
+        self,
+    ) -> None:
+        """Exceptional teardown uses the session-leader PID after root exit."""
+        app = DeepAgentsApp()
+        proc = MagicMock()
+        proc.pid = 4321
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.wait = AsyncMock(return_value=0)
+        app._schedule_git_branch_refresh = MagicMock(
+            side_effect=RuntimeError("output rendering failed")
+        )
+        mount_message = AsyncMock()
+        cleanup_shell_task = AsyncMock()
+
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch("asyncio.create_subprocess_shell", return_value=proc),
+            patch(
+                "deepagents_code.app._start_posix_shell_process",
+                new=AsyncMock(
+                    return_value=(proc, _mock_posix_owner_guard()),
+                ),
+            ),
+            patch(
+                "os.killpg",
+                side_effect=_posix_group_exits_after_sigterm,
+            ) as killpg,
+            patch.object(app, "_mount_message", mount_message),
+            patch.object(app, "_cleanup_shell_task", cleanup_shell_task),
+            pytest.raises(RuntimeError, match="output rendering failed"),
+        ):
+            await asyncio.wait_for(
+                app._run_shell_task("command", incognito=True),
+                timeout=1,
+            )
+
+        killpg.assert_any_call(proc.pid, signal.SIGTERM)
+        killpg.assert_any_call(proc.pid, 0)
+        proc.wait.assert_awaited()
+        cleanup_shell_task.assert_awaited_once_with(refresh_git_branch=True)
 
     async def test_cleanup_clears_state(self) -> None:
         """_cleanup_shell_task should reset all shell state."""
@@ -12906,8 +13580,6 @@ class TestShellCommandInterrupt:
         `_cleanup_shell_task` must re-resolve the branch so commands like
         `git checkout` are reflected in the footer.
         """
-        import subprocess
-
         repo = tmp_path / "repo"
         repo.mkdir()
 
@@ -13063,9 +13735,16 @@ class TestShellCommandInterrupt:
             app._process_next_from_queue = queue_mock  # ty: ignore
 
             with (
+                patch.object(sys, "platform", "linux"),
                 patch(
                     "asyncio.create_subprocess_shell",
                     return_value=mock_proc,
+                ),
+                patch(
+                    "deepagents_code.app._start_posix_shell_process",
+                    new=AsyncMock(
+                        return_value=(mock_proc, _mock_posix_owner_guard()),
+                    ),
                 ),
                 patch(
                     "deepagents_code.app.AssistantMessage.write_initial_content",
@@ -13151,14 +13830,26 @@ class TestShellCommandInterrupt:
             mock_proc.returncode = None
             mock_proc.pid = 12345
             mock_proc.wait = AsyncMock()
+            mock_proc.terminate = MagicMock()
+            mock_proc.kill = MagicMock()
+            mock_proc._transport = MagicMock()
 
             with (
+                patch.object(sys, "platform", "linux"),
                 patch(
                     "asyncio.create_subprocess_shell",
                     return_value=mock_proc,
                 ),
-                patch("os.killpg"),
-                patch("os.getpgid", return_value=12345),
+                patch(
+                    "deepagents_code.app._start_posix_shell_process",
+                    new=AsyncMock(
+                        return_value=(mock_proc, _mock_posix_owner_guard()),
+                    ),
+                ),
+                patch(
+                    "os.killpg",
+                    side_effect=_posix_group_exits_after_sigterm,
+                ),
             ):
                 await app._run_shell_task("sleep 999")
                 await pilot.pause()
@@ -13183,13 +13874,27 @@ class TestShellCommandInterrupt:
         mock_proc.wait = AsyncMock()
         mock_proc.terminate = MagicMock()
         mock_proc.kill = MagicMock()
+        mock_proc._transport = MagicMock()
 
         async with app.run_test() as pilot:
             await pilot.pause()
 
-            with patch(
-                "asyncio.create_subprocess_shell",
-                return_value=mock_proc,
+            with (
+                patch.object(sys, "platform", "linux"),
+                patch(
+                    "asyncio.create_subprocess_shell",
+                    return_value=mock_proc,
+                ),
+                patch(
+                    "deepagents_code.app._start_posix_shell_process",
+                    new=AsyncMock(
+                        return_value=(mock_proc, _mock_posix_owner_guard()),
+                    ),
+                ),
+                patch(
+                    "os.killpg",
+                    side_effect=_posix_group_exits_after_sigterm,
+                ),
             ):
                 await app._run_shell_task("echo secret", incognito=True)
                 await pilot.pause()
@@ -13215,18 +13920,21 @@ class TestShellCommandInterrupt:
             mock_proc.returncode = None
             mock_proc.pid = 42
             mock_proc.wait = AsyncMock()
+            mock_proc._transport = None
             app._shell_process = mock_proc
 
             with (
                 patch("deepagents_code.app.sys") as mock_sys,
-                patch("os.killpg") as mock_killpg,
-                patch("os.getpgid", return_value=42) as mock_getpgid,
+                patch(
+                    "os.killpg",
+                    side_effect=_posix_group_exits_after_sigterm,
+                ) as mock_killpg,
             ):
                 mock_sys.platform = "linux"
                 await app._kill_shell_process()
 
-            mock_getpgid.assert_called_once_with(42)
-            mock_killpg.assert_called_once_with(42, signal.SIGTERM)
+            mock_killpg.assert_any_call(42, signal.SIGTERM)
+            mock_killpg.assert_any_call(42, 0)
 
     async def test_sigkill_escalation(self) -> None:
         """SIGKILL should be sent when SIGTERM times out."""
@@ -13239,20 +13947,26 @@ class TestShellCommandInterrupt:
             mock_proc.pid = 42
             mock_proc.wait = AsyncMock(side_effect=asyncio.TimeoutError)
             mock_proc.kill = MagicMock()
+            mock_proc._transport = None
             app._shell_process = mock_proc
 
             with (
                 patch("deepagents_code.app.sys") as mock_sys,
                 patch("os.killpg") as mock_killpg,
-                patch("os.getpgid", return_value=42),
+                patch(
+                    "deepagents_code.app._SHELL_TERMINATE_TIMEOUT_SECONDS",
+                    0.01,
+                ),
             ):
                 mock_sys.platform = "linux"
+                started = time.monotonic()
                 await app._kill_shell_process()
+                elapsed = time.monotonic() - started
 
-            # First call: SIGTERM, second call: SIGKILL
-            assert mock_killpg.call_count == 2
             mock_killpg.assert_any_call(42, signal.SIGTERM)
-            mock_killpg.assert_any_call(42, signal.SIGKILL)
+            mock_killpg.assert_any_call(42, 0)
+            mock_killpg.assert_any_call(42, getattr(signal, "SIGKILL", 9))
+            assert elapsed < 0.5
 
     async def test_no_op_when_no_shell_running(self) -> None:
         """Ctrl+C with no shell command running should fall through to quit hint."""
@@ -13266,14 +13980,20 @@ class TestShellCommandInterrupt:
             assert app._quit_pending is True
 
     async def test_oserror_shows_error_message(self) -> None:
-        """OSError from create_subprocess_shell should display error."""
+        """A platform shell launch error should display an error."""
         app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
 
-            with patch(
-                "asyncio.create_subprocess_shell",
-                side_effect=OSError("Permission denied"),
+            with (
+                patch(
+                    "asyncio.create_subprocess_shell",
+                    side_effect=OSError("Permission denied"),
+                ),
+                patch(
+                    "deepagents_code.app._start_posix_shell_process",
+                    new=AsyncMock(side_effect=OSError("Permission denied")),
+                ),
             ):
                 await app._run_shell_task("forbidden")
                 await pilot.pause()
@@ -13351,9 +14071,16 @@ class TestShellCommandInterrupt:
             app._process_next_from_queue = AsyncMock()  # ty: ignore
 
             with (
+                patch.object(sys, "platform", "linux"),
                 patch(
                     "asyncio.create_subprocess_shell",
                     return_value=mock_proc,
+                ),
+                patch(
+                    "deepagents_code.app._start_posix_shell_process",
+                    new=AsyncMock(
+                        return_value=(mock_proc, _mock_posix_owner_guard()),
+                    ),
                 ),
                 patch(
                     "deepagents_code.app.AssistantMessage.write_initial_content",
@@ -13392,9 +14119,18 @@ class TestShellCommandInterrupt:
             app._maybe_drain_deferred = AsyncMock()  # ty: ignore
             app._process_next_from_queue = AsyncMock()  # ty: ignore
 
-            with patch(
-                "asyncio.create_subprocess_shell",
-                return_value=mock_proc,
+            with (
+                patch.object(sys, "platform", "linux"),
+                patch(
+                    "asyncio.create_subprocess_shell",
+                    return_value=mock_proc,
+                ),
+                patch(
+                    "deepagents_code.app._start_posix_shell_process",
+                    new=AsyncMock(
+                        return_value=(mock_proc, _mock_posix_owner_guard()),
+                    ),
+                ),
             ):
                 await app._run_shell_task("falsey", incognito=True)
                 await pilot.pause()
@@ -13427,9 +14163,18 @@ class TestShellCommandInterrupt:
             app._maybe_drain_deferred = AsyncMock()  # ty: ignore
             app._process_next_from_queue = AsyncMock()  # ty: ignore
 
-            with patch(
-                "asyncio.create_subprocess_shell",
-                return_value=mock_proc,
+            with (
+                patch.object(sys, "platform", "linux"),
+                patch(
+                    "asyncio.create_subprocess_shell",
+                    return_value=mock_proc,
+                ),
+                patch(
+                    "deepagents_code.app._start_posix_shell_process",
+                    new=AsyncMock(
+                        return_value=(mock_proc, _mock_posix_owner_guard()),
+                    ),
+                ),
             ):
                 await app._run_shell_task("echo hello world", incognito=False)
                 await pilot.pause()
@@ -13472,9 +14217,16 @@ class TestShellCommandInterrupt:
             app._process_next_from_queue = AsyncMock()  # ty: ignore
 
             with (
+                patch.object(sys, "platform", "linux"),
                 patch(
                     "asyncio.create_subprocess_shell",
                     return_value=mock_proc,
+                ),
+                patch(
+                    "deepagents_code.app._start_posix_shell_process",
+                    new=AsyncMock(
+                        return_value=(mock_proc, _mock_posix_owner_guard()),
+                    ),
                 ),
                 patch(
                     "deepagents_code.app.AssistantMessage.write_initial_content",
@@ -13593,9 +14345,16 @@ class TestShellCommandInterrupt:
             app._process_next_from_queue = AsyncMock()  # ty: ignore
 
             with (
+                patch.object(sys, "platform", "linux"),
                 patch(
                     "asyncio.create_subprocess_shell",
                     return_value=mock_proc,
+                ),
+                patch(
+                    "deepagents_code.app._start_posix_shell_process",
+                    new=AsyncMock(
+                        return_value=(mock_proc, _mock_posix_owner_guard()),
+                    ),
                 ),
                 patch(
                     "deepagents_code.app.AssistantMessage.write_initial_content",
@@ -13627,9 +14386,18 @@ class TestShellCommandInterrupt:
             app._maybe_drain_deferred = AsyncMock()  # ty: ignore
             app._process_next_from_queue = AsyncMock()  # ty: ignore
 
-            with patch(
-                "asyncio.create_subprocess_shell",
-                return_value=mock_proc,
+            with (
+                patch.object(sys, "platform", "linux"),
+                patch(
+                    "asyncio.create_subprocess_shell",
+                    return_value=mock_proc,
+                ),
+                patch(
+                    "deepagents_code.app._start_posix_shell_process",
+                    new=AsyncMock(
+                        return_value=(mock_proc, _mock_posix_owner_guard()),
+                    ),
+                ),
             ):
                 await app._run_startup_command("echo secret-startup")
                 await pilot.pause()
@@ -13656,9 +14424,18 @@ class TestShellCommandInterrupt:
             app._maybe_drain_deferred = AsyncMock()  # ty: ignore
             app._process_next_from_queue = AsyncMock()  # ty: ignore
 
-            with patch(
-                "asyncio.create_subprocess_shell",
-                return_value=mock_proc,
+            with (
+                patch.object(sys, "platform", "linux"),
+                patch(
+                    "asyncio.create_subprocess_shell",
+                    return_value=mock_proc,
+                ),
+                patch(
+                    "deepagents_code.app._start_posix_shell_process",
+                    new=AsyncMock(
+                        return_value=(mock_proc, _mock_posix_owner_guard()),
+                    ),
+                ),
             ):
                 await app._run_shell_task("falsey", incognito=False)
                 await pilot.pause()
@@ -13822,8 +14599,8 @@ class TestShellCommandInterrupt:
                 for msg in messages
             )
 
-    async def test_kill_noop_when_already_exited(self) -> None:
-        """_kill_shell_process should no-op if process already exited."""
+    async def test_kill_uses_known_group_when_root_already_exited(self) -> None:
+        """Root exit does not relinquish ownership of its POSIX process group."""
         app = DeepAgentsApp()
         async with app.run_test() as pilot:
             await pilot.pause()
@@ -13831,13 +14608,23 @@ class TestShellCommandInterrupt:
             mock_proc = AsyncMock()
             mock_proc.returncode = 0
             mock_proc.pid = 42
+            mock_proc.wait = AsyncMock(return_value=0)
+            mock_proc._transport = None
             app._shell_process = mock_proc
 
-            with patch("os.killpg") as mock_killpg:
+            with (
+                patch.object(sys, "platform", "linux"),
+                patch(
+                    "os.killpg",
+                    side_effect=_posix_group_exits_after_sigterm,
+                ) as mock_killpg,
+            ):
                 await app._kill_shell_process()
 
-            mock_killpg.assert_not_called()
-            mock_proc.terminate.assert_not_called()
+            mock_killpg.assert_any_call(42, signal.SIGTERM)
+            mock_killpg.assert_any_call(42, 0)
+            mock_proc.wait.assert_awaited()
+            mock_proc.kill.assert_not_called()
 
     async def test_end_to_end_escape_during_shell(self) -> None:
         """Esc during a running shell worker should cancel execution."""
@@ -18459,7 +19246,7 @@ class TestDeferredActions:
 
                 widget = app._startup_failure_widget
                 assert isinstance(widget, ErrorMessage)
-                assert DEFAULT_DEBUG_FILE in str(widget._content)
+                assert str(Path(DEFAULT_DEBUG_FILE)) in str(widget._content)
         finally:
             for h in added:
                 h.close()
@@ -18625,7 +19412,7 @@ class TestDeferredActions:
             assert isinstance(widget, ErrorMessage)
             rendered = str(widget._content)
             assert (
-                "uv tool install --reinstall -U "
+                "uv --no-config tool install --reinstall -U "
                 f"deepagents-code=={__version__} "
                 "--with langchain-custom_provider --prerelease allow" in rendered
             )
@@ -19852,6 +20639,8 @@ class TestRestartServerForAgentSwap:
         )
         async with app.run_test() as pilot:
             await pilot.pause()
+            await _wait_for_startup_idle(app)
+            await _wait_for_session_state(app)
 
             # Simulate port rebind during restart (TIME_WAIT) so the test
             # catches any regression that reuses the old URL.
@@ -21486,8 +22275,8 @@ class TestNotificationCenterIntegration:
             assert isinstance(app.screen, UpdateProgressScreen)
             status = app.screen.query(Static).filter(".up-status").first()
             assert "Update complete" not in str(status.render())
-            assert "/opt/stale/bin/dcode" in str(status.render())
-            assert "/home/user/.local/bin/dcode" in str(status.render())
+            assert str(shadow.shadowing_bin) in str(status.render())
+            assert str(shadow.upgraded_bin_dir / "dcode") in str(status.render())
             await pilot.press("c")
             await pilot.pause()
 
@@ -21501,7 +22290,7 @@ class TestNotificationCenterIntegration:
         )
         # The warning toast names both paths so the user can act on it.
         assert any(
-            "/opt/stale/bin/dcode" in m and "/home/user/.local/bin" in m
+            str(shadow.shadowing_bin) in m and str(shadow.upgraded_bin_dir) in m
             for m in notified
         )
 
@@ -21573,7 +22362,7 @@ class TestNotificationCenterIntegration:
         )
         # The warning toast names both paths so the user can act on it.
         assert any(
-            "/opt/stale/bin/dcode" in m and "/home/user/.local/bin" in m
+            str(shadow.shadowing_bin) in m and str(shadow.upgraded_bin_dir) in m
             for m in notified
         )
 
@@ -23585,6 +24374,9 @@ class TestExternalEventEnvGating:
         import shutil
         import tempfile
 
+        if os.name == "nt":
+            pytest.skip("UnixSocketEventSource requires a real Unix domain socket")
+
         # Use short-path tmp to avoid AF_UNIX path-length limit on macOS.
         socket_dir = tempfile.mkdtemp(dir="/tmp")
         try:
@@ -23602,6 +24394,10 @@ class TestExternalEventEnvGating:
             shutil.rmtree(socket_dir, ignore_errors=True)
         del tmp_path
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="The external event transport currently requires Unix sockets",
+    )
     async def test_socket_file_removed_on_exit(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -27153,10 +27949,11 @@ class TestWelcomeBannerLiveUpdates:
         with patch.dict(os.environ, {SPLASH_SHOW_CWD: "1"}):
             app = DeepAgentsApp(agent=MagicMock(), thread_id="thread-123")
             async with app.run_test() as pilot:
-                app._apply_cwd_to_ui(Path("/work/proj"))
+                cwd = Path("/work/proj")
+                app._apply_cwd_to_ui(cwd)
                 await pilot.pause()
                 banner = app.query_one("#welcome-banner", WelcomeBanner)
-                assert "/work/proj" in banner._build_banner().plain
+                assert str(cwd) in banner._build_banner().plain
 
     async def test_sync_status_model_swallows_screen_stack_error(
         self, caplog: pytest.LogCaptureFixture
@@ -27217,8 +28014,9 @@ class TestWelcomeBannerLiveUpdates:
                 caplog.at_level(logging.WARNING, logger="deepagents_code.app"),
             ):
                 # Must not propagate; cwd state is set before the banner update.
-                app._apply_cwd_to_ui(Path("/work/proj"))
-            assert app._cwd == "/work/proj"
+                cwd = Path("/work/proj")
+                app._apply_cwd_to_ui(cwd)
+            assert app._cwd == str(cwd)
         assert "Welcome banner not found during cwd sync" in caplog.text
 
 

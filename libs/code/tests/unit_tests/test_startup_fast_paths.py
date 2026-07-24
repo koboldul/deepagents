@@ -146,7 +146,7 @@ def test_help_only_commands_skip_runtime_imports(
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
-        (["auth", "path"], "/auth.json"),
+        (["auth", "path"], "auth.json"),
         (["config", "path", "--json"], '"command": "config path"'),
         (["doctor", "--json"], '"command": "doctor"'),
     ],

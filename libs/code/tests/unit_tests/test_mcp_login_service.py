@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -36,7 +37,8 @@ def _project_approval_config(
     text = (
         "[mcp]\n"
         "enabled_project_server_approvals = ["
-        f'{{ project_root = "{project_root}", name = "{name}", '
+        f"{{ project_root = {json.dumps(str(project_root))}, "
+        f"name = {json.dumps(name)}, "
         f'fingerprint = "{fingerprint_mcp_server_config(server)}" }}]\n'
     )
     if disabled:
@@ -215,7 +217,8 @@ class TestResolveMcpConfigAutodiscover:
         config_text = (
             "[mcp]\n"
             "enabled_project_server_approvals = ["
-            f'{{ project_root = "{project_cfg.parent}", name = "slack", '
+            f"{{ project_root = {json.dumps(str(project_cfg.parent))}, name = "
+            '"slack", '
             f'fingerprint = "{fingerprint_mcp_server_config(slack)}" }}]\n'
             "disabled_project_servers = 123\n"
         )
@@ -782,5 +785,7 @@ class TestFormatLoadErrorsNotice:
         )
         lines = notice.splitlines()
         assert len(lines) == 2
-        assert "Ignoring MCP config /a/.mcp.json: bad json" in lines[0]
-        assert "Ignoring MCP config /b/.mcp.json: missing command" in lines[1]
+        assert f"Ignoring MCP config {Path('/a/.mcp.json')}: bad json" in lines[0]
+        assert (
+            f"Ignoring MCP config {Path('/b/.mcp.json')}: missing command" in lines[1]
+        )

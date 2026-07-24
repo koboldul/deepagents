@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
 import subprocess
-from typing import TYPE_CHECKING, Any
+import sys
+import threading
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, Mock
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 import pytest
 from deepagents.backends import LocalShellBackend
 from deepagents.backends.protocol import ExecuteResponse
 from deepagents.middleware._state import private_state_field_names
 
+import deepagents_code.local_context as local_context_module
 from deepagents_code.local_context import (
     _DETECT_SCRIPT_TIMEOUT,
     _TOOL_NAME_DISPLAY_LIMIT,
@@ -24,7 +27,17 @@ from deepagents_code.local_context import (
     _AsyncExecutableBackend,
     _build_mcp_context,
     _build_tracing_context,
+    _collect_files_section,
+    _collect_gh_section,
+    _collect_git_context,
+    _collect_makefile_section,
+    _collect_package_manager_section,
+    _collect_project_section,
+    _collect_runtime_section,
+    _collect_test_command_section,
+    _collect_tree_section,
     _ExecutableBackend,
+    _resolve_path_executable,
     _section_files,
     _section_gh_cli,
     _section_git,
@@ -38,6 +51,9 @@ from deepagents_code.local_context import (
     build_detect_script,
 )
 from deepagents_code.mcp_tools import MCPServerInfo, MCPToolInfo
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class _SyncBackendFake:
@@ -122,8 +138,7 @@ def _make_summarization_event(cutoff: int) -> dict[str, Any]:
 SAMPLE_CONTEXT = (
     "## Local Context\n\n"
     "**Current Directory**: `/home/user/project`\n\n"
-    "**Git**: Current branch `main`, `main`, `master` available,"
-    " 1 uncommitted change\n\n"
+    "**Git**: Current branch `main`, `main`, `master` available\n\n"
     "**Detected Runtimes**: Python 3.12.4, Node 20.11.0\n"
 )
 
@@ -132,6 +147,356 @@ SAMPLE_CONTEXT_NO_GIT = (
     "**Current Directory**: `/home/user/project`\n\n"
     "**Detected Runtimes**: Python 3.12.4\n"
 )
+
+requires_bash = pytest.mark.skipif(
+    shutil.which("bash") is None,
+    reason="Remote Linux sandbox detection sections require bash",
+)
+skip_win32_remote_bash = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Remote Bash-script tests are skipped on Windows",
+)
+
+_FsPath = str | bytes | os.PathLike[str] | os.PathLike[bytes]
+
+
+def _no_path_executable(
+    command: str,
+    *,
+    project_root: Path | None = None,
+) -> None:
+    """Return no executable for tests that isolate marker behavior."""
+    del command, project_root
+
+
+def _guard_no_follow_probes(
+    monkeypatch: pytest.MonkeyPatch,
+    paths: list[Path],
+) -> None:
+    """Fail if code uses a follow-target API on an untrusted local entry."""
+    watched = {path.absolute() for path in paths}
+
+    def is_watched(path: _FsPath | int) -> bool:
+        if isinstance(path, int):
+            return False
+        try:
+            candidate = Path(os.fsdecode(path)).absolute()
+        except (TypeError, ValueError, OSError):
+            return False
+        return any(
+            candidate == entry or entry in candidate.parents for entry in watched
+        )
+
+    for method_name in ("is_file", "is_dir", "open", "resolve"):
+        original = cast("Callable[..., object]", getattr(Path, method_name))
+
+        def guarded(
+            path: Path,
+            *args: object,
+            _method_name: str = method_name,
+            _original: Callable[..., object] = original,
+            **kwargs: object,
+        ) -> object:
+            if is_watched(path):
+                msg = f"{_method_name} followed untrusted path {path}"
+                raise AssertionError(msg)
+            return _original(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, method_name, guarded)
+
+    real_stat = os.stat
+
+    def guarded_stat(
+        path: _FsPath | int,
+        *,
+        dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        if follow_symlinks and is_watched(path):
+            msg = f"stat followed untrusted path {path}"
+            raise AssertionError(msg)
+        return real_stat(
+            path,
+            dir_fd=dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(os, "stat", guarded_stat)
+
+
+class TestPathExecutableResolver:
+    """Tests for executable discovery used by local startup probes."""
+
+    @staticmethod
+    def _add_executable(directory: Path, command: str, *, suffix: str = "") -> Path:
+        filename = f"{command}{suffix}"
+        executable = directory / filename
+        executable.write_bytes(b"MZ" if sys.platform == "win32" else b"#!/bin/sh\n")
+        if sys.platform != "win32":
+            executable.chmod(0o755)
+        return executable
+
+    @pytest.mark.parametrize("command", ["git", "node", "gh"])
+    def test_empty_path_entries_never_select_cwd_executables(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        command: str,
+    ) -> None:
+        repository = tmp_path / "repository"
+        bin_dir = tmp_path / "bin"
+        repository.mkdir()
+        bin_dir.mkdir()
+        suffix = ".exe" if sys.platform == "win32" else ""
+        self._add_executable(repository, command, suffix=suffix)
+        expected = self._add_executable(bin_dir, command, suffix=suffix)
+        monkeypatch.chdir(repository)
+        monkeypatch.setenv("PATH", f"{os.pathsep}{bin_dir}")
+        if sys.platform == "win32":
+            monkeypatch.setenv("PATHEXT", ".EXE")
+
+        resolved = _resolve_path_executable(command)
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    @pytest.mark.parametrize("command", ["git", "node", "gh"])
+    def test_never_searches_project_or_relative_path_entries(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        command: str,
+    ) -> None:
+        repository = tmp_path / "repository"
+        repository_bin = repository / "bin"
+        bin_dir = tmp_path / "bin"
+        repository.mkdir()
+        repository_bin.mkdir()
+        bin_dir.mkdir()
+        suffix = ".exe" if sys.platform == "win32" else ""
+        self._add_executable(repository, command, suffix=suffix)
+        self._add_executable(repository_bin, command, suffix=suffix)
+        expected = self._add_executable(bin_dir, command, suffix=suffix)
+        monkeypatch.chdir(repository)
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join((".", "bin", str(repository), str(bin_dir))),
+        )
+        monkeypatch.setenv("PATHEXT", ".EXE")
+
+        resolved = _resolve_path_executable(command, project_root=repository)
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows PATH semantics")
+    def test_windows_honors_pathext_case_insensitively(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        expected = self._add_executable(bin_dir, "node", suffix=".ExE")
+        monkeypatch.setenv("PATH", str(bin_dir))
+        monkeypatch.setenv("PATHEXT", ".cMd;.eXe")
+
+        resolved = _resolve_path_executable("node")
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX PATH semantics")
+    def test_posix_requires_regular_files_with_executable_bits(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        directory_candidate = tmp_path / "directory-candidate"
+        non_executable_bin = tmp_path / "non-executable-bin"
+        executable_bin = tmp_path / "executable-bin"
+        directory_candidate.mkdir()
+        non_executable_bin.mkdir()
+        executable_bin.mkdir()
+        (directory_candidate / "git").mkdir()
+        non_executable = non_executable_bin / "git"
+        non_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+        non_executable.chmod(0o644)
+        expected = self._add_executable(executable_bin, "git")
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join(
+                (
+                    str(directory_candidate),
+                    str(non_executable_bin),
+                    str(executable_bin),
+                )
+            ),
+        )
+
+        resolved = _resolve_path_executable("git")
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX PATH semantics")
+    def test_posix_rejects_relative_path_entries(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        self._add_executable(bin_dir, "node")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("PATH", "bin")
+
+        resolved = _resolve_path_executable("node")
+
+        assert resolved is None
+
+    @pytest.mark.parametrize("command", ["git", "node", "gh"])
+    def test_rejects_active_project_tree_when_cwd_is_elsewhere(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        command: str,
+    ) -> None:
+        current_directory = tmp_path / "current"
+        project = tmp_path / "project"
+        project_bin = project / "bin"
+        trusted_bin = tmp_path / "trusted"
+        current_directory.mkdir()
+        project_bin.mkdir(parents=True)
+        trusted_bin.mkdir()
+        suffix = ".exe" if sys.platform == "win32" else ""
+        self._add_executable(project_bin, command, suffix=suffix)
+        expected = self._add_executable(trusted_bin, command, suffix=suffix)
+        monkeypatch.chdir(current_directory)
+        monkeypatch.setenv(
+            "PATH",
+            os.pathsep.join((str(project_bin), str(trusted_bin))),
+        )
+        if sys.platform == "win32":
+            monkeypatch.setenv("PATHEXT", ".EXE")
+
+        resolved = _resolve_path_executable(command, project_root=project)
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+    def test_valid_path_candidate_is_returned(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        suffix = ".exe" if sys.platform == "win32" else ""
+        expected = self._add_executable(bin_dir, "gh", suffix=suffix)
+        monkeypatch.setenv("PATH", str(bin_dir))
+        if sys.platform == "win32":
+            monkeypatch.setenv("PATHEXT", ".EXE")
+
+        resolved = _resolve_path_executable(
+            "gh",
+            project_root=tmp_path / "project",
+        )
+
+        assert resolved is not None
+        assert expected.samefile(resolved)
+
+
+class TestRunFixedCommand:
+    """Direct regressions for bounded local subprocess capture."""
+
+    def test_large_output_is_drained_without_unbounded_retention(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The reader drains all output but retains only `output_limit + 1`."""
+        total_output = 32 * 1024 * 1024
+
+        class LargeStream:
+            def __init__(self) -> None:
+                self.remaining = total_output
+                self.emitted = 0
+                self.closed = False
+
+            def read(self, size: int = -1) -> str:
+                assert 0 < size <= local_context_module._LOCAL_COMMAND_READ_CHUNK_SIZE
+                if self.remaining == 0:
+                    return ""
+                length = min(size, self.remaining)
+                self.remaining -= length
+                self.emitted += length
+                return "x" * length
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeProcess:
+            def __init__(self, stdout: LargeStream) -> None:
+                self.stdout = stdout
+                self.killed = False
+
+            def wait(self, *, timeout: int) -> int:
+                assert timeout == local_context_module._LOCAL_COMMAND_TIMEOUT
+                return 0
+
+            def kill(self) -> None:
+                self.killed = True
+
+        stream = LargeStream()
+        process = FakeProcess(stream)
+        popen = Mock(return_value=process)
+        monkeypatch.setattr(local_context_module.subprocess, "Popen", popen)
+        environment = {"PATH": "trusted"}
+
+        result = local_context_module._run_fixed_command(
+            ("fixed-tool", "--version"),
+            cwd=tmp_path,
+            output_limit=1024,
+            env=environment,
+        )
+
+        assert result == local_context_module._CommandResult(
+            returncode=0,
+            stdout="x" * 1024,
+            truncated=True,
+        )
+        assert stream.emitted == total_output
+        assert stream.closed
+        assert not process.killed
+        kwargs = popen.call_args.kwargs
+        assert kwargs["stdout"] == subprocess.PIPE
+        assert kwargs["stderr"] == subprocess.DEVNULL
+        assert kwargs["encoding"] == "utf-8"
+        assert kwargs["errors"] == "replace"
+        assert kwargs["shell"] is False
+        assert kwargs["env"] is environment
+        assert "capture_output" not in kwargs
+
+    def test_large_real_output_is_truncated(self, tmp_path: Path) -> None:
+        """A real multi-megabyte stream completes with bounded returned text."""
+        result = local_context_module._run_fixed_command(
+            (
+                sys.executable,
+                "-c",
+                (
+                    "import sys; chunk = b'x' * 65536; "
+                    "[sys.stdout.buffer.write(chunk) for _ in range(128)]"
+                ),
+            ),
+            cwd=tmp_path,
+            output_limit=4096,
+        )
+
+        assert result is not None
+        assert result.returncode == 0
+        assert result.stdout == "x" * 4096
+        assert result.truncated is True
 
 
 class TestLocalContextMiddleware:
@@ -187,7 +552,10 @@ class TestLocalContextMiddleware:
                 inherit_env=False,
                 env=os.environ.copy(),
             )
-            middleware = LocalContextMiddleware(backend=backend)
+            middleware = LocalContextMiddleware(
+                backend=backend,
+                local_root=tmp_path,
+            )
             result = middleware.before_agent({"messages": []}, Mock())
 
             assert result is not None
@@ -211,6 +579,905 @@ class TestLocalContextMiddleware:
 
         assert result is None
         backend._mock.assert_not_called()
+
+    @staticmethod
+    def _create_project(root: Path) -> None:
+        """Create representative project, git, and file context."""
+        if shutil.which("git") is None:
+            pytest.skip("git is required for native local context tests")
+        (root / "pyproject.toml").write_text(
+            "[tool.uv]\n[tool.pytest.ini_options]\n",
+            encoding="utf-8",
+        )
+        (root / "uv.lock").write_text("", encoding="utf-8")
+        (root / "Makefile").write_text(
+            "test:\n\tpython -m pytest\n",
+            encoding="utf-8",
+        )
+        (root / "src").mkdir()
+        (root / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+        (root / "libs").mkdir()
+        (root / "apps").mkdir()
+        _git_init_commit(root, branch="main")
+
+    def test_sync_local_collection_does_not_call_backend(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Sync local collection reads project context without backend execution."""
+
+        class _FailingBackend:
+            execute_calls = 0
+            aexecute_calls = 0
+
+            def execute(
+                self,
+                command: str,  # noqa: ARG002
+                *,
+                timeout: int | None = None,  # noqa: ARG002
+            ) -> ExecuteResponse:
+                self.execute_calls += 1
+                msg = "local collection must not call backend.execute"
+                raise AssertionError(msg)
+
+            async def aexecute(
+                self,
+                command: str,  # noqa: ARG002
+                *,
+                timeout: int | None = None,  # noqa: ARG002, ASYNC109
+            ) -> ExecuteResponse:
+                self.aexecute_calls += 1
+                msg = "local collection must not call backend.aexecute"
+                raise AssertionError(msg)
+
+        self._create_project(tmp_path)
+        real_resolve = local_context_module._resolve_path_executable
+
+        def resolve(
+            command: str,
+            *,
+            project_root: Path | None = None,
+        ) -> str | None:
+            return (
+                "make"
+                if command == "make"
+                else real_resolve(command, project_root=project_root)
+            )
+
+        monkeypatch.setattr(
+            local_context_module,
+            "_resolve_path_executable",
+            resolve,
+        )
+        backend = _FailingBackend()
+        middleware = LocalContextMiddleware(
+            backend=backend,
+            local_root=tmp_path,
+        )
+
+        result = middleware.before_agent({"messages": []}, Mock())
+
+        assert result is not None
+        context = result["_local_context"]
+        assert f"**Current Directory**: `{tmp_path.resolve()}`" in context
+        assert "Language: python" in context
+        assert "Monorepo: yes" in context
+        assert "**Package Manager**: Python: uv" in context
+        assert "**Git**: Current branch `main`" in context
+        assert "uncommitted" not in context
+        assert "**Run Tests**: `make test`" in context
+        assert "- src/" in context
+        assert "**Tree** (3 levels):" in context
+        assert "app.py" in context
+        assert "**Makefile** (`Makefile`, first 20 lines):" in context
+        assert backend.execute_calls == 0
+        assert backend.aexecute_calls == 0
+
+    def test_local_runtime_labels_application_python_and_path_node(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Local runtime text distinguishes the app interpreter from PATH."""
+        node = str(tmp_path / "node")
+        resolve = Mock(return_value=node)
+        run = Mock(
+            return_value=local_context_module._CommandResult(
+                returncode=0,
+                stdout="v24.14.0",
+                truncated=False,
+            )
+        )
+        monkeypatch.setattr(
+            local_context_module,
+            "_resolve_path_executable",
+            resolve,
+        )
+        monkeypatch.setattr(local_context_module, "_run_fixed_command", run)
+
+        context = _collect_runtime_section(tmp_path)
+
+        python_version = (
+            f"{sys.version_info.major}.{sys.version_info.minor}."
+            f"{sys.version_info.micro}"
+        )
+        assert context == (
+            f"**Detected Runtimes**: Application Python {python_version}, Node 24.14.0"
+        )
+        resolve.assert_called_once_with("node", project_root=tmp_path)
+        run.assert_called_once_with((node, "--version"), cwd=tmp_path)
+
+    def test_local_git_probe_uses_path_only_resolver(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        resolve = Mock(return_value=None)
+        monkeypatch.setattr(
+            local_context_module,
+            "_resolve_path_executable",
+            resolve,
+        )
+
+        context = _collect_git_context(tmp_path)
+
+        assert context.root is None
+        assert context.summary is None
+        resolve.assert_called_once_with("git", project_root=tmp_path)
+
+    def test_local_git_probe_scrubs_execution_environment(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        preserved = {
+            "HOME": "safe-home",
+            "PATH": "safe-path",
+            "TEMP": "safe-temp",
+        }
+        for key, value in preserved.items():
+            monkeypatch.setenv(key, value)
+        for key in (
+            "BASH_ENV",
+            "DYLD_INSERT_LIBRARIES",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_PAGER",
+            "LD_PRELOAD",
+            "NODE_OPTIONS",
+            "PAGER",
+            "PYTHONPATH",
+        ):
+            monkeypatch.setenv(key, "payload")
+
+        environment = local_context_module._git_probe_environment()
+
+        for key, value in preserved.items():
+            assert environment[key] == value
+        assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert environment["GIT_TERMINAL_PROMPT"] == "0"
+        assert not {
+            "BASH_ENV",
+            "DYLD_INSERT_LIBRARIES",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_EXTERNAL_DIFF",
+            "GIT_PAGER",
+            "LD_PRELOAD",
+            "NODE_OPTIONS",
+            "PAGER",
+            "PYTHONPATH",
+        }.intersection(environment)
+
+    def test_local_git_probe_forces_safe_global_configuration(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        run = Mock(return_value=None)
+        monkeypatch.setattr(local_context_module, "_run_fixed_command", run)
+        monkeypatch.setenv("GIT_EXTERNAL_DIFF", "payload")
+        monkeypatch.setenv("LD_PRELOAD", "payload")
+
+        local_context_module._run_fixed_git_command(
+            "git",
+            ("rev-parse", "--show-toplevel"),
+            cwd=tmp_path,
+        )
+
+        argv = run.call_args.args[0]
+        environment = run.call_args.kwargs["env"]
+        assert argv[0:2] == ("git", "--no-pager")
+        assert "core.fsmonitor=false" in argv
+        assert f"core.hooksPath={os.devnull}" in argv
+        assert "diff.external=" in argv
+        assert "pager.status=false" in argv
+        assert argv[-2:] == ("rev-parse", "--show-toplevel")
+        assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert "GIT_EXTERNAL_DIFF" not in environment
+        assert "LD_PRELOAD" not in environment
+
+    def test_local_git_probe_disables_repository_fsmonitor_payload(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        git = shutil.which("git")
+        if git is None:
+            pytest.skip("git is required for the fsmonitor regression")
+        _git_init_commit(tmp_path, branch="main")
+        marker = tmp_path / "fsmonitor-invoked"
+        if sys.platform == "win32":
+            payload = tmp_path / "fsmonitor.cmd"
+            payload.write_text(
+                f'@echo off\r\n>"{marker}" echo invoked\r\nexit /b 0\r\n',
+                encoding="utf-8",
+            )
+        else:
+            payload = tmp_path / "fsmonitor"
+            payload.write_text(
+                f"#!/bin/sh\nprintf invoked > {shlex.quote(str(marker))}\nexit 0\n",
+                encoding="utf-8",
+            )
+            payload.chmod(0o755)
+
+        clean_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith("GIT_")
+        }
+        clean_environment.update(
+            {
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+            }
+        )
+        configured_payload = (
+            payload.as_posix() if sys.platform == "win32" else str(payload)
+        )
+        subprocess.run(
+            [git, "config", "core.fsmonitor", configured_payload],
+            cwd=tmp_path,
+            env=clean_environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            [git, "--no-pager", "status", "--porcelain=v1"],
+            cwd=tmp_path,
+            env=clean_environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert marker.read_text(encoding="utf-8").strip() == "invoked"
+        marker.unlink()
+
+        context = _collect_git_context(tmp_path)
+
+        assert context.root == tmp_path.resolve()
+        assert context.summary is not None
+        assert not marker.exists()
+
+    def test_local_git_probe_never_runs_repository_clean_filter(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _git_init_commit(tmp_path, branch="main")
+        marker = tmp_path / "filter-invoked"
+        _arm_malicious_clean_filter(tmp_path, marker)
+
+        context = _collect_git_context(tmp_path)
+
+        assert context.root == tmp_path.resolve()
+        assert context.summary is not None
+        assert "Current branch `main`" in context.summary
+        assert not marker.exists()
+
+    def test_local_gh_probe_uses_path_only_resolver(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        resolve = Mock(return_value=None)
+        monkeypatch.setattr(
+            local_context_module,
+            "_resolve_path_executable",
+            resolve,
+        )
+
+        assert _collect_gh_section(tmp_path) == ""
+        resolve.assert_called_once_with("gh", project_root=tmp_path)
+
+    def test_local_project_markers_reject_external_links_without_following(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Language, monorepo, and environment markers never follow links."""
+        root = tmp_path / "root"
+        outside = tmp_path / "outside"
+        root.mkdir()
+        outside.mkdir()
+        pyproject = root / "pyproject.toml"
+        packages = root / "packages"
+        environment = root / ".venv"
+        target_file = outside / "pyproject.toml"
+        target_packages = outside / "packages"
+        target_environment = outside / "venv"
+        target_file.write_text("[project]\n", encoding="utf-8")
+        target_packages.mkdir()
+        target_environment.mkdir()
+        try:
+            pyproject.symlink_to(target_file)
+            packages.symlink_to(target_packages, target_is_directory=True)
+            environment.symlink_to(target_environment, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"filesystem links are unavailable: {exc}")
+        _guard_no_follow_probes(
+            monkeypatch,
+            [pyproject, packages, environment],
+        )
+
+        section = _collect_project_section(root, None)
+
+        assert section == ""
+
+    def test_local_package_markers_reject_external_links_without_following(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Package-manager marker files cannot redirect detection."""
+        root = tmp_path / "root"
+        outside = tmp_path / "outside"
+        root.mkdir()
+        outside.mkdir()
+        pyproject = root / "pyproject.toml"
+        uv_lock = root / "uv.lock"
+        target_pyproject = outside / "pyproject.toml"
+        target_lock = outside / "uv.lock"
+        target_pyproject.write_text("[tool.uv]\n", encoding="utf-8")
+        target_lock.write_text("secret-lock", encoding="utf-8")
+        try:
+            pyproject.symlink_to(target_pyproject)
+            uv_lock.symlink_to(target_lock)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"file symlinks are unavailable: {exc}")
+        _guard_no_follow_probes(monkeypatch, [pyproject, uv_lock])
+
+        section = _collect_package_manager_section(root)
+
+        assert section == ""
+
+    def test_local_test_markers_reject_external_links_without_following(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Test-command detection cannot read or classify linked markers."""
+        root = tmp_path / "root"
+        outside = tmp_path / "outside"
+        root.mkdir()
+        outside.mkdir()
+        makefile = root / "Makefile"
+        pyproject = root / "pyproject.toml"
+        package_json = root / "package.json"
+        tests = root / "tests"
+        target_makefile = outside / "Makefile"
+        target_pyproject = outside / "pyproject.toml"
+        target_package_json = outside / "package.json"
+        target_tests = outside / "tests"
+        target_makefile.write_text("test:\n\tpytest\n", encoding="utf-8")
+        target_pyproject.write_text(
+            "[project]\n[tool.pytest.ini_options]\n",
+            encoding="utf-8",
+        )
+        target_package_json.write_text(
+            '{"scripts": {"test": "node --test"}}\n',
+            encoding="utf-8",
+        )
+        target_tests.mkdir()
+        try:
+            makefile.symlink_to(target_makefile)
+            pyproject.symlink_to(target_pyproject)
+            package_json.symlink_to(target_package_json)
+            tests.symlink_to(target_tests, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"filesystem links are unavailable: {exc}")
+        _guard_no_follow_probes(
+            monkeypatch,
+            [makefile, pyproject, package_json, tests],
+        )
+
+        section = _collect_test_command_section(root)
+
+        assert section == ""
+
+    def test_local_files_list_link_name_without_target_classification(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Visible-entry sorting lists a link but never classifies its target."""
+        root = tmp_path / "root"
+        outside = tmp_path / "outside"
+        root.mkdir()
+        outside.mkdir()
+        (root / "local").mkdir()
+        (root / "file.txt").write_text("local", encoding="utf-8")
+        (outside / "secret.txt").write_text("secret", encoding="utf-8")
+        link = root / "outside-directory"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"directory symlinks are unavailable: {exc}")
+        _guard_no_follow_probes(monkeypatch, [link])
+
+        section = _collect_files_section(root)
+
+        assert "- local/" in section
+        assert "- outside-directory" in section
+        assert "- outside-directory/" not in section
+        assert "secret.txt" not in section
+
+    def test_local_collectors_do_not_use_follow_target_path_classifiers(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Normal marker detection, sorting, and reads stay on guarded APIs."""
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\n[tool.uv]\n[tool.pytest.ini_options]\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "uv.lock").write_text("", encoding="utf-8")
+        (tmp_path / "Makefile").write_text("test:\n\tpytest\n", encoding="utf-8")
+        (tmp_path / "tests" / "unit_tests").mkdir(parents=True)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "app.py").write_text("pass\n", encoding="utf-8")
+
+        def forbidden(path: Path, *_args: object, **_kwargs: object) -> bool:
+            msg = f"follow-target classifier used for {path}"
+            raise AssertionError(msg)
+
+        monkeypatch.setattr(Path, "is_file", forbidden)
+        monkeypatch.setattr(Path, "is_dir", forbidden)
+        monkeypatch.setattr(Path, "open", forbidden)
+        monkeypatch.setattr(
+            local_context_module,
+            "_resolve_path_executable",
+            _no_path_executable,
+        )
+
+        project = _collect_project_section(tmp_path, None)
+        package_manager = _collect_package_manager_section(tmp_path)
+        test_command = _collect_test_command_section(tmp_path)
+        files = _collect_files_section(tmp_path)
+        tree = _collect_tree_section(tmp_path)
+        makefile = _collect_makefile_section(tmp_path, None)
+
+        assert "Language: python" in project
+        assert "Python: uv" in package_manager
+        assert test_command == "**Run Tests**: `pytest tests/unit_tests/`"
+        assert "- src/" in files
+        assert "app.py" in tree
+        assert "pytest" in makefile
+
+    def test_local_tree_lists_but_does_not_follow_external_symlink(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A directory symlink outside the local root is listed, not traversed."""
+        root = tmp_path / "root"
+        outside = tmp_path / "outside"
+        root.mkdir()
+        outside.mkdir()
+        secret = outside / "outside-symlink-secret.txt"
+        secret.write_text("secret", encoding="utf-8")
+        link = root / "outside-link"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"directory symlinks are unavailable: {exc}")
+        _guard_no_follow_probes(monkeypatch, [link])
+
+        tree = _collect_tree_section(root)
+
+        assert link.name in tree
+        assert secret.name not in tree
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows junctions")
+    def test_local_tree_lists_but_does_not_follow_windows_junction(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A no-admin Windows junction is listed, not traversed."""
+        root = tmp_path / "root"
+        outside = tmp_path / "outside"
+        root.mkdir()
+        outside.mkdir()
+        secret = outside / "outside-junction-secret.txt"
+        secret.write_text("secret", encoding="utf-8")
+        junction = root / "outside-junction"
+        result = subprocess.run(
+            [
+                os.environ.get("COMSPEC", "cmd.exe"),
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(junction),
+                str(outside),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+
+        try:
+            tree = _collect_tree_section(root)
+        finally:
+            junction.rmdir()
+
+        assert junction.name in tree
+        assert secret.name not in tree
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows junctions")
+    def test_windows_junction_markers_are_listed_but_never_classified(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Junctions cannot become project, environment, test, or tree markers."""
+        root = tmp_path / "root"
+        outside = tmp_path / "outside"
+        root.mkdir()
+        outside.mkdir()
+        secret = outside / "junction-secret.txt"
+        secret.write_text("secret", encoding="utf-8")
+        junctions = [
+            root / "packages",
+            root / ".venv",
+            root / "tests",
+            root / "outside-visible",
+        ]
+        try:
+            for junction in junctions:
+                result = subprocess.run(
+                    [
+                        os.environ.get("COMSPEC", "cmd.exe"),
+                        "/d",
+                        "/c",
+                        "mklink",
+                        "/J",
+                        str(junction),
+                        str(outside),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                assert result.returncode == 0, result.stderr or result.stdout
+            _guard_no_follow_probes(monkeypatch, junctions)
+
+            project = _collect_project_section(root, None)
+            test_command = _collect_test_command_section(root)
+            files = _collect_files_section(root)
+            tree = _collect_tree_section(root)
+        finally:
+            for junction in junctions:
+                if os.path.lexists(junction):
+                    junction.rmdir()
+
+        assert project == ""
+        assert test_command == ""
+        assert "- outside-visible" in files
+        assert "- outside-visible/" not in files
+        assert "outside-visible" in tree
+        assert secret.name not in tree
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows UNC paths")
+    def test_direct_unc_root_is_rejected_before_metadata_probe(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A direct UNC root is rejected lexically before `lstat`."""
+        lstat = Mock(side_effect=AssertionError("UNC metadata probe"))
+        monkeypatch.setattr(Path, "lstat", lstat)
+
+        context = local_context_module._collect_local_context(
+            Path(r"\\127.0.0.1\deepagents-missing-share")
+        )
+
+        assert context == ""
+        lstat.assert_not_called()
+
+    @pytest.mark.skipif(
+        sys.platform != "win32",
+        reason="requires Windows UNC symlinks",
+    )
+    def test_unc_reparse_markers_never_probe_remote_targets(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """UNC-targeting reparse entries stay names, never marker content."""
+        root = tmp_path / "root"
+        root.mkdir()
+        unc_root = Path(r"\\127.0.0.1\deepagents-missing-share")
+        file_links = [
+            root / "pyproject.toml",
+            root / "uv.lock",
+            root / "package.json",
+            root / "Makefile",
+        ]
+        directory_links = [
+            root / "packages",
+            root / ".venv",
+            root / "tests",
+            root / "unc-visible",
+        ]
+        created: list[Path] = []
+        try:
+            for link in file_links:
+                link.symlink_to(unc_root / link.name)
+                created.append(link)
+            for link in directory_links:
+                link.symlink_to(
+                    unc_root / link.name,
+                    target_is_directory=True,
+                )
+                created.append(link)
+        except (NotImplementedError, OSError) as exc:
+            for link in reversed(created):
+                link.unlink(missing_ok=True)
+            pytest.skip(f"UNC symlinks are unavailable: {exc}")
+        _guard_no_follow_probes(monkeypatch, [*file_links, *directory_links])
+
+        project = _collect_project_section(root, None)
+        package_manager = _collect_package_manager_section(root)
+        test_command = _collect_test_command_section(root)
+        files = _collect_files_section(root)
+        tree = _collect_tree_section(root)
+        makefile = _collect_makefile_section(root, None)
+
+        assert project == ""
+        assert package_manager == ""
+        assert test_command == ""
+        assert "- unc-visible" in files
+        assert "- unc-visible/" not in files
+        assert "unc-visible" in tree
+        assert "deepagents-missing-share" not in tree
+        assert makefile == ""
+
+    def test_local_makefile_preview_rejects_external_symlink(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = tmp_path / "root"
+        outside = tmp_path / "outside"
+        root.mkdir()
+        outside.mkdir()
+        secret = "outside-makefile-secret-6e732f"
+        target = outside / "stolen"
+        target.write_text(secret, encoding="utf-8")
+        makefile = root / "Makefile"
+        try:
+            makefile.symlink_to(target)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"file symlinks are unavailable: {exc}")
+        _guard_no_follow_probes(monkeypatch, [makefile])
+
+        context = local_context_module._collect_local_context(root)
+
+        assert secret not in context
+        assert "**Makefile**" not in context
+        assert "**Run Tests**: `make test`" not in context
+
+    @pytest.mark.skipif(
+        not Path("/proc/self/environ").exists(),
+        reason="requires procfs",
+    )
+    def test_local_makefile_preview_rejects_proc_environ_symlink(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        makefile = tmp_path / "Makefile"
+        try:
+            makefile.symlink_to("/proc/self/environ")
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"file symlinks are unavailable: {exc}")
+
+        context = local_context_module._collect_local_context(tmp_path)
+
+        assert "**Makefile**" not in context
+        assert "**Run Tests**: `make test`" not in context
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows reparse")
+    def test_local_makefile_preview_rejects_windows_reparse_file(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        root = tmp_path / "root"
+        outside = tmp_path / "outside"
+        root.mkdir()
+        outside.mkdir()
+        secret = "windows-reparse-secret-c83fd1"
+        target = outside / "stolen"
+        target.write_text(secret, encoding="utf-8")
+        makefile = root / "Makefile"
+        try:
+            makefile.symlink_to(target)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"Windows file symlinks are unavailable: {exc}")
+        metadata = makefile.lstat()
+        reparse_flag = local_context_module.stat.FILE_ATTRIBUTE_REPARSE_POINT
+        assert metadata.st_file_attributes & reparse_flag
+
+        context = local_context_module._collect_local_context(root)
+
+        assert secret not in context
+        assert "**Makefile**" not in context
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows junctions")
+    def test_local_makefile_preview_rejects_windows_junction(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        root = tmp_path / "root"
+        outside = tmp_path / "outside"
+        root.mkdir()
+        outside.mkdir()
+        secret = "windows-junction-secret-b4d8a2"
+        (outside / secret).write_text(secret, encoding="utf-8")
+        junction = root / "Makefile"
+        result = subprocess.run(
+            [
+                os.environ.get("COMSPEC", "cmd.exe"),
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(junction),
+                str(outside),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+
+        try:
+            context = local_context_module._collect_local_context(root)
+        finally:
+            junction.rmdir()
+
+        assert secret not in context
+        assert "**Makefile**" not in context
+
+    @pytest.mark.skipif(
+        not getattr(os, "O_NOFOLLOW", 0),
+        reason="platform has no O_NOFOLLOW",
+    )
+    def test_local_makefile_preview_opens_with_no_follow(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (tmp_path / "Makefile").write_text("test:\n\tpytest\n", encoding="utf-8")
+        real_open = os.open
+        opened_flags: list[int] = []
+
+        def tracking_open(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            if Path(os.fsdecode(path)).name == "Makefile":
+                opened_flags.append(flags)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        monkeypatch.setattr(local_context_module.os, "open", tracking_open)
+
+        section = _collect_makefile_section(tmp_path, None)
+
+        assert "pytest" in section
+        assert opened_flags
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        assert all(flags & no_follow for flags in opened_flags)
+
+    def test_local_collection_reports_containing_git_root(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Local collection reports the git root when cwd is a subdirectory."""
+        self._create_project(tmp_path)
+        local_root = tmp_path / "src"
+        middleware = LocalContextMiddleware(
+            backend=object(),
+            local_root=local_root,
+        )
+
+        result = middleware.before_agent({"messages": []}, Mock())
+
+        assert result is not None
+        context = result["_local_context"]
+        assert f"**Current Directory**: `{local_root.resolve()}`" in context
+        assert f"- Project root: `{tmp_path.resolve()}`" in context
+        assert "**Git**: Current branch `main`" in context
+        assert "**Makefile**" in context
+
+    async def test_async_local_collection_uses_thread_and_not_backend(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Async local collection runs in a worker and skips both backend hooks."""
+
+        class _FailingBackend:
+            execute_calls = 0
+            aexecute_calls = 0
+
+            def execute(
+                self,
+                command: str,  # noqa: ARG002
+                *,
+                timeout: int | None = None,  # noqa: ARG002
+            ) -> ExecuteResponse:
+                self.execute_calls += 1
+                msg = "local collection must not call backend.execute"
+                raise AssertionError(msg)
+
+            async def aexecute(
+                self,
+                command: str,  # noqa: ARG002
+                *,
+                timeout: int | None = None,  # noqa: ARG002, ASYNC109
+            ) -> ExecuteResponse:
+                self.aexecute_calls += 1
+                msg = "local collection must not call backend.aexecute"
+                raise AssertionError(msg)
+
+        self._create_project(tmp_path)
+        caller_thread = threading.get_ident()
+        collection_threads: list[int] = []
+        collect = local_context_module._collect_local_context
+
+        def recording_collect(root: Path) -> str:
+            collection_threads.append(threading.get_ident())
+            return collect(root)
+
+        monkeypatch.setattr(
+            local_context_module,
+            "_collect_local_context",
+            recording_collect,
+        )
+        backend = _FailingBackend()
+        middleware = LocalContextMiddleware(
+            backend=backend,
+            local_root=tmp_path,
+        )
+
+        result = await middleware.abefore_agent({"messages": []}, Mock())
+
+        assert result is not None
+        assert "**Git**: Current branch `main`" in result["_local_context"]
+        assert "- src/" in result["_local_context"]
+        assert collection_threads
+        assert all(thread_id != caller_thread for thread_id in collection_threads)
+        assert backend.execute_calls == 0
+        assert backend.aexecute_calls == 0
 
     def test_before_agent_handles_script_failure(self) -> None:
         """Test before_agent returns None when script exits non-zero."""
@@ -269,7 +1536,7 @@ class TestLocalContextMiddleware:
         ctx = result["_local_context"]
         assert "**Git**: Current branch `main`" in ctx
         assert "`main`, `master` available" in ctx
-        assert "1 uncommitted change" in ctx
+        assert "uncommitted" not in ctx
 
     def test_before_agent_no_git(self) -> None:
         """Test output without git info."""
@@ -555,6 +1822,117 @@ class TestLocalContextMiddleware:
 
         assert result is None
         backend._mock.assert_not_called()
+
+
+class TestCollectTestCommandSection:
+    """Tests for native local test-command detection."""
+
+    @staticmethod
+    def _create_uv_project(root: Path) -> None:
+        (root / "pyproject.toml").write_text(
+            "[project]\n"
+            'name = "sample"\n'
+            'version = "0.1.0"\n'
+            "\n"
+            "[dependency-groups]\n"
+            'test = ["pytest"]\n'
+            "\n"
+            "[tool.pytest.ini_options]\n",
+            encoding="utf-8",
+        )
+        (root / "uv.lock").write_text("", encoding="utf-8")
+        (root / "Makefile").write_text("test:\n\tpytest\n", encoding="utf-8")
+        (root / "tests" / "unit_tests").mkdir(parents=True)
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="Windows PATH semantics")
+    def test_windows_without_make_uses_uv_unit_test_command(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._create_uv_project(tmp_path)
+
+        def resolve_uv(
+            command: str,
+            *,
+            project_root: Path | None = None,
+        ) -> str | None:
+            del project_root
+            return "uv.exe" if command == "uv" else None
+
+        monkeypatch.setattr(
+            local_context_module,
+            "_resolve_path_executable",
+            resolve_uv,
+        )
+
+        section = _collect_test_command_section(tmp_path)
+
+        assert section == (
+            "**Run Tests**: `uv run --group test pytest tests/unit_tests/`"
+        )
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX PATH semantics")
+    def test_posix_with_make_preserves_make_test(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._create_uv_project(tmp_path)
+
+        def resolve_make(
+            command: str,
+            *,
+            project_root: Path | None = None,
+        ) -> str | None:
+            del project_root
+            return "/usr/bin/make" if command == "make" else None
+
+        monkeypatch.setattr(
+            local_context_module,
+            "_resolve_path_executable",
+            resolve_make,
+        )
+
+        section = _collect_test_command_section(tmp_path)
+
+        assert section == "**Run Tests**: `make test`"
+
+    def test_without_make_or_uv_uses_scoped_pytest_command(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._create_uv_project(tmp_path)
+        monkeypatch.setattr(
+            local_context_module,
+            "_resolve_path_executable",
+            _no_path_executable,
+        )
+
+        section = _collect_test_command_section(tmp_path)
+
+        assert section == "**Run Tests**: `pytest tests/unit_tests/`"
+
+    def test_without_make_continues_to_node_detection(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (tmp_path / "Makefile").write_text("test:\n\tnpm test\n", encoding="utf-8")
+        (tmp_path / "package.json").write_text(
+            '{"scripts": {"test": "node --test"}}\n',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            local_context_module,
+            "_resolve_path_executable",
+            _no_path_executable,
+        )
+
+        section = _collect_test_command_section(tmp_path)
+
+        assert section == "**Run Tests**: `npm test`"
 
 
 def _make_async_backend(output: str = "", exit_code: int = 0) -> _AsyncBackendFake:
@@ -934,6 +2312,7 @@ def _run_section(section_bash: str, cwd: Path, *, with_header: bool = False) -> 
     return result.stdout
 
 
+@skip_win32_remote_bash
 class TestBuildDetectScript:
     """Smoke tests for the script assembly."""
 
@@ -947,6 +2326,8 @@ class TestBuildDetectScript:
         assert build_detect_script() == DETECT_CONTEXT_SCRIPT
 
 
+@skip_win32_remote_bash
+@requires_bash
 class TestSectionHeader:
     """Tests for _section_header."""
 
@@ -980,6 +2361,8 @@ class TestSectionHeader:
         assert "IN_GIT=true" in result.stdout
 
 
+@skip_win32_remote_bash
+@requires_bash
 class TestSectionProject:
     """Tests for _section_project."""
 
@@ -1015,6 +2398,8 @@ class TestSectionProject:
         assert "**Project**:" not in out
 
 
+@skip_win32_remote_bash
+@requires_bash
 class TestSectionPackageManagers:
     """Tests for _section_package_managers."""
 
@@ -1060,6 +2445,8 @@ class TestSectionPackageManagers:
         assert "**Package Manager**" not in out
 
 
+@skip_win32_remote_bash
+@requires_bash
 class TestSectionRuntimes:
     """Tests for _section_runtimes."""
 
@@ -1072,13 +2459,17 @@ class TestSectionRuntimes:
 
 def _git_env(tmp_path: Path) -> dict[str, str]:
     """Minimal env for `git commit` in an isolated temp dir."""
-    return {
-        "GIT_AUTHOR_NAME": "t",
-        "GIT_AUTHOR_EMAIL": "t@t",
-        "GIT_COMMITTER_NAME": "t",
-        "GIT_COMMITTER_EMAIL": "t@t",
-        "HOME": str(tmp_path),
-    }
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+            "HOME": str(tmp_path),
+        }
+    )
+    return env
 
 
 def _git_init_commit(tmp_path: Path, *, branch: str | None = None) -> None:
@@ -1096,6 +2487,81 @@ def _git_init_commit(tmp_path: Path, *, branch: str | None = None) -> None:
     )
 
 
+def _arm_malicious_clean_filter(repository: Path, marker: Path) -> None:
+    """Configure and prove a repository clean filter that writes `marker`."""
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git is required for the clean-filter regression")
+    attributes = repository / ".gitattributes"
+    tracked = repository / "tracked.txt"
+    payload = repository / "malicious_filter.py"
+    attributes.write_text("tracked.txt filter=dcode-malicious\n", encoding="utf-8")
+    tracked.write_text("safe\n", encoding="utf-8")
+    payload.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "Path(sys.argv[1]).write_text('invoked', encoding='utf-8')\n"
+        "sys.stdout.buffer.write(sys.stdin.buffer.read())\n",
+        encoding="utf-8",
+    )
+    environment = _git_env(repository)
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+        }
+    )
+    subprocess.run(
+        [git, "add", ".gitattributes", "tracked.txt"],
+        cwd=repository,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [git, "commit", "-m", "add filtered file"],
+        cwd=repository,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    command = " ".join(
+        shlex.quote(Path(argument).resolve().as_posix())
+        for argument in (sys.executable, payload, marker)
+    )
+    subprocess.run(
+        [git, "config", "filter.dcode-malicious.clean", command],
+        cwd=repository,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [git, "config", "filter.dcode-malicious.required", "true"],
+        cwd=repository,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tracked.write_text("evil\n", encoding="utf-8")
+    subprocess.run(
+        [git, "--no-pager", "status", "--porcelain=v1"],
+        cwd=repository,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert marker.read_text(encoding="utf-8") == "invoked"
+    marker.unlink()
+
+
+@skip_win32_remote_bash
+@requires_bash
 class TestSectionGit:
     """Tests for _section_git."""
 
@@ -1130,26 +2596,33 @@ class TestSectionGit:
         out = _run_section(_section_git(), tmp_path, with_header=True)
         assert "`main` available" in out
 
-    def test_uncommitted_changes_singular(self, tmp_path: Path) -> None:
-        _git_init_commit(tmp_path)
-        (tmp_path / "new.txt").write_text("hello")
-        out = _run_section(_section_git(), tmp_path, with_header=True)
-        assert "1 uncommitted change\n" in out or out.rstrip().endswith(
-            "1 uncommitted change"
-        )
-
-    def test_uncommitted_changes_plural(self, tmp_path: Path) -> None:
+    def test_omits_uncommitted_change_count(self, tmp_path: Path) -> None:
         _git_init_commit(tmp_path)
         (tmp_path / "a.txt").write_text("a")
         (tmp_path / "b.txt").write_text("b")
         out = _run_section(_section_git(), tmp_path, with_header=True)
-        assert "2 uncommitted changes" in out
+        assert "uncommitted" not in out
+
+    def test_git_section_never_runs_repository_clean_filter(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _git_init_commit(tmp_path, branch="main")
+        marker = tmp_path / "filter-invoked"
+        _arm_malicious_clean_filter(tmp_path, marker)
+
+        out = _run_section(_section_git(), tmp_path, with_header=True)
+
+        assert "Current branch `main`" in out
+        assert not marker.exists()
 
     def test_no_output_outside_git(self, tmp_path: Path) -> None:
         out = _run_section(_section_git(), tmp_path, with_header=True)
         assert "**Git**" not in out
 
 
+@skip_win32_remote_bash
+@requires_bash
 class TestSectionGhCli:
     """Tests for _section_gh_cli."""
 
@@ -1205,6 +2678,8 @@ class TestSectionGhCli:
         assert "does not expose `mergedAt`" in result.stdout
 
 
+@skip_win32_remote_bash
+@requires_bash
 class TestSectionTestCommand:
     """Tests for _section_test_command."""
 
@@ -1234,6 +2709,8 @@ class TestSectionTestCommand:
         assert "**Run Tests**" not in out
 
 
+@skip_win32_remote_bash
+@requires_bash
 class TestSectionFiles:
     """Tests for _section_files."""
 
@@ -1266,6 +2743,8 @@ class TestSectionFiles:
         assert ".deepagents" in out
 
 
+@skip_win32_remote_bash
+@requires_bash
 class TestSectionTree:
     """Tests for _section_tree."""
 
@@ -1324,6 +2803,8 @@ class TestSectionTree:
         assert "sed -n '1,22p;23{p;q;}'" in script
 
 
+@skip_win32_remote_bash
+@requires_bash
 class TestSectionMakefile:
     """Tests for _section_makefile."""
 
@@ -1345,6 +2826,20 @@ class TestSectionMakefile:
     def test_no_output_without_makefile(self, tmp_path: Path) -> None:
         """No Makefile section is emitted when no Makefile exists."""
         out = _run_section(_section_makefile(), tmp_path, with_header=True)
+        assert "**Makefile**" not in out
+
+    def test_rejects_external_makefile_symlink(self, tmp_path: Path) -> None:
+        """A remote-context Makefile preview does not follow a file symlink."""
+        outside = tmp_path.with_name(f"{tmp_path.name}-outside")
+        outside.mkdir()
+        secret = "remote-makefile-secret-916d3a"
+        target = outside / "stolen"
+        target.write_text(secret, encoding="utf-8")
+        (tmp_path / "Makefile").symlink_to(target)
+
+        out = _run_section(_section_makefile(), tmp_path, with_header=True)
+
+        assert secret not in out
         assert "**Makefile**" not in out
 
     def test_fallback_to_git_root_makefile(self, tmp_path: Path) -> None:
@@ -1397,6 +2892,8 @@ class TestExecutableBackend:
 # ---------------------------------------------------------------------------
 
 
+@skip_win32_remote_bash
+@requires_bash
 class TestFullScript:
     """End-to-end tests for the assembled DETECT_CONTEXT_SCRIPT."""
 
@@ -1434,6 +2931,8 @@ class TestFullScript:
 # ---------------------------------------------------------------------------
 
 
+@skip_win32_remote_bash
+@requires_bash
 class TestSectionProjectExtended:
     """Extended tests for _section_project."""
 
@@ -1465,6 +2964,8 @@ class TestSectionProjectExtended:
         assert f"Project root: `{tmp_path}`" in out
 
 
+@skip_win32_remote_bash
+@requires_bash
 class TestSectionPackageManagersExtended:
     """Extended tests for _section_package_managers."""
 
@@ -1489,6 +2990,8 @@ class TestSectionPackageManagersExtended:
         assert "Python: poetry" in out
 
 
+@skip_win32_remote_bash
+@requires_bash
 class TestSectionGitExtended:
     """Extended tests for _section_git."""
 

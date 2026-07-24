@@ -9,7 +9,7 @@ import json
 import logging
 import threading
 from collections import OrderedDict
-from pathlib import PurePosixPath
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired, cast
 
 from deepagents.backends.protocol import (
@@ -372,14 +372,27 @@ class _RepositoryToolBudgetMiddleware(AgentMiddleware[FilesystemState, None]):
             ValueError: If `root` is not a safe absolute path.
         """
         super().__init__()
-        normalized = root.replace("\\", "/")
-        path = PurePosixPath(normalized)
-        if not normalized.startswith("/") or ".." in path.parts or "~" in root:
+        self._virtual_paths = getattr(backend, "virtual_mode", False) is True
+        windows_path = PureWindowsPath(root)
+        self._source_windows_root = (
+            windows_path if self._virtual_paths and windows_path.is_absolute() else None
+        )
+        if self._virtual_paths:
+            path: PurePosixPath | PureWindowsPath = PurePosixPath("/")
+        else:
+            path = windows_path if windows_path.is_absolute() else PurePosixPath(root)
+        if not path.is_absolute() or ".." in path.parts or "~" in root:
             msg = f"Repository root must be an absolute contained path: {root!r}"
             raise ValueError(msg)
         self._backend = backend
+        self._root_path = path
+        self._windows_paths = isinstance(path, PureWindowsPath)
         self._root = str(path)
-        self._sandbox = backend if isinstance(backend, SandboxBackendProtocol) else None
+        self._sandbox = (
+            backend
+            if not self._virtual_paths and isinstance(backend, SandboxBackendProtocol)
+            else None
+        )
         self._calls: OrderedDict[str, int] = OrderedDict()
         self._lock = threading.Lock()
 
@@ -416,16 +429,68 @@ class _RepositoryToolBudgetMiddleware(AgentMiddleware[FilesystemState, None]):
             status="error",
         )
 
+    def _repository_path(self, raw_path: str) -> PurePosixPath | PureWindowsPath:
+        """Parse a repository path using the configured root's path flavor.
+
+        Returns:
+            A Windows or POSIX path matching the configured repository root.
+        """
+        if self._windows_paths:
+            return PureWindowsPath(raw_path)
+        return PurePosixPath(raw_path)
+
+    def _normalized_repository_path(
+        self,
+        raw_path: str,
+    ) -> PurePosixPath | PureWindowsPath | None:
+        """Return the contained backend path, virtualizing Windows host paths."""
+        if self._virtual_paths:
+            if self._source_windows_root is not None:
+                windows_path = PureWindowsPath(raw_path)
+                if windows_path.is_absolute():
+                    root_parts = self._source_windows_root.parts
+                    path_parts = windows_path.parts
+                    if (
+                        ".." in path_parts
+                        or "~" in raw_path
+                        or len(path_parts) < len(root_parts)
+                        or any(
+                            path.casefold() != root.casefold()
+                            for path, root in zip(
+                                path_parts[: len(root_parts)],
+                                root_parts,
+                                strict=True,
+                            )
+                        )
+                    ):
+                        return None
+                    return PurePosixPath("/", *path_parts[len(root_parts) :])
+            if "\\" in raw_path:
+                return None
+            path = PurePosixPath(raw_path)
+            if (
+                not path.is_absolute()
+                or ".." in path.parts
+                or "~" in raw_path
+                or not (path == self._root_path or self._root_path in path.parents)
+            ):
+                return None
+            return path
+
+        path = self._repository_path(raw_path)
+        root = self._root_path
+        if (
+            not path.is_absolute()
+            or ".." in path.parts
+            or "~" in raw_path
+            or not (path == root or root in path.parents)
+        ):
+            return None
+        return path
+
     def _safe_path(self, raw_path: str) -> bool:
         """Return whether an explicit repository path is absolute and contained."""
-        path = PurePosixPath(raw_path.replace("\\", "/"))
-        root = PurePosixPath(self._root)
-        return (
-            raw_path.startswith("/")
-            and ".." not in path.parts
-            and "~" not in raw_path
-            and (root == PurePosixPath("/") or path == root or root in path.parents)
-        )
+        return self._normalized_repository_path(raw_path) is not None
 
     def _containment_command(self, raw_path: str) -> str:
         """Build a sandbox command that checks the canonical repository boundary.
@@ -512,8 +577,8 @@ class _RepositoryToolBudgetMiddleware(AgentMiddleware[FilesystemState, None]):
             return self._error(request, "Repository path is unavailable.")
         return None
 
-    @staticmethod
     def _entry_size(
+        self,
         entries: Sequence[FileInfo] | None,
         normalized_path: str,
     ) -> int | None:
@@ -526,11 +591,14 @@ class _RepositoryToolBudgetMiddleware(AgentMiddleware[FilesystemState, None]):
         Returns:
             The entry's integer size, or `None` when unknown.
         """
+        expected = self._normalized_repository_path(normalized_path)
+        if expected is None:
+            return None
         for item in entries or []:
             raw = item.get("path") if isinstance(item, dict) else None
             if not isinstance(raw, str):
                 continue
-            if str(PurePosixPath(raw)) == normalized_path:
+            if self._normalized_repository_path(raw) == expected:
                 size = item.get("size")
                 return size if isinstance(size, int) else None
         return None
@@ -557,8 +625,8 @@ class _RepositoryToolBudgetMiddleware(AgentMiddleware[FilesystemState, None]):
         if not isinstance(raw_path, str):
             return None
 
-        path = PurePosixPath(raw_path.replace("\\", "/"))
-        if not self._safe_path(raw_path):
+        path = self._normalized_repository_path(raw_path)
+        if path is None:
             return self._error(request, _REPOSITORY_PATH_ERROR)
         if not self._sandbox_contains(raw_path):
             return self._error(request, _REPOSITORY_PATH_ERROR)
@@ -619,8 +687,8 @@ class _RepositoryToolBudgetMiddleware(AgentMiddleware[FilesystemState, None]):
         if not isinstance(raw_path, str):
             return None
 
-        path = PurePosixPath(raw_path.replace("\\", "/"))
-        if not self._safe_path(raw_path):
+        path = self._normalized_repository_path(raw_path)
+        if path is None:
             return self._error(request, _REPOSITORY_PATH_ERROR)
         if not await self._asandbox_contains(raw_path):
             return self._error(request, _REPOSITORY_PATH_ERROR)
@@ -730,6 +798,12 @@ class _RepositoryToolBudgetMiddleware(AgentMiddleware[FilesystemState, None]):
             if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
                 count = _REPOSITORY_GREP_MATCH_LIMIT
             args["max_count"] = min(count, _REPOSITORY_GREP_MATCH_LIMIT)
+        path_key = "file_path" if name == "read_file" else "path"
+        raw_path = args.get(path_key)
+        if isinstance(raw_path, str):
+            normalized_path = self._normalized_repository_path(raw_path)
+            if normalized_path is not None:
+                args[path_key] = str(normalized_path)
         return request.override(tool_call={**request.tool_call, "args": args})
 
     @override
@@ -753,10 +827,10 @@ class _RepositoryToolBudgetMiddleware(AgentMiddleware[FilesystemState, None]):
                 "criteria now using the context already gathered.",
             )
 
+        request = self._bounded_request(request)
         if error := self._preflight(request):
             return error
 
-        request = self._bounded_request(request)
         return self._bound_result(request, handler(request))
 
     @override
@@ -780,10 +854,10 @@ class _RepositoryToolBudgetMiddleware(AgentMiddleware[FilesystemState, None]):
                 "criteria now using the context already gathered.",
             )
 
+        request = self._bounded_request(request)
         if error := await self._apreflight(request):
             return error
 
-        request = self._bounded_request(request)
         return self._bound_result(request, await handler(request))
 
 
@@ -1532,7 +1606,13 @@ def _create_goal_criteria_agent(
         _WebSearchBudgetMiddleware(),
         _CriteriaContextBudgetMiddleware(),
     ]
+    criteria_repository_root = repository_root
     if repository_backend is not None:
+        repository_budget = _RepositoryToolBudgetMiddleware(
+            repository_backend,
+            root=repository_root,
+        )
+        criteria_repository_root = repository_budget._root
         middleware.extend(
             [
                 FilesystemMiddleware(
@@ -1541,10 +1621,7 @@ def _create_goal_criteria_agent(
                     grep_max_count=_REPOSITORY_GREP_MATCH_LIMIT,
                     tool_token_limit_before_evict=None,
                 ),
-                _RepositoryToolBudgetMiddleware(
-                    repository_backend,
-                    root=repository_root,
-                ),
+                repository_budget,
             ]
         )
     middleware.append(
@@ -1562,7 +1639,7 @@ def _create_goal_criteria_agent(
         system_prompt=GOAL_RUBRIC_SYSTEM_PROMPT.replace(
             "Repository paths are absolute, rooted at `/`.",
             "Repository paths are absolute and confined to repository root "
-            f"`{repository_root}`.",
+            f"`{criteria_repository_root}`.",
         ),
         response_format=ToolStrategy(schema=GoalProposal),
         state_schema=GoalCriteriaAgentState,

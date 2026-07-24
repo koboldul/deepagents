@@ -11,6 +11,8 @@
 
 ## Quick Install
 
+macOS/Linux:
+
 ```bash
 curl -LsSf https://langch.in/dcode | bash
 ```
@@ -20,6 +22,34 @@ curl -LsSf https://langch.in/dcode | bash
 # OpenAI, Anthropic, and Gemini are included by default
 DEEPAGENTS_CODE_EXTRAS="nvidia,ollama" curl -LsSf https://langch.in/dcode | bash
 ```
+
+Windows PowerShell:
+
+```powershell
+winget install --id astral-sh.uv -e
+$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+uv tool install -U --prerelease allow deepagents-code
+uv tool update-shell
+$uvToolBin = (uv tool dir --bin).Trim()
+$env:Path = "$uvToolBin;$env:Path"
+dcode
+```
+
+The second command refreshes `uv` in the current PowerShell. `uv tool
+update-shell` updates future shells, while the tool-bin `PATH` prepend makes
+`dcode` available immediately in this one. Opening a new shell before running
+`uv tool install` also works. See the
+[official uv installation guide](https://docs.astral.sh/uv/getting-started/installation/)
+for trusted alternatives to `winget`.
+
+From a checked-out repository, users with `uv` already installed can run the
+native installer instead:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+PowerShell and cmd are supported natively. WSL remains optional, not required.
 
 Run:
 

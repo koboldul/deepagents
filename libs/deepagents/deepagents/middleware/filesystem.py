@@ -12,7 +12,7 @@ import uuid
 from binascii import Error as BinasciiError
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, NotRequired, cast
 
 if TYPE_CHECKING:
@@ -935,7 +935,7 @@ class GrepSchema(BaseModel):
 class ExecuteSchema(BaseModel):
     """Input schema for the `execute` tool."""
 
-    command: str = Field(description="Shell command to execute in the sandbox environment.")
+    command: str = Field(description="Command to execute in the backend-configured shell and working directory.")
 
     timeout: int | None = Field(
         default=None,
@@ -1052,47 +1052,40 @@ Examples:
 GREP_TOOL_DESCRIPTION = _GREP_TOOL_DESCRIPTION_TEMPLATE.format(execute_fallback=_GREP_REGEX_EXECUTE_FALLBACK)
 _GREP_TOOL_DESCRIPTION_WITHOUT_EXECUTE = _GREP_TOOL_DESCRIPTION_TEMPLATE.format(execute_fallback="")
 
-EXECUTE_TOOL_DESCRIPTION = """Executes a shell command in an isolated sandbox environment.
+EXECUTE_TOOL_DESCRIPTION = """Executes a command in the backend-configured shell and working directory.
 
 Usage:
-Executes a given command in the sandbox environment with proper handling and security measures.
+Use this tool for commands, scripts, tests, builds, and other shell operations.
 Before executing the command, please follow these steps:
 1. Directory Verification:
    - If the command will create new directories or files, first use the ls tool to verify the parent directory exists and is the correct location
    - For example, before running "mkdir foo/bar", first use ls to check that "foo" exists and is the intended parent directory
 2. Command Execution:
-   - Always quote file paths that contain spaces with double quotes (e.g., cd "path with spaces/file.txt")
-   - Examples of proper quoting:
-     - cd "/Users/name/My Documents" (correct)
-     - cd /Users/name/My Documents (incorrect - will fail)
-     - python "/path/with spaces/script.py" (correct)
-     - python /path/with spaces/script.py (incorrect - will fail)
-   - After ensuring proper quoting, execute the command
+   - Prefer paths relative to the project working directory
+   - Use shell-native absolute path syntax only when a relative project path is not suitable
+   - Quote paths containing spaces with syntax supported by the configured shell
    - Capture the output of the command
 Usage notes:
-  - Commands run in an isolated sandbox environment
+  - Commands run in the shell and working directory configured by the backend
   - Returns combined stdout/stderr output with exit code
   - If the output is very large, it may be truncated
   - For long-running commands, use the optional timeout parameter to override the default timeout (e.g., execute(command="make build", timeout=300))
   - A timeout of 0 may disable timeouts on backends that support no-timeout execution
-  - VERY IMPORTANT: You MUST avoid using search commands like find and grep. Instead use the grep, glob tools to search. You MUST avoid read tools like cat, head, tail, and use read_file to read files.
-  - When issuing multiple commands, use the ';' or '&&' operator to separate them. DO NOT use newlines (newlines are ok in quoted strings)
-    - Use '&&' when commands depend on each other (e.g., "mkdir dir && cd dir")
-    - Use ';' only when you need to run commands sequentially but don't care if earlier commands fail
-  - Try to maintain your current working directory throughout the session by using absolute paths and avoiding usage of cd
+  - VERY IMPORTANT: Use grep and glob instead of shell search commands, and use read_file instead of shell file-reading commands
+  - Use command separators and path syntax supported by the configured shell
+  - Keep commands in the backend working directory when possible; pass relative project paths instead of changing directories
 
 Examples:
   Good examples:
-    - execute(command="pytest /foo/bar/tests")
-    - execute(command="python /path/to/script.py")
+    - execute(command="pytest tests")
+    - execute(command="python scripts/check.py")
     - execute(command="npm install && npm test")
     - execute(command="make build", timeout=300)
 
   Bad examples (avoid these):
-    - execute(command="cd /foo/bar && pytest tests")  # Use absolute path instead
-    - execute(command="cat file.txt")  # Use read_file tool instead
-    - execute(command="find . -name '*.py'")  # Use glob tool instead
-    - execute(command="grep -r 'pattern' .")  # Use grep tool instead
+    - Changing directories before running a command that accepts a relative project path
+    - Reading files through the shell instead of read_file
+    - Searching files through the shell instead of glob or grep
 
 Note: This tool is only available if the backend supports execution (SandboxBackendProtocol).
 If execution is not supported, the tool will return an error message."""
@@ -1146,14 +1139,56 @@ FILESYSTEM_SYSTEM_PROMPT = _FILESYSTEM_SYSTEM_PROMPT_TEMPLATE.format(
 
 EXECUTION_SYSTEM_PROMPT = """## Execute Tool `execute`
 
-You have access to an `execute` tool for running shell commands in a sandboxed environment.
+You have access to an `execute` tool for running commands in the backend-configured shell and working directory.
 Use this tool to run commands, scripts, tests, builds, and other shell operations.
 
-- execute: run a shell command in the sandbox (returns output and exit code)"""
+- execute: run a command in the configured shell (returns output and exit code)"""
+
+
+def _virtual_route_prefix(prefix: str) -> str:
+    """Keep file-tool route prefixes POSIX and composable for subpaths."""
+    return prefix if prefix.endswith("/") else f"{prefix}/"
+
+
+def _native_route_host_prefix(
+    route_backend: FilesystemBackend,
+) -> tuple[str, str]:
+    """Return a native host prefix and separator for shell command examples."""
+    host_root = route_backend.cwd
+    if isinstance(host_root, PureWindowsPath):
+        separator = "\\"
+        host = str(host_root if route_backend.virtual_mode else PureWindowsPath(host_root.anchor))
+    else:
+        separator = "/"
+        host = host_root.as_posix() if route_backend.virtual_mode else separator
+    return (host if host.endswith(separator) else f"{host}{separator}"), separator
+
+
+def _quote_windows_cmd_path(path: str) -> str:
+    """Quote a Windows path without allowing cmd.exe percent expansion.
+
+    Carets are literal inside quotes, so each escaped percent sits between
+    adjacent quoted path segments.
+    """
+    return '"' + path.replace("%", '"^%"') + '"'
+
+
+def _route_host_mapping_line(
+    virtual_prefix: str,
+    route_backend: FilesystemBackend,
+) -> str:
+    """Render one virtual-to-host mapping with a shell-ready nested example."""
+    virtual = _virtual_route_prefix(virtual_prefix)
+    host, host_separator = _native_route_host_prefix(route_backend)
+    host_example = f"{host}dir{host_separator}x.py"
+    if host_separator == "\\":
+        host_example = _quote_windows_cmd_path(host_example)
+    example = f"`{virtual}dir/x.py` -> `{host_example}`"
+    return f"- `{virtual}` -> `{host}` (e.g. {example})"
 
 
 def _route_host_path_prompt(backend: BackendProtocol) -> str:
-    """Build a prompt section mapping virtual route paths to host shell paths.
+    r"""Build a prompt section mapping virtual route paths to host shell paths.
 
     `execute` runs on the default backend's shell, so virtual paths (e.g.
     `/common/`) may not exist there. Instead of rewriting shell commands, provide
@@ -1165,11 +1200,11 @@ def _route_host_path_prompt(backend: BackendProtocol) -> str:
     `LocalShellBackend` (its shell runs on the local host). For such a default, a
     `FilesystemBackend` route maps to a host path based on its mode:
 
-    - virtual mode: the prefix maps to the backend's host root, `route.cwd`
-        (e.g. `/common/` -> `/data/`, so `/common/x` is `/data/x` on the host).
+    - virtual mode: the prefix maps to the backend's host root, `route.cwd`,
+        rendered using the host shell's native path syntax.
     - non-virtual mode: the prefix is stripped and the remaining absolute path is
-        used as-is (`root_dir` is ignored), i.e. the prefix maps to the filesystem
-        root `/` (e.g. `/legacy/x` is `/x`).
+        used as-is (`root_dir` is ignored), i.e. the prefix maps to the native
+        filesystem root (for example, `/` on POSIX or `C:\` on Windows).
 
     A remote/sandbox default runs its shell in a separate filesystem, so a local
     `FilesystemBackend` route is not reachable from it. Those routes, along with
@@ -1186,35 +1221,18 @@ def _route_host_path_prompt(backend: BackendProtocol) -> str:
     # default, no local filesystem route is reachable from the shell.
     default_uses_local_shell = isinstance(backend.default, LocalShellBackend)
 
-    # (virtual_prefix, host_prefix) pairs. A host_prefix of "/" means the virtual
-    # prefix is stripped down to the filesystem root.
-    host_mappings: list[tuple[str, str]] = []
+    # Keep the route backend intact until rendering so route matching continues to
+    # use POSIX virtual prefixes while host paths use their native path flavor.
+    host_mappings: list[tuple[str, FilesystemBackend]] = []
     no_host_routes: list[str] = []
     for route_prefix, route_backend in backend.sorted_routes:
         if not (default_uses_local_shell and isinstance(route_backend, FilesystemBackend)):
             no_host_routes.append(route_prefix)
-        elif route_backend.virtual_mode:
-            # Virtual mode: prefix maps to the backend's host root directory.
-            host_mappings.append((route_prefix, str(route_backend.cwd)))
         else:
-            # Non-virtual mode: prefix is stripped, remaining absolute path used
-            # as-is -> the prefix maps to the filesystem root.
-            host_mappings.append((route_prefix, "/"))
+            host_mappings.append((route_prefix, route_backend))
 
     if not host_mappings and not no_host_routes:
         return ""
-
-    def _norm(prefix: str) -> str:
-        """Ensure a trailing slash so prefix substitution composes for subpaths."""
-        return prefix if prefix.endswith("/") else f"{prefix}/"
-
-    def _mapping_line(virtual_prefix: str, host_prefix: str) -> str:
-        # Normalize both sides to end with "/" so replacing the virtual prefix with
-        # the host prefix yields a correct host path for nested paths.
-        virtual = _norm(virtual_prefix)
-        host = _norm(host_prefix)
-        example = f"`{virtual}dir/x.py` -> `{host}dir/x.py`"
-        return f"- `{virtual}` -> `{host}` (e.g. {example})"
 
     lines = [
         "## Shell paths vs. virtual paths",
@@ -1233,12 +1251,21 @@ def _route_host_path_prompt(backend: BackendProtocol) -> str:
     if host_mappings:
         lines.append("")
         lines.append("Host path mappings:")
-        lines.extend(_mapping_line(virtual_prefix, host_prefix) for virtual_prefix, host_prefix in host_mappings)
+        if any(
+            isinstance(route_backend.cwd, PureWindowsPath) and "%" in _native_route_host_prefix(route_backend)[0]
+            for _, route_backend in host_mappings
+        ):
+            lines.append(
+                "For cmd.exe mappings containing a literal `%`, the mapping keeps the host prefix readable. "
+                "In commands, copy the quoted example form: it places each `%` outside the quoted segments as "
+                "`^%`, preventing `%NAME%` environment expansion."
+            )
+        lines.extend(_route_host_mapping_line(virtual_prefix, route_backend) for virtual_prefix, route_backend in host_mappings)
 
     if no_host_routes:
         lines.append("")
         lines.append("Virtual mounts without a host path mapping (not accessible from the shell):")
-        lines.extend(f"- `{prefix}`" for prefix in no_host_routes)
+        lines.extend(f"- `{_virtual_route_prefix(prefix)}`" for prefix in no_host_routes)
 
     return "\n".join(lines)
 

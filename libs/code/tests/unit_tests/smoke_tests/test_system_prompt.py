@@ -8,6 +8,7 @@ so the golden file is reproducible across machines.
 
 from __future__ import annotations
 
+import re
 import uuid
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
@@ -42,11 +43,11 @@ _FIXED_LOCAL_CONTEXT = """## Local Context
 
 **Current Directory**: `/home/user/project`
 
-**Git**: branch `main`, 2 uncommitted changes
+**Git**: branch `main`
 
 **Project**: python (uv), monorepo
 
-**Runtimes**: Python 3.13.1, Node 24.14.0"""
+**Runtimes**: Application Python 3.13.1, Node 24.14.0"""
 
 
 class _SnapshotChatModel(GenericFakeChatModel):
@@ -146,6 +147,10 @@ def _mock_settings(tmp_path: Path) -> Generator[None, None, None]:
                 "deepagents_code.agent._offload_fallback_root",
                 return_value=tmp_path / ".deepagents",
             ),
+            patch(
+                "deepagents_code.agent._use_virtual_local_paths",
+                return_value=False,
+            ),
         ):
             yield
 
@@ -193,12 +198,21 @@ def test_system_prompt_snapshot(
 
     assert len(model.captured_system_messages) >= 1
     actual = str(model.captured_system_messages[0].text).rstrip("\n") + "\n"
+    actual = actual.replace(_FIXED_CWD.replace("/", "\\"), _FIXED_CWD)
+    actual = re.sub(r"\\+", "/", actual)
     # Redact machine-specific paths so the snapshot is reproducible across
     # machines and CI checkouts with different repo roots.
+    actual = actual.replace(str(tmp_path).replace("\\", "\\\\"), "<tmp_path>")
+    actual = actual.replace(tmp_path.as_posix(), "<tmp_path>")
     actual = actual.replace(str(tmp_path), "<tmp_path>")
+    built_in_skills_dir = Settings.get_built_in_skills_dir()
+    actual = actual.replace(str(built_in_skills_dir), "<built_in_skills_dir>")
     actual = actual.replace(
-        str(Settings.get_built_in_skills_dir()), "<built_in_skills_dir>"
+        built_in_skills_dir.as_posix(),
+        "<built_in_skills_dir>",
     )
+    actual = actual.replace("<tmp_path>\\\\", "<tmp_path>/")
+    actual = actual.replace("<tmp_path>\\", "<tmp_path>/")
 
     _assert_snapshot(
         snapshots_dir / "system_prompt_interactive_local.md",

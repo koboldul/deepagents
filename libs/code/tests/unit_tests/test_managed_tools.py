@@ -460,6 +460,7 @@ def test_extract_rg_supports_legacy_tar_extractall(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Tar extraction falls back when Python 3.11 lacks `filter=` support."""
+    monkeypatch.setattr(managed_tools.sys, "platform", "linux")
     rg_payload = b"#!/bin/sh\necho fake rg\n"
     archive = tmp_path / "ripgrep-test.tar.gz"
     archive.write_bytes(_make_fake_tarball(rg_payload))
@@ -559,7 +560,7 @@ def test_install_ripgrep_sync_happy_path(
     expected = bin_dir / ("rg.exe" if is_windows else "rg")
     assert installed == expected
     assert installed.read_bytes() == rg_payload
-    if not is_windows:
+    if not is_windows and os.name != "nt":
         assert installed.stat().st_mode & 0o777 == 0o755
 
 

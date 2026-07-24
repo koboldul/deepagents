@@ -3,9 +3,12 @@
 import asyncio
 import inspect
 import os
+import shutil
 import signal
+import subprocess
 import sys
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,6 +30,7 @@ from deepagents_code.main import (
     _ripgrep_install_hint,
     _run_startup_auto_update,
     _should_check_teardown_thread,
+    _tail_log_command,
     _terminal_row_count,
     build_missing_tool_notification,
     check_optional_tools,
@@ -42,9 +46,30 @@ from deepagents_code.mcp_tools import ProjectServerSummary
 pytestmark = pytest.mark.self_managed_update_check
 
 
+@contextmanager
+def _startup_auto_update_hermetic_defaults() -> Iterator[None]:
+    """Keep startup auto-update tests off user state and live metadata."""
+    with (
+        patch(
+            "deepagents_code.update_check.should_skip_startup_auto_update_after_failure",
+            return_value=False,
+        ),
+        patch(
+            "deepagents_code.update_check.release_requires_prereleases",
+            return_value=False,
+        ),
+        patch(
+            "deepagents_code.update_check.get_cached_update_available",
+            return_value=(False, None),
+        ),
+    ):
+        yield
+
+
 class TestTerminationSignalHandling:
     """Tests for terminating-signal cleanup wiring."""
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX signals")
     def test_posix_installs_unwinding_handler(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -78,23 +103,83 @@ class TestTerminationSignalHandling:
         install.assert_not_called()
 
 
+class TestTailLogCommand:
+    """Tests for platform-specific log-follow commands."""
+
+    def test_posix_uses_shell_quoting(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """POSIX log paths are safely quoted for `tail`."""
+        monkeypatch.setattr("deepagents_code.main.sys.platform", "linux")
+
+        command = _tail_log_command("/tmp/it's [ready].log")
+
+        assert command == """tail -f '/tmp/it'"'"'s [ready].log'"""
+
+    def test_windows_uses_powershell_quoting(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows log paths are safely quoted for PowerShell."""
+        monkeypatch.setattr("deepagents_code.main.sys.platform", "win32")
+
+        command = _tail_log_command(r"C:\logs\O'Brien [ready].log")
+
+        assert command == (
+            'powershell -NoProfile -Command "'
+            "Get-Content -Wait -LiteralPath 'C:\\logs\\O''Brien [ready].log'"
+            '"'
+        )
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows shells")
+    def test_windows_command_executes_from_powershell_and_cmd(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The emitted nested quoting survives both supported Windows shells."""
+        log_path = tmp_path / "logs with spaces" / "O'Brien [ready].log"
+        log_path.parent.mkdir()
+        log_path.write_text("tail-marker\n", encoding="utf-8")
+        monkeypatch.setattr("deepagents_code.main.sys.platform", "win32")
+        command = _tail_log_command(log_path)
+        assert command.endswith('"')
+        one_line_command = f'{command[:-1]} | Select-Object -First 1"'
+
+        shells: list[tuple[str, list[str] | str, bool]] = []
+        for name in ("powershell.exe", "pwsh.exe"):
+            executable = shutil.which(name)
+            if executable is not None:
+                shells.append(
+                    (
+                        Path(executable).stem,
+                        [executable, "-NoProfile", "-Command", one_line_command],
+                        False,
+                    )
+                )
+        command_prompt = shutil.which("cmd.exe")
+        if command_prompt is not None:
+            shells.append(("cmd", one_line_command, True))
+        assert shells
+
+        for shell, arguments, use_shell in shells:
+            result = subprocess.run(
+                arguments,
+                check=False,
+                capture_output=True,
+                executable=command_prompt if use_shell else None,
+                shell=use_shell,
+                text=True,
+                timeout=15,
+            )
+            assert result.returncode == 0, f"{shell}: {result.stderr}"
+            assert result.stdout.strip() == "tail-marker", shell
+
+
 class TestStartupAutoUpdate:
     """Tests for startup auto-update behavior."""
 
-    @pytest.fixture(autouse=True)
-    def _no_prerelease_lookup(self) -> Iterator[None]:
-        """Stub the pre-release dependency lookup for startup tests.
-
-        The startup auto-update path calls `release_requires_prereleases`
-        (e.g. in the restart-loop guard) with `latest`. Unstubbed, that reads
-        the real host cache and falls through to a live PyPI request, which is
-        non-hermetic and would hit the network under a bare `pytest` run. Pin it
-        to `False`; the function's own behavior is covered in `test_update_check`.
-        """
-        with patch(
-            "deepagents_code.update_check.release_requires_prereleases",
-            return_value=False,
-        ):
+    @pytest.fixture(autouse=True, scope="class")
+    def _hermetic_startup_auto_update_defaults(self) -> Iterator[None]:
+        """Default startup update tests to no failure marker and no live lookups."""
+        with _startup_auto_update_hermetic_defaults():
             yield
 
     @pytest.fixture(autouse=True)
@@ -177,7 +262,7 @@ class TestStartupAutoUpdate:
         upgrade.assert_awaited_once()
         clear_failure.assert_called_once_with("9.9.9")
         printed = " ".join(str(c.args[0]) for c in console.print.call_args_list)
-        assert "tail -f /tmp/dcode-update.log" in printed
+        assert _tail_log_command(Path("/tmp/dcode-update.log")) in printed
         restart.assert_called_once_with()
 
     def test_successful_update_skips_restart_when_shadowed(self) -> None:
@@ -191,6 +276,8 @@ class TestStartupAutoUpdate:
         with no explanation. Also pins the markup-escape behavior: a path
         containing a Rich-special character must not raise.
         """
+        from rich.markup import escape
+
         from deepagents_code.update_check import ShadowedDcode
 
         console = MagicMock()
@@ -247,8 +334,8 @@ class TestStartupAutoUpdate:
         # dropped `escape()` would either raise `MarkupError` (test fails)
         # or render `[legacy]` as a (broken) style tag. Asserting the
         # escaped form pins the fix.
-        assert "/opt/old \\[legacy]/bin/dcode" in printed
-        assert "/home/user/.local/bin" in printed
+        assert escape(str(shadow.shadowing_bin)) in printed
+        assert escape(str(shadow.upgraded_bin_dir)) in printed
         assert "Continuing with v" in printed
 
     def test_disabled_update_does_not_check_pypi(self) -> None:
@@ -1025,6 +1112,12 @@ class TestStartupAutoUpdate:
 
 class TestAutoUpdateDefaultMigration:
     """First-run consent/migration notice for the auto-update opt-out default."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _hermetic_startup_auto_update_defaults(self) -> Iterator[None]:
+        """Default startup update tests to no failure marker and no live lookups."""
+        with _startup_auto_update_hermetic_defaults():
+            yield
 
     @pytest.fixture(autouse=True)
     def _no_shadowed_dcode(self) -> Iterator[None]:
@@ -3187,6 +3280,8 @@ class TestCheckMcpProjectTrustPrompt:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Remembered approvals still skip the prompt with an env allowlist set."""
+        import json
+
         from deepagents_code import model_config
         from deepagents_code.main import _check_mcp_project_trust
 
@@ -3211,7 +3306,8 @@ class TestCheckMcpProjectTrustPrompt:
         user_config.write_text(
             "[mcp]\n"
             "enabled_project_server_approvals = ["
-            f'{{ project_root = "{project_root}", name = "docs[/green]", '
+            f"{{ project_root = {json.dumps(str(project_root))}, "
+            'name = "docs[/green]", '
             f'fingerprint = "{fingerprint}" }}]\n'
             'disabled_project_servers = ["blocked[/red]"]\n'
         )
@@ -3480,9 +3576,15 @@ class TestSelectProjectServersToPersist:
     @pytest.fixture
     def _interactive_picker_terminal(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Allow picker tests to run independently of pytest's captured streams."""
+        from prompt_toolkit.output import DummyOutput
+
         monkeypatch.setattr(
             "deepagents_code.main._project_mcp_picker_has_terminal",
             lambda: True,
+        )
+        monkeypatch.setattr(
+            "prompt_toolkit.output.defaults.create_output",
+            lambda **_kwargs: DummyOutput(),
         )
 
     @pytest.mark.parametrize(

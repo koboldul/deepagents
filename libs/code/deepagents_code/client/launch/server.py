@@ -26,6 +26,10 @@ from deepagents_code.config import _INHERITED_PYTHONPATH_ENV
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+    from typing import IO
+
+    from deepagents_code._posix_shell import _SyncPosixOwnerGuard
+    from deepagents_code.update_check import _WindowsJobObject
 
 logger = logging.getLogger(__name__)
 
@@ -371,8 +375,285 @@ def _build_server_env() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Process-group teardown
+# Process-tree teardown
 # ---------------------------------------------------------------------------
+
+
+_POSIX_SERVER_LAUNCHER = """\
+import os
+import signal
+import sys
+
+gate_fd = int(sys.argv[1])
+try:
+    gate_token = os.read(gate_fd, 1)
+finally:
+    os.close(gate_fd)
+
+if gate_token != b"G":
+    raise SystemExit(125)
+
+for signal_name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+    signal_number = getattr(signal, signal_name, None)
+    if signal_number is not None:
+        signal.signal(signal_number, signal.SIG_DFL)
+
+command = sys.argv[2:]
+os.execvpe(command[0], command, os.environ)
+"""
+
+
+def _close_posix_file_descriptor(file_descriptor: int | None) -> None:
+    """Close an optional POSIX file descriptor without masking cleanup."""
+    if file_descriptor is not None:
+        with contextlib.suppress(OSError):
+            os.close(file_descriptor)
+
+
+def _reap_starting_posix_server(process: subprocess.Popen[Any]) -> None:
+    """Reap a gated POSIX root that has not executed the server command."""
+    try:
+        process.wait(timeout=_SIGKILL_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        if process.poll() is None:
+            with contextlib.suppress(OSError, ProcessLookupError):
+                process.kill()
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            process.wait(timeout=_SIGKILL_TIMEOUT)
+
+
+def _open_posix_server_launch_gate(file_descriptor: int) -> None:
+    """Allow a gated server root to execute its command.
+
+    Raises:
+        OSError: If the complete gate token cannot be written.
+    """
+    if os.write(file_descriptor, b"G") != 1:
+        msg = "Failed to open POSIX server launch gate"
+        raise OSError(msg)
+
+
+def _spawn_posix_server_process(
+    cmd: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    stdout: int | IO[str] | None,
+) -> tuple[subprocess.Popen[Any], _SyncPosixOwnerGuard]:
+    """Gate server execution until its process-group watchdog is armed.
+
+    Args:
+        cmd: Server command and arguments.
+        cwd: Server working directory.
+        env: Exact server environment.
+        stdout: Combined stdout/stderr destination.
+
+    Returns:
+        The server root and its durable process-group ownership token.
+    """
+    from deepagents_code._posix_shell import _start_sync_posix_owner_guard
+
+    gate_read_fd: int | None = None
+    gate_write_fd: int | None = None
+    process: subprocess.Popen[Any] | None = None
+    owner: _SyncPosixOwnerGuard | None = None
+
+    try:
+        gate_read_fd, gate_write_fd = os.pipe()
+        process = subprocess.Popen(  # noqa: S603
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                _POSIX_SERVER_LAUNCHER,
+                str(gate_read_fd),
+                *cmd,
+            ],
+            cwd=cwd,
+            env=env,
+            stdout=stdout,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            pass_fds=(gate_read_fd,),
+        )
+        _close_posix_file_descriptor(gate_read_fd)
+        gate_read_fd = None
+
+        owner = _start_sync_posix_owner_guard(
+            process.pid,
+            term_timeout=_SHUTDOWN_TIMEOUT,
+        )
+        _open_posix_server_launch_gate(gate_write_fd)
+        _close_posix_file_descriptor(gate_write_fd)
+        gate_write_fd = None
+    except BaseException:
+        _close_posix_file_descriptor(gate_write_fd)
+        gate_write_fd = None
+        if owner is not None:
+            owner.terminate(reap=process.poll if process is not None else None)
+        if process is not None:
+            _reap_starting_posix_server(process)
+        raise
+    else:
+        return process, owner
+    finally:
+        _close_posix_file_descriptor(gate_read_fd)
+        _close_posix_file_descriptor(gate_write_fd)
+
+
+def _windows_popen_process_handle(process: subprocess.Popen[Any]) -> int:
+    """Return the native process handle retained by `subprocess.Popen`.
+
+    Args:
+        process: Windows subprocess created by `subprocess.Popen`.
+
+    Returns:
+        The native Windows process handle.
+
+    Raises:
+        OSError: If the process handle is unavailable.
+    """
+    handle = getattr(process, "_handle", None)
+    if not isinstance(handle, int):
+        msg = "Windows subprocess process handle is unavailable"
+        raise OSError(msg)
+    return handle
+
+
+def _wait_for_windows_process_exit(
+    process: subprocess.Popen[Any],
+    *,
+    timeout: float,
+) -> bool:
+    """Wait a bounded interval for a Windows root process to exit.
+
+    Args:
+        process: Root process to reap.
+        timeout: Maximum seconds to wait.
+
+    Returns:
+        Whether the root exited before the deadline.
+    """
+    try:
+        process.wait(timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return process.poll() is not None
+    return True
+
+
+def _terminate_windows_server_process(
+    process: subprocess.Popen[Any],
+    job: _WindowsJobObject | None,
+) -> None:
+    """Terminate and reap an owned Windows server process tree.
+
+    The Job handle is closed first even when the root already exited, because
+    descendants can remain alive after their parent. Root-process fallbacks and
+    waits stay bounded so shutdown is safe to repeat.
+
+    Args:
+        process: Root server process.
+        job: Kill-on-close Job Object containing the server tree, if assigned.
+    """
+    job_terminated = False
+    if job is not None:
+        try:
+            job_terminated = job.terminate()
+        except OSError:
+            logger.exception(
+                "Failed to terminate server Job Object for pid=%d; "
+                "descendants may be orphaned",
+                process.pid,
+            )
+        if not job_terminated:
+            logger.error(
+                "Failed to close server Job Object for pid=%d; "
+                "descendants may be orphaned",
+                process.pid,
+            )
+
+    if job_terminated:
+        if _wait_for_windows_process_exit(process, timeout=_SHUTDOWN_TIMEOUT):
+            return
+        logger.warning(
+            "Server process pid=%d did not exit after Job termination; "
+            "killing root process",
+            process.pid,
+        )
+    elif process.poll() is not None:
+        # `poll()` reaped the root. The Job path above still ran first so any
+        # surviving descendants were not mistaken for a fully stopped tree.
+        return
+
+    try:
+        process.kill()
+    except ProcessLookupError:
+        logger.debug(
+            "Server process pid=%d already exited before forced termination",
+            process.pid,
+        )
+        return
+    except OSError:
+        logger.exception(
+            "Failed to force-kill server process pid=%d; it may be orphaned",
+            process.pid,
+        )
+        return
+
+    if not _wait_for_windows_process_exit(process, timeout=_SIGKILL_TIMEOUT):
+        logger.warning(
+            "Server process pid=%d did not exit after forced termination",
+            process.pid,
+        )
+
+
+def _assign_windows_server_job_and_resume(
+    process: subprocess.Popen[Any],
+) -> _WindowsJobObject:
+    """Assign a suspended server process to a Job, then resume it.
+
+    Args:
+        process: Server process created with `CREATE_SUSPENDED`.
+
+    Returns:
+        The Job Object containing the resumed server process.
+    """
+    from deepagents_code.update_check import (
+        _resume_windows_process,
+        _WindowsJobObject,
+    )
+
+    job: _WindowsJobObject | None = None
+    try:
+        process_handle = _windows_popen_process_handle(process)
+        job = _WindowsJobObject.create_for_process_handle(process_handle)
+        _resume_windows_process(process_handle)
+    except BaseException:
+        # Assignment failures happen while the root is still suspended, so it
+        # cannot run unowned. Resume failures close the already-assigned Job.
+        _terminate_windows_server_process(process, job)
+        raise
+    return job
+
+
+def _reap_posix_owned_server_root(process: subprocess.Popen[Any]) -> None:
+    """Reap the server root after its ownership watchdog completes teardown."""
+    if process.poll() is not None:
+        return
+
+    try:
+        process.wait(timeout=_SIGKILL_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        if process.poll() is None:
+            logger.warning(
+                "Server process pid=%d survived owned process-group teardown; "
+                "killing root process",
+                process.pid,
+            )
+            with contextlib.suppress(OSError, ProcessLookupError):
+                process.kill()
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+            process.wait(timeout=_SIGKILL_TIMEOUT)
 
 
 def _server_process_group(pid: int) -> int | None:
@@ -439,12 +720,15 @@ def _wait_for_process_group_exit(
         `True` when the group is gone, or `False` on timeout.
     """
     deadline = time.monotonic() + timeout
+    killpg = getattr(  # ruff: ignore[get-attr-with-constant]  # Absent on Windows.
+        os, "killpg"
+    )
     while True:
         # `poll()` reaps an exited leader without blocking. Until that happens,
         # its zombie entry keeps `killpg(..., 0)` reporting the group as alive.
         process.poll()
         try:
-            os.killpg(pgid, 0)
+            killpg(pgid, 0)
         except ProcessLookupError:
             process.wait()
             return True
@@ -458,28 +742,70 @@ def _wait_for_process_group_exit(
         time.sleep(min(_PROCESS_GROUP_POLL_INTERVAL, remaining))
 
 
-def _terminate_server_process(process: subprocess.Popen[Any]) -> None:
+def _terminate_server_process(
+    process: subprocess.Popen[Any],
+    windows_job: _WindowsJobObject | None = None,
+    posix_owner: _SyncPosixOwnerGuard | None = None,
+) -> None:
     """Terminate the `langgraph dev` server and its descendants.
 
     Sends SIGTERM, waits `_SHUTDOWN_TIMEOUT` for a graceful exit, then escalates
-    to SIGKILL. On POSIX the whole detached process group is signaled via
-    `os.killpg`, and teardown waits for the entire group to exit — not just the
-    root — so a child that outlives the `langgraph dev` root is still escalated
-    to SIGKILL rather than orphaned. On Windows (or if the server is not its own
-    group leader) only the root process is signaled. `_server_process_group`
-    guarantees dcode's own process group is never targeted.
+    to SIGKILL. On POSIX a retained watchdog control token signals the original
+    detached process group even after its leader exits; a root-live fallback
+    preserves the prior direct `os.killpg` behavior when no token is available.
+    On Windows an assigned kill-on-close Job is terminated before bounded root
+    reaping. `_server_process_group` guarantees dcode's own process group is
+    never targeted by the POSIX fallback.
 
     Args:
         process: The running server subprocess to terminate.
+        windows_job: Windows Job Object owning the server tree, if applicable.
+        posix_owner: Watchdog control token owning the original POSIX process
+            group, if applicable.
     """
     pid = process.pid
+    if sys.platform == "win32" and windows_job is not None:
+        logger.info("Stopping langgraph dev server (pid=%d)", pid)
+        _terminate_windows_server_process(process, windows_job)
+        return
+    if sys.platform != "win32" and posix_owner is not None:
+        logger.info("Stopping langgraph dev server (pid=%d)", pid)
+        process.poll()
+        owner_was_alive = posix_owner.is_alive()
+        if not posix_owner.terminate(reap=process.poll):
+            if process.poll() is None:
+                logger.warning(
+                    "POSIX server ownership watchdog for pid=%d exited before "
+                    "teardown; falling back to the still-live server root",
+                    pid,
+                )
+                _terminate_server_process(process)
+                return
+            if owner_was_alive:
+                logger.warning(
+                    "POSIX server ownership watchdog for pid=%d did not complete "
+                    "teardown; descendants may be orphaned",
+                    pid,
+                )
+            else:
+                logger.debug(
+                    "POSIX server ownership watchdog for pid=%d already exited; "
+                    "skipping stale process-group signaling",
+                    pid,
+                )
+        _reap_posix_owned_server_root(process)
+        return
+
     pgid = _server_process_group(pid)
     scope = "process group" if pgid is not None else "process"
 
     logger.info("Stopping langgraph dev server (pid=%d)", pid)
     try:
         if pgid is not None:
-            os.killpg(pgid, signal.SIGTERM)
+            killpg = getattr(  # ruff: ignore[get-attr-with-constant]  # Windows.
+                os, "killpg"
+            )
+            killpg(pgid, signal.SIGTERM)
             stopped = _wait_for_process_group_exit(process, pgid, _SHUTDOWN_TIMEOUT)
         else:
             process.send_signal(signal.SIGTERM)
@@ -510,7 +836,13 @@ def _terminate_server_process(process: subprocess.Popen[Any]) -> None:
     # just before SIGKILL, while any other `OSError` means it may be orphaned.
     try:
         if pgid is not None:
-            os.killpg(pgid, signal.SIGKILL)
+            killpg = getattr(  # ruff: ignore[get-attr-with-constant]  # Windows.
+                os, "killpg"
+            )
+            sigkill = getattr(  # ruff: ignore[get-attr-with-constant]  # Windows.
+                signal, "SIGKILL"
+            )
+            killpg(pgid, sigkill)
             if not _wait_for_process_group_exit(process, pgid, _SIGKILL_TIMEOUT):
                 logger.warning(
                     "Server %s pid=%d did not exit after SIGKILL", scope, pid
@@ -581,6 +913,8 @@ class ServerProcess:
         self._owns_config_dir = owns_config_dir
         self._scaffold = scaffold
         self._process: subprocess.Popen | None = None
+        self._windows_job: _WindowsJobObject | None = None
+        self._posix_owner: _SyncPosixOwnerGuard | None = None
         self._temp_dir: tempfile.TemporaryDirectory | None = None
         self._log_file: tempfile.NamedTemporaryFile | None = None  # ty: ignore[invalid-type-form]
         self._env_overrides: dict[str, str] = {}
@@ -668,9 +1002,26 @@ class ServerProcess:
                 stop phase. If synchronous terminal shutdown ran meanwhile,
                 abort instead of resurrecting the subprocess.
         """
-        process = self._spawn_process(
-            expected_stop_generation=expected_stop_generation,
-        )
+        try:
+            process = self._spawn_process(
+                expected_stop_generation=expected_stop_generation,
+            )
+        except BaseException:
+            with self._state_lock:
+                partial_start = (
+                    self._process is not None
+                    or self._windows_job is not None
+                    or self._posix_owner is not None
+                    or self._log_file is not None
+                )
+            if partial_start:
+                try:
+                    await asyncio.to_thread(self.stop)
+                except Exception:
+                    logger.exception(
+                        "Error stopping server during startup cleanup",
+                    )
+            raise
         if process is None:
             return
         started = False
@@ -729,6 +1080,15 @@ class ServerProcess:
                 raise asyncio.CancelledError
             if self._running_locked():
                 return None
+            if (
+                self._process is not None
+                or self._windows_job is not None
+                or self._posix_owner is not None
+            ):
+                # A previous root may have exited while descendants remained in
+                # its owned process tree. Tear that ownership state down before
+                # replacing it.
+                self._stop_process_locked()
             self._stopped = False
 
             work_dir = self.config_dir
@@ -783,14 +1143,31 @@ class ServerProcess:
                 mode="w",
                 encoding="utf-8",
             )
-            self._process = subprocess.Popen(  # noqa: S603
-                cmd,
-                cwd=str(work_dir),
-                env=env,
-                stdout=self._log_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=(sys.platform != "win32"),
-            )
+            creationflags = 0
+            if sys.platform == "win32":
+                from deepagents_code.update_check import (
+                    _WINDOWS_CREATE_SUSPENDED,
+                )
+
+                creationflags = _WINDOWS_CREATE_SUSPENDED
+            if sys.platform == "win32":
+                self._process = subprocess.Popen(  # noqa: S603
+                    cmd,
+                    cwd=str(work_dir),
+                    env=env,
+                    stdout=self._log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=False,
+                    creationflags=creationflags,
+                )
+                self._windows_job = _assign_windows_server_job_and_resume(self._process)
+            else:
+                self._process, self._posix_owner = _spawn_posix_server_process(
+                    cmd,
+                    cwd=str(work_dir),
+                    env=env,
+                    stdout=self._log_file,
+                )
             return self._process
 
     async def wait_for_graph_ready(
@@ -882,24 +1259,54 @@ class ServerProcess:
 
     def _stop_process_locked(self) -> None:
         """Stop the subprocess while `_state_lock` is held."""
-        if self._process is None:
-            return
+        process = self._process
+        windows_job = self._windows_job
+        posix_owner = self._posix_owner
 
-        if self._process.poll() is None:
-            _terminate_server_process(self._process)
+        if process is not None and (
+            windows_job is not None or posix_owner is not None or process.poll() is None
+        ):
+            _terminate_server_process(process, windows_job, posix_owner)
             # `_terminate_server_process` is best-effort. If the process is still
             # alive here (e.g. SIGKILL failed with EPERM), then once we drop the
             # handle below we can no longer observe or reap this pid, so surface
             # the still-running process rather than clearing state as if shutdown
             # succeeded.
-            if self._process.poll() is None:
+            if process.poll() is None:
                 logger.warning(
                     "Dropping handle to server pid=%d that is still running; "
                     "it may be orphaned",
-                    self._process.pid,
+                    process.pid,
                 )
+        elif windows_job is not None:
+            try:
+                if not windows_job.terminate():
+                    logger.error(
+                        "Failed to close server Job Object without a root process; "
+                        "descendants may be orphaned"
+                    )
+            except OSError:
+                logger.exception(
+                    "Failed to terminate server Job Object without a root process; "
+                    "descendants may be orphaned"
+                )
+        elif posix_owner is not None:
+            owner_was_alive = posix_owner.is_alive()
+            if not posix_owner.terminate():
+                if owner_was_alive:
+                    logger.warning(
+                        "POSIX server ownership watchdog did not complete without "
+                        "a root process; descendants may be orphaned"
+                    )
+                else:
+                    logger.debug(
+                        "POSIX server ownership watchdog already exited without "
+                        "a root process; skipping stale process-group signaling"
+                    )
 
         self._process = None
+        self._windows_job = None
+        self._posix_owner = None
 
         if self._log_file is not None:
             log_path = Path(self._log_file.name)

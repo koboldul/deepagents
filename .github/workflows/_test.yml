@@ -148,10 +148,10 @@ jobs:
           COV_OS: ${{ inputs.coverage-os || inputs.os }}
         run: |
           if [ -n "$COV_PY" ] && [ "$PY" = "$COV_PY" ] && [ "$PY_OS" = "$COV_OS" ]; then
-            uv run --group test pytest -n auto -vvv tests/unit_tests/ --cov=deepagents --cov-report=term-missing
+            uv run --group test pytest -n auto -vvv --disable-socket --allow-hosts=127.0.0.1,localhost,::1 tests/unit_tests/ --cov=deepagents --cov-report=term-missing
           else
             echo "Coverage disabled for Python $PY / $PY_OS (target=$COV_PY / $COV_OS)"
-            uv run --group test pytest -n auto -vvv tests/unit_tests/
+            uv run --group test pytest -n auto -vvv --disable-socket --allow-hosts=127.0.0.1,localhost,::1 tests/unit_tests/
           fi
 
       - name: "🧹 Verify Clean Working Directory"

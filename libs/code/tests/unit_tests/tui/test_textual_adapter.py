@@ -1242,10 +1242,11 @@ class TestGetGitBranch:
 
     def test_reuses_cached_branch_for_same_working_directory(self) -> None:
         """Repeated lookups in one repo should only resolve the branch once."""
+        repo = Path("/tmp/repo")
         with (
             patch(
                 "deepagents_code.config.Path.cwd",
-                return_value=Path("/tmp/repo"),
+                return_value=repo,
             ),
             patch(
                 "deepagents_code.config.resolve_git_branch",
@@ -1255,7 +1256,7 @@ class TestGetGitBranch:
             assert config_module._get_git_branch() == "feature-branch"
             assert config_module._get_git_branch() == "feature-branch"
 
-        mock_resolve.assert_called_once_with("/tmp/repo")
+        mock_resolve.assert_called_once_with(str(repo))
 
 
 class TestGetGitCommitSha:

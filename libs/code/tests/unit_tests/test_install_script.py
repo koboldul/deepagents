@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import os
-import pty
 import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+if sys.platform == "win32":
+    pytest.skip("install.sh tests require POSIX pty support", allow_module_level=True)
+
+import pty  # imported only after the Windows module-level skip
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "install.sh"
 

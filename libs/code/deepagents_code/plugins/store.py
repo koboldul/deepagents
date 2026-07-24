@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import shutil
 import tempfile
 from contextlib import suppress
@@ -28,6 +29,8 @@ _INSTALLED_STORAGE_VERSION = 2
 _UNVERSIONED_CACHE_KEY = "unversioned"
 _CACHE_SLUG_LENGTH = 48
 _CACHE_DIGEST_LENGTH = 32
+_INSTALL_CACHE_SLUG_LENGTH = 16
+_INSTALL_CACHE_DIGEST_LENGTH = 16
 SUPPORTED_MARKETPLACE_SOURCE_TYPES: frozenset[MarketplaceSourceType] = frozenset(
     {"directory", "file", "github", "git", "url"}
 )
@@ -87,7 +90,18 @@ def sanitize_plugin_id(value: str) -> str:
 
 def opaque_cache_key(value: str) -> str:
     """Return a cache key that cannot disclose source credentials."""
-    return sha256(value.encode()).hexdigest()
+    return sha256(value.encode()).hexdigest()[:_CACHE_DIGEST_LENGTH]
+
+
+def _install_cache_component(value: str) -> str:
+    """Return a short cache component that leaves room for plugin contents."""
+    slug = "".join(
+        ch if ch.isascii() and (ch.isalnum() or ch in {"_", "-"}) else "-"
+        for ch in value
+    )
+    slug = slug.strip("-")[:_INSTALL_CACHE_SLUG_LENGTH] or "plugin"
+    digest = sha256(value.encode()).hexdigest()[:_INSTALL_CACHE_DIGEST_LENGTH]
+    return f"{slug}-{digest}"
 
 
 def ensure_marketplace_cache_dir() -> Path:
@@ -117,11 +131,11 @@ def versioned_cache_path(plugin_id: str, version: str | None) -> Path:
 
     """
     plugin_name, marketplace = split_plugin_id(plugin_id)
-    safe_version = sanitize_plugin_id(version or _UNVERSIONED_CACHE_KEY)
+    safe_version = _install_cache_component(version or _UNVERSIONED_CACHE_KEY)
     return (
         ensure_plugin_install_cache_dir()
-        / sanitize_plugin_id(marketplace)
-        / sanitize_plugin_id(plugin_name)
+        / _install_cache_component(marketplace)
+        / _install_cache_component(plugin_name)
         / safe_version
     )
 
@@ -501,8 +515,9 @@ def cache_and_register_plugin(
             pass
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_dir = cache_path.parent / f".{cache_path.name}.tmp-{os.getpid()}"
-    backup_dir = cache_path.parent / f".{cache_path.name}.backup-{os.getpid()}"
+    operation_id = f"{os.getpid()}-{secrets.token_hex(4)}"
+    temp_dir = cache_path.parent / f".tmp-{operation_id}"
+    backup_dir = cache_path.parent / f".bak-{operation_id}"
     if temp_dir.exists():
         shutil.rmtree(temp_dir, ignore_errors=True)
     if backup_dir.exists():

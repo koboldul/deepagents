@@ -44,7 +44,19 @@ Deep Agents is an open source agent harness — an opinionated agent that runs o
 Deep Agents is available as a JavaScript/TypeScript library — see [deepagents.js](https://github.com/langchain-ai/deepagentsjs).
 
 > [!NOTE]
-> **Deep Agents Code** — a pre-built coding agent in your terminal, similar to Claude Code or Cursor, powered by any LLM. Install with `curl -LsSf https://langch.in/dcode | bash`. See the [documentation](https://docs.langchain.com/deepagents-code) for the full feature set.
+> **Deep Agents Code** — a pre-built coding agent in your terminal, similar to Claude Code or Cursor, powered by any LLM. On macOS/Linux, install with `curl -LsSf https://langch.in/dcode | bash`. On Windows, use Windows Package Manager, refresh the current PowerShell `PATH` (or open a new shell), and then install the tool:
+>
+> ```powershell
+> winget install --id astral-sh.uv -e
+> $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+> uv tool install -U --prerelease allow deepagents-code
+> uv tool update-shell
+> $uvToolBin = (uv tool dir --bin).Trim()
+> $env:Path = "$uvToolBin;$env:Path"
+> dcode
+> ```
+>
+> The second command refreshes `uv` in the current PowerShell. `uv tool update-shell` updates future shells, while the tool-bin `PATH` prepend makes `dcode` available immediately in this one. See the [official uv installation guide](https://docs.astral.sh/uv/getting-started/installation/) for trusted alternatives to `winget`. From a checkout, users with `uv` already installed can run `powershell -ExecutionPolicy Bypass -File .\libs\code\scripts\install.ps1`. PowerShell and cmd are supported natively; WSL is optional. See the [documentation](https://docs.langchain.com/deepagents-code) for the full feature set.
 
 ## Quickstart
 

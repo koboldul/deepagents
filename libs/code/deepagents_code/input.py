@@ -1,6 +1,7 @@
 """Input handling utilities including image/video tracking and file mention parsing."""
 
 import logging
+import os
 import re
 import shlex
 from dataclasses import dataclass, replace
@@ -87,6 +88,175 @@ space code points that look identical to normal spaces when pasted.
 
 _WINDOWS_DRIVE_PATH_PATTERN = re.compile(r"^[A-Za-z]:[\\/]")
 """Pattern for Windows drive-letter paths like `C:\\Users\\...`."""
+
+_FILE_URI_PREFIX_PATTERN = re.compile(r"^file://", re.IGNORECASE)
+"""Pattern for file URIs, matched case-insensitively."""
+
+_WINDOWS_OBJECT_MANAGER_ROOTS = frozenset(
+    {
+        "??",
+        "device",
+        "dosdevices",
+        "global??",
+        "globalroot",
+    }
+)
+"""Native Windows namespace roots that must never reach filesystem probes."""
+
+_MATCHING_QUOTE_MIN_LENGTH = 2
+"""Minimum token length that can contain matching surrounding quotes."""
+
+_WINDOWS_DRIVE_PREFIX_LENGTH = 2
+"""Length of a bare Windows drive prefix such as `C:`."""
+
+
+def _strip_leading_path_wrappers(text: str) -> str:
+    """Remove wrappers before inspecting a possible path prefix.
+
+    Only leading wrappers are removed so quoted paths followed by prompt text
+    are inspected without requiring the closing wrapper to end the payload.
+
+    Args:
+        text: Raw path-like input.
+
+    Returns:
+        Input beginning at the first unwrapped character.
+    """
+    value = text.lstrip()
+    while value.startswith(('"', "'", "<")):
+        value = value[1:].lstrip()
+    return value
+
+
+def _is_local_windows_drive_target(text: str) -> bool:
+    r"""Return whether a namespace target starts with a local drive prefix.
+
+    Args:
+        text: Windows namespace target using backslash separators.
+
+    Returns:
+        `True` for targets such as `C:` and `C:\\path`.
+    """
+    return (
+        len(text) >= _WINDOWS_DRIVE_PREFIX_LENGTH
+        and text[0].isalpha()
+        and text[1] == ":"
+        and (len(text) == _WINDOWS_DRIVE_PREFIX_LENGTH or text[2] == "\\")
+    )
+
+
+def _is_absolute_local_windows_drive_target(text: str) -> bool:
+    r"""Return whether a namespace target is an absolute drive path.
+
+    Args:
+        text: Windows namespace target using backslash separators.
+
+    Returns:
+        `True` for targets such as `C:\\path`, otherwise `False`.
+    """
+    return len(text) > _WINDOWS_DRIVE_PREFIX_LENGTH and (
+        _is_local_windows_drive_target(text)
+    )
+
+
+def _has_remote_windows_path_prefix(text: str) -> bool:
+    r"""Return whether `text` starts with an unproven Windows path namespace.
+
+    This check is string-only. It must remain free of `Path` construction and
+    filesystem calls because probing UNC, object-manager, or device namespaces
+    can initiate remote authentication or access non-filesystem kernel objects.
+    The only extended namespace accepted is a direct `\\?\C:\...`-style local
+    drive path.
+
+    Args:
+        text: Unwrapped path-like input.
+
+    Returns:
+        `True` for UNC and unproven native/extended namespaces.
+    """
+    normalized = text.replace("/", "\\")
+    if not normalized.startswith("\\"):
+        return False
+
+    if normalized.startswith("\\\\"):
+        target = normalized[2:]
+        if target.casefold().startswith("?\\"):
+            namespace_target = target[2:]
+            return not _is_absolute_local_windows_drive_target(namespace_target)
+        return True
+
+    native_root = normalized[1:].split("\\", 1)[0].casefold()
+    return native_root in _WINDOWS_OBJECT_MANAGER_ROOTS
+
+
+def _is_remote_windows_file_uri(value: str) -> bool:
+    """Return whether a file URI would resolve through a remote authority.
+
+    Empty authorities are allowed only when the decoded path is local. Bare
+    drive authorities such as `file://C:/path` remain supported for backward
+    compatibility. All other authorities, including `localhost`, are rejected
+    conservatively because Windows may route them through a network provider.
+
+    Args:
+        value: File URI beginning with `file://`.
+
+    Returns:
+        `True` when the URI can address a remote Windows filesystem.
+    """
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return True
+
+    authority = unquote(parsed.netloc).replace("/", "\\")
+    if authority:
+        return not _is_local_windows_drive_target(authority)
+
+    path_text = unquote(parsed.path or "")
+    return _has_remote_windows_path_prefix(path_text)
+
+
+def _is_remote_windows_path(text: str) -> bool:
+    """Return whether path-like input could trigger unsafe Windows access.
+
+    Remote UNC paths, file authorities, and unproven Windows namespaces are
+    unsupported on every host and rejected using string-only checks before
+    path construction or filesystem probing.
+
+    Args:
+        text: Raw path, file URI, or path-prefixed prompt text.
+
+    Returns:
+        `True` for remote or unproven Windows namespace forms.
+    """
+    value = _strip_leading_path_wrappers(text)
+    if _FILE_URI_PREFIX_PATTERN.match(value):
+        return _is_remote_windows_file_uri(value)
+    return _has_remote_windows_path_prefix(value)
+
+
+def _contains_remote_windows_path(text: str) -> bool:
+    """Return whether any whitespace-delimited input starts a remote path.
+
+    Paste payloads may contain multiple paths or a path followed by prompt
+    text. Scanning token starts prevents a later remote token from reaching a
+    fallback parser after strict multi-path parsing rejects the payload.
+
+    Args:
+        text: Raw paste or path-like input.
+
+    Returns:
+        `True` when any token starts with a remote Windows path form.
+    """
+    at_token_start = True
+    for index, character in enumerate(text):
+        if character.isspace():
+            at_token_start = True
+            continue
+        if at_token_start and _is_remote_windows_path(text[index:]):
+            return True
+        at_token_start = False
+    return False
 
 
 @dataclass(frozen=True)
@@ -477,7 +647,8 @@ def parse_file_mentions(text: str) -> tuple[str, list[Path]]:
     Backslash-escaped spaces in paths (e.g., `@my\ folder/file.txt`) are
     unescaped before resolution. Tilde paths (e.g., `@~/file.txt`) are expanded
     via `Path.expanduser()`. Only regular files are returned; directories are
-    excluded.
+    excluded. Remote UNC paths, device namespaces, and remote `file://`
+    authorities are unsupported and rejected before path construction.
 
     This function does not raise exceptions; invalid paths are handled
     internally with a console warning.
@@ -499,6 +670,14 @@ def parse_file_mentions(text: str) -> tuple[str, list[Path]]:
 
         raw_path = match.group("path")
         clean_path = raw_path.replace("\\ ", " ")
+        path_suffix = text[match.start() + 1 :]
+
+        if _is_remote_windows_path(path_suffix) or _is_remote_windows_path(clean_path):
+            console.print(
+                f"[yellow]Warning: Remote or device paths are not supported: "
+                f"{escape_markup(raw_path)}[/yellow]"
+            )
+            continue
 
         try:
             path = Path(clean_path).expanduser()
@@ -535,7 +714,10 @@ def parse_pasted_file_paths(text: str) -> list[Path]:
 
     - Absolute/relative paths
     - POSIX shell quoting and escaping
-    - `file://` URLs
+    - Local `file://` URLs, including Windows drive file URIs
+
+    Remote UNC paths, device namespaces, and `file://` authorities are
+    unsupported and rejected before filesystem probing.
 
     Args:
         text: Raw paste payload from the terminal.
@@ -543,6 +725,9 @@ def parse_pasted_file_paths(text: str) -> list[Path]:
     Returns:
         List of resolved file paths, or an empty list when parsing fails.
     """
+    if _contains_remote_windows_path(text):
+        return []
+
     payload = text.strip()
     if not payload:
         return []
@@ -552,12 +737,17 @@ def parse_pasted_file_paths(text: str) -> list[Path]:
         line = raw_line.strip()
         if not line:
             continue
+        if _contains_remote_windows_path(line):
+            return []
         line_tokens = _split_paste_line(line)
         if not line_tokens:
             return []
         tokens.extend(line_tokens)
 
     if not tokens:
+        return []
+
+    if any(_is_remote_windows_path(token) for token in tokens):
         return []
 
     paths: list[Path] = []
@@ -591,6 +781,9 @@ def parse_pasted_path_payload(
     Returns:
         Parsed payload details, otherwise `None`.
     """
+    if _contains_remote_windows_path(text):
+        return None
+
     paths = parse_pasted_file_paths(text)
     if paths:
         return ParsedPastedPathPayload(paths=paths)
@@ -623,6 +816,9 @@ def parse_single_pasted_file_path(text: str) -> Path | None:
     Returns:
         Resolved path when payload is a single existing file, otherwise `None`.
     """
+    if _contains_remote_windows_path(text):
+        return None
+
     candidate = normalize_pasted_path(text)
     if candidate is None:
         return None
@@ -642,7 +838,7 @@ def extract_leading_pasted_file_path(text: str) -> tuple[Path, int] | None:
         Tuple of `(resolved_path, token_end_index)` or `None` when no valid
         leading file path token exists.
     """
-    if not text:
+    if not text or _contains_remote_windows_path(text):
         return None
 
     start = len(text) - len(text.lstrip())
@@ -669,8 +865,11 @@ def normalize_pasted_path(text: str) -> Path | None:
     Supports:
 
     - quoted and shell-escaped single paths
-    - `file://` URLs
-    - Windows drive-letter and UNC paths
+    - local `file://` URLs
+    - local Windows drive-letter paths
+
+    Remote UNC paths, device namespaces, and remote file authorities are
+    unsupported and rejected before path construction.
 
     Args:
         text: Raw pasted text payload.
@@ -678,6 +877,9 @@ def normalize_pasted_path(text: str) -> Path | None:
     Returns:
         Parsed `Path` if payload is a single path token, otherwise `None`.
     """
+    if _contains_remote_windows_path(text):
+        return None
+
     payload = text.strip()
     if not payload:
         return None
@@ -693,7 +895,7 @@ def normalize_pasted_path(text: str) -> Path | None:
         else unquoted
     )
 
-    if unquoted.startswith("file://"):
+    if _FILE_URI_PREFIX_PATTERN.match(unquoted):
         return _token_to_path(unquoted)
 
     windows_path = _normalize_windows_pasted_path(unquoted)
@@ -727,7 +929,7 @@ def _split_paste_line(line: str) -> list[str]:
         Parsed shell-like tokens, or an empty list when parsing fails.
     """
     try:
-        return shlex.split(line, posix=True)
+        return shlex.split(line, posix=os.name != "nt")
     except ValueError:
         # Unbalanced quotes or other tokenization errors: treat as plain text.
         return []
@@ -746,15 +948,34 @@ def _token_to_path(token: str) -> Path | None:
     if not value:
         return None
 
+    if _is_remote_windows_path(value):
+        return None
+
+    if (
+        len(value) >= _MATCHING_QUOTE_MIN_LENGTH
+        and value[0] == value[-1]
+        and value[0] in {'"', "'"}
+    ):
+        value = value[1:-1]
+
     if value.startswith("<") and value.endswith(">"):
         value = value[1:-1].strip()
         if not value:
             return None
 
-    if value.startswith("file://"):
+    if _FILE_URI_PREFIX_PATTERN.match(value):
         parsed = urlparse(value)
+        netloc = unquote(parsed.netloc)
         path_text = unquote(parsed.path or "")
-        if parsed.netloc and parsed.netloc != "localhost":
+        if _WINDOWS_DRIVE_PATH_PATTERN.match(netloc):
+            path_text = netloc
+        elif (
+            len(netloc) == _WINDOWS_DRIVE_PREFIX_LENGTH
+            and netloc[0].isalpha()
+            and netloc[1] == ":"
+        ):
+            path_text = f"{netloc}{path_text}"
+        elif netloc and netloc != "localhost":
             path_text = f"//{parsed.netloc}{path_text}"
         if (
             path_text.startswith("/")
@@ -810,9 +1031,8 @@ def _leading_token_end(text: str) -> int | None:
 def _extract_unquoted_leading_path_with_spaces(text: str) -> tuple[Path, int] | None:
     """Extract a leading unquoted path that may contain spaces.
 
-    This fallback is intentionally POSIX-oriented (`/` and `~/`) because the
-    slash-command conflict it addresses is specific to inputs that begin with
-    `/`.
+    Supports POSIX absolute/home paths and local Windows drive-letter paths.
+    Remote UNC paths are unsupported and rejected before filesystem probing.
 
     Args:
         text: Input text beginning with a potential path.
@@ -823,7 +1043,10 @@ def _extract_unquoted_leading_path_with_spaces(text: str) -> tuple[Path, int] | 
     """
     if not text or ("\n" in text or "\r" in text):
         return None
-    if not text.startswith(("/", "~/")):
+    is_windows_path = bool(_WINDOWS_DRIVE_PATH_PATTERN.match(text)) or text.startswith(
+        "\\\\"
+    )
+    if not text.startswith(("/", "~/")) and not is_windows_path:
         return None
     if " " not in text and "\u00a0" not in text and "\u202f" not in text:
         return None
@@ -841,15 +1064,18 @@ def _extract_unquoted_leading_path_with_spaces(text: str) -> tuple[Path, int] | 
 
 
 def _normalize_windows_pasted_path(text: str) -> Path | None:
-    """Return a `Path` for unquoted Windows drive/UNC path inputs.
+    """Return a `Path` for an unquoted local Windows drive path.
 
     Args:
         text: Potential Windows path input.
 
     Returns:
-        Parsed `Path` when `text` is Windows drive-letter or UNC style,
-        otherwise `None`.
+        Parsed `Path` for a local drive-letter path, otherwise `None`. Remote
+        UNC and object-namespace paths are unsupported.
     """
+    if _is_remote_windows_path(text):
+        return None
+
     if _WINDOWS_DRIVE_PATH_PATTERN.match(text) or text.startswith("\\\\"):
         return Path(text)
     return None
@@ -869,6 +1095,9 @@ def _normalize_posix_pasted_path(text: str) -> Path | None:
         Parsed `Path` when `text` looks like a raw POSIX absolute/home path,
         otherwise `None`.
     """
+    if _is_remote_windows_path(text):
+        return None
+
     if "\n" in text or "\r" in text:
         return None
     if text.startswith("~/"):
@@ -896,6 +1125,9 @@ def _safe_exists(path: Path) -> bool:
     Returns:
         `True` if the path exists, `False` if it does not or cannot be probed.
     """
+    if _is_remote_windows_path(str(path)):
+        return False
+
     try:
         return path.exists()
     except OSError as e:
@@ -914,6 +1146,9 @@ def _safe_is_file(path: Path) -> bool:
     Returns:
         `True` if the path is a regular file, `False` otherwise or on failure.
     """
+    if _is_remote_windows_path(str(path)):
+        return False
+
     try:
         return path.is_file()
     except OSError as e:
@@ -932,6 +1167,9 @@ def _safe_is_dir(path: Path) -> bool:
     Returns:
         `True` if the path is a directory, `False` otherwise or on failure.
     """
+    if _is_remote_windows_path(str(path)):
+        return False
+
     try:
         return path.is_dir()
     except OSError as e:
@@ -950,6 +1188,9 @@ def _resolve_existing_pasted_path(path: Path) -> Path | None:
     Returns:
         Resolved existing file path, otherwise `None`.
     """
+    if _is_remote_windows_path(str(path)):
+        return None
+
     try:
         resolved = path.expanduser().resolve()
     except (OSError, RuntimeError) as e:
@@ -992,6 +1233,9 @@ def _resolve_with_unicode_space_variants(path: Path) -> Path | None:
     Returns:
         Matching filesystem path, or `None` when no variant match exists.
     """
+    if _is_remote_windows_path(str(path)):
+        return None
+
     expanded = path.expanduser()
     if expanded.is_absolute():
         current = Path(expanded.anchor)

@@ -55,7 +55,7 @@ def _collect_bare_literals(*, include_registry: bool = False) -> dict[str, set[s
     for py_file in _SRC_DIR.rglob("*.py"):
         if not include_registry and py_file == _REGISTRY_FILE:
             continue
-        matches = set(_ENV_VAR_RE.findall(py_file.read_text()))
+        matches = set(_ENV_VAR_RE.findall(py_file.read_text(encoding="utf-8")))
         if matches:
             hits[str(py_file.relative_to(_SRC_DIR))] = matches
     return hits
@@ -76,7 +76,9 @@ class TestEnvVarRegistryDrift:
     def test_no_stale_registry_entries(self) -> None:
         """Every registered value must be parseable from `_env_vars.py` source."""
         registered = _registered_values()
-        in_registry_file = set(_ENV_VAR_RE.findall(_REGISTRY_FILE.read_text()))
+        in_registry_file = set(
+            _ENV_VAR_RE.findall(_REGISTRY_FILE.read_text(encoding="utf-8"))
+        )
         stale = registered - in_registry_file
         assert not stale, (
             f"Constants whose values don't appear in _env_vars.py: {stale}. "

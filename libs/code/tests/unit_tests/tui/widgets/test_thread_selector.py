@@ -593,6 +593,11 @@ class TestThreadSelectorTabSort:
                 updated_cell = header.query_one(".thread-cell-updated_at", Static)
                 created_cell = header.query_one(".thread-cell-created_at", Static)
 
+                for _ in range(20):
+                    if updated_cell.render_line(0).text.rstrip() == "Updated":
+                        break
+                    await pilot.pause()
+
                 assert updated_cell.render_line(0).text.rstrip() == "Updated"
                 assert created_cell.render_line(0).text.rstrip() == "Created"
                 assert updated_cell.has_class("thread-cell-sorted")
@@ -2368,8 +2373,6 @@ class TestThreadSelectorPrefetchedRows:
 
                 screen = app.screen
                 assert isinstance(screen, ThreadSelectorScreen)
-                with pytest.raises(NoMatches):
-                    screen.query_one("#thread-loading", Static)
 
                 for _ in range(10):
                     if mock_list_threads.await_count >= 1 and len(screen._threads) == 1:

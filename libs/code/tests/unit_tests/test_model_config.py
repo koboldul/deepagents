@@ -1,6 +1,7 @@
 """Tests for model_config module."""
 
 import io
+import json
 import logging
 import threading
 import tomllib
@@ -1672,19 +1673,16 @@ models = ["llama3"]
         """Unreadable config file returns empty config and logs a warning."""
         config_path = tmp_path / "config.toml"
         config_path.write_text("[models]\ndefault = 'test'")
-        config_path.chmod(0o000)
 
-        try:
-            with caplog.at_level(logging.WARNING):
-                config = ModelConfig.load(config_path)
+        with (
+            patch("pathlib.Path.open", side_effect=PermissionError("denied")),
+            caplog.at_level(logging.WARNING),
+        ):
+            config = ModelConfig.load(config_path)
 
-            assert config.default_model is None
-            assert config.providers == {}
-            assert any(
-                "Could not read config file" in r.message for r in caplog.records
-            )
-        finally:
-            config_path.chmod(0o644)
+        assert config.default_model is None
+        assert config.providers == {}
+        assert any("Could not read config file" in r.message for r in caplog.records)
 
 
 class TestModelConfigGetAllModels:
@@ -2553,6 +2551,11 @@ api_key_env = "SOME_KEY"
 
 class TestOllamaModelDiscovery:
     """Tests for auto-populating the switcher from a running Ollama daemon."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_ambient_ollama_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Keep discovery tests independent of the developer's Ollama endpoint."""
+        monkeypatch.delenv("OLLAMA_HOST", raising=False)
 
     @staticmethod
     def _patch_registry() -> AbstractContextManager[object]:
@@ -6174,8 +6177,10 @@ class TestLoadMcpServerApprovalsParsing:
             "[mcp]\n"
             "enabled_project_server_approvals = [\n"
             '  "not-a-table",\n'
-            f'  {{ project_root = "{project_root}", name = "missing-fp" }},\n'
-            f'  {{ project_root = "{project_root}", name = "good", '
+            f"  {{ project_root = {json.dumps(str(project_root))}, "
+            'name = "missing-fp" },\n'
+            f"  {{ project_root = {json.dumps(str(project_root))}, name = "
+            '"good", '
             f'fingerprint = "{fingerprint}" }},\n'
             "]\n"
         )
@@ -6207,7 +6212,8 @@ class TestLoadMcpServerTrustLists:
         config_path.write_text(
             "[mcp]\n"
             "enabled_project_server_approvals = ["
-            f'{{ project_root = "{project_root}", name = "docs", '
+            f"{{ project_root = {json.dumps(str(project_root))}, name = "
+            '"docs", '
             f'fingerprint = "{fingerprint}" }}]\n'
             'disabled_project_servers = ["blocked"]\n'
         )
@@ -6238,7 +6244,8 @@ class TestLoadMcpServerTrustLists:
         config_path.write_text(
             "[mcp]\n"
             "enabled_project_server_approvals = ["
-            f'{{ project_root = "{loop}", name = "docs", '
+            f"{{ project_root = {json.dumps(str(loop))}, name = "
+            '"docs", '
             f'fingerprint = "{fingerprint}" }}]\n'
         )
 
@@ -6261,7 +6268,8 @@ class TestLoadMcpServerTrustLists:
         config_path.write_text(
             "[mcp]\n"
             "enabled_project_server_approvals = ["
-            f'{{ project_root = "{project_root}", name = "both", '
+            f"{{ project_root = {json.dumps(str(project_root))}, name = "
+            '"both", '
             f'fingerprint = "{fingerprint}" }}]\n'
             'disabled_project_servers = ["both"]\n'
         )
@@ -6298,7 +6306,8 @@ class TestLoadMcpServerTrustLists:
         config_path.write_text(
             "[mcp]\n"
             "enabled_project_server_approvals = ["
-            f'{{ project_root = "{project_root}", name = "srv", '
+            f"{{ project_root = {json.dumps(str(project_root))}, name = "
+            '"srv", '
             f'fingerprint = "{fingerprint}" }}]\n'
         )
         monkeypatch.setenv(model_config._env_vars.DISABLED_PROJECT_MCP_SERVERS, "srv")
@@ -6398,7 +6407,8 @@ class TestLoadMcpServerTrustLists:
         config_path.write_text(
             "[mcp]\n"
             "enabled_project_server_approvals = ["
-            f'{{ project_root = "{project_root}", name = "toml-enabled", '
+            f"{{ project_root = {json.dumps(str(project_root))}, name = "
+            '"toml-enabled", '
             f'fingerprint = "{fingerprint}" }}]\n'
             'disabled_project_servers = ["toml-disabled"]\n'
         )
@@ -6428,7 +6438,8 @@ class TestLoadMcpServerTrustLists:
         config_path.write_text(
             "[mcp]\n"
             "enabled_project_server_approvals = ["
-            f'{{ project_root = "{project_root}", name = "toml-enabled", '
+            f"{{ project_root = {json.dumps(str(project_root))}, name = "
+            '"toml-enabled", '
             f'fingerprint = "{fingerprint}" }}]\n'
         )
         monkeypatch.setenv(
@@ -6451,7 +6462,8 @@ class TestLoadMcpServerTrustLists:
         user_config.write_text(
             "[mcp]\n"
             "enabled_project_server_approvals = ["
-            f'{{ project_root = "{project_root}", name = "docs", '
+            f"{{ project_root = {json.dumps(str(project_root))}, name = "
+            '"docs", '
             f'fingerprint = "{fingerprint}" }}]\n'
         )
         monkeypatch.setattr(model_config, "DEFAULT_CONFIG_PATH", user_config)
@@ -6496,7 +6508,8 @@ class TestLoadMcpServerTrustLists:
         config_path.write_text(
             "[mcp]\n"
             "enabled_project_server_approvals = ["
-            f'{{ project_root = "{project_root}", name = "toml-enabled", '
+            f"{{ project_root = {json.dumps(str(project_root))}, name = "
+            '"toml-enabled", '
             f'fingerprint = "{fingerprint}" }}]\n'
             'disabled_project_servers = ["toml-disabled"]\n'
         )
@@ -6623,7 +6636,8 @@ class TestLoadMcpServerTrustLists:
         config_path.write_text(
             "[mcp]\n"
             "enabled_project_server_approvals = ["
-            f'{{ project_root = "{project_root}", name = "docs", '
+            f"{{ project_root = {json.dumps(str(project_root))}, name = "
+            '"docs", '
             f'fingerprint = "{fingerprint}" }}]\n'
             "disabled_project_servers = 123\n"
         )

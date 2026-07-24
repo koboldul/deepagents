@@ -1,9 +1,8 @@
-"""Middleware for injecting local context into system prompt.
+"""Middleware for injecting runtime and project context into the system prompt.
 
-Detects git state, project structure, package managers, runtimes, and
-directory layout by running a bash script via the backend. Because the
-script executes inside the backend (local shell or remote sandbox), the
-same detection logic works regardless of where the agent runs.
+Local dcode sessions collect context directly from the captured project
+directory with Python and fixed-argument subprocess calls. Remote Linux
+sandboxes retain the backend-executed Bash detection script.
 """
 
 from __future__ import annotations
@@ -12,7 +11,17 @@ import asyncio
 import inspect
 import json
 import logging
+import os
+import re
+import stat
+import subprocess  # noqa: S404  # All probes use fixed argv and shell=False.
+import sys
+import threading
+from contextlib import suppress
+from dataclasses import dataclass
+from pathlib import Path
 from typing import (
+    IO,
     TYPE_CHECKING,
     Annotated,
     Any,
@@ -53,6 +62,1168 @@ _MCP_ERROR_DETAIL_LIMIT = 200
 
 _TRACING_PROJECT_NAME_LIMIT = 200
 """Max characters of a LangSmith project name surfaced in the system prompt."""
+
+_LOCAL_COMMAND_TIMEOUT = 5
+"""Timeout in seconds for local context subprocess probes."""
+
+_LOCAL_COMMAND_OUTPUT_LIMIT = 1_000_000
+"""Maximum captured characters from a local context subprocess probe."""
+
+_LOCAL_COMMAND_READ_CHUNK_SIZE = 64 * 1024
+"""Chunk size used while draining bounded local subprocess output."""
+
+_LOCAL_FILE_LIMIT = 20
+"""Maximum top-level project entries shown in local context."""
+
+_LOCAL_TREE_DEPTH = 3
+"""Maximum directory depth shown in the local context preview."""
+
+_LOCAL_TREE_LINE_LIMIT = 22
+"""Maximum directory-preview lines shown before the truncation marker."""
+
+_LOCAL_MAKEFILE_LINE_LIMIT = 20
+"""Maximum Makefile lines shown in local context."""
+
+_WINDOWS_DEFAULT_PATHEXT = (".COM", ".EXE", ".BAT", ".CMD")
+"""Executable suffixes used when Windows does not define `PATHEXT`."""
+
+_QUOTED_PATH_ENTRY_MIN_LENGTH = 2
+"""Minimum length of a PATH entry wrapped in matching quote characters."""
+
+_GIT_PROBE_ENVIRONMENT_KEYS = frozenset(
+    {
+        "COMSPEC",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USERPROFILE",
+        "WINDIR",
+    }
+)
+"""Environment variables safe and necessary for fixed local Git probes."""
+
+_LOCAL_EXCLUDED_NAMES = frozenset(
+    {
+        ".coverage",
+        ".eggs",
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+    }
+)
+
+
+@dataclass(frozen=True)
+class _CommandResult:
+    """Bounded result from a fixed-argument local subprocess probe."""
+
+    returncode: int
+    stdout: str
+    truncated: bool
+
+
+class _BoundedTextBuffer:
+    """Drain a text stream while retaining at most a fixed character count."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._chunks: list[str] = []
+        self._length = 0
+        self.failed = False
+
+    def drain(self, stream: IO[str]) -> None:
+        """Read `stream` to EOF while discarding text beyond the buffer limit."""
+        try:
+            while chunk := stream.read(_LOCAL_COMMAND_READ_CHUNK_SIZE):
+                remaining = self._limit - self._length
+                if remaining > 0:
+                    retained = chunk[:remaining]
+                    self._chunks.append(retained)
+                    self._length += len(retained)
+        except (OSError, ValueError):
+            self.failed = True
+        finally:
+            with suppress(OSError, ValueError):
+                stream.close()
+
+    def getvalue(self) -> str:
+        """Return the retained text."""
+        return "".join(self._chunks)
+
+
+@dataclass(frozen=True)
+class _GitContext:
+    """Git details reused by multiple local context sections."""
+
+    root: Path | None = None
+    summary: str | None = None
+
+
+@dataclass(frozen=True)
+class _SafePath:
+    """A path whose components were checked without following links."""
+
+    path: Path
+    metadata: os.stat_result
+
+
+@dataclass(frozen=True)
+class _VisibleEntry:
+    """A visible directory entry classified from no-follow metadata."""
+
+    path: Path
+    metadata: os.stat_result
+
+    @property
+    def is_directory(self) -> bool:
+        """Whether the entry is a normal directory."""
+        return not _is_link_or_reparse(self.metadata) and stat.S_ISDIR(
+            self.metadata.st_mode
+        )
+
+
+def _windows_executable_names(command: str) -> tuple[str, ...]:
+    raw_extensions = os.environ.get("PATHEXT")
+    extensions = (
+        raw_extensions.split(os.pathsep)
+        if raw_extensions
+        else list(_WINDOWS_DEFAULT_PATHEXT)
+    )
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for extension in extensions:
+        if not extension:
+            continue
+        value = extension if extension.startswith(".") else f".{extension}"
+        if not re.fullmatch(r"\.[A-Za-z0-9]+", value):
+            continue
+        key = value.casefold()
+        if key not in seen:
+            seen.add(key)
+            normalized.append(value)
+
+    suffix = Path(command).suffix.casefold()
+    if suffix:
+        return (command,) if suffix in seen else ()
+    return tuple(f"{command}{extension}" for extension in normalized)
+
+
+def _is_within_path(path: Path, boundary: Path) -> bool:
+    """Return whether `path` is equal to or contained by `boundary`."""
+    return path == boundary or path.is_relative_to(boundary)
+
+
+def _is_link_or_reparse(metadata: os.stat_result) -> bool:
+    """Return whether no-follow metadata describes a link or reparse point."""
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        reparse_flag and getattr(metadata, "st_file_attributes", 0) & reparse_flag
+    )
+
+
+def _is_windows_remote_path(path: Path) -> bool:
+    """Reject UNC and device-namespace paths without probing them.
+
+    Returns:
+        `True` when `path` uses a Windows remote or device namespace.
+    """
+    if os.name != "nt":
+        return False
+    return os.fspath(path).replace("/", "\\").startswith("\\\\")
+
+
+def _windows_lstat_local_path(path: Path) -> os.stat_result | None:
+    """Walk a Windows path with `lstat`, stopping before any reparse target.
+
+    Returns:
+        Final no-follow metadata, or `None` when the path is unsafe.
+    """
+    if _is_windows_remote_path(path):
+        return None
+    try:
+        absolute_path = path.absolute()
+    except (OSError, RuntimeError):
+        return None
+    if _is_windows_remote_path(absolute_path) or not absolute_path.anchor:
+        return None
+
+    current = Path(absolute_path.anchor)
+    try:
+        metadata = current.lstat()
+        for part in absolute_path.parts[1:]:
+            current /= part
+            metadata = current.lstat()
+            if current != absolute_path and _is_link_or_reparse(metadata):
+                return None
+    except OSError:
+        return None
+    return metadata
+
+
+def _resolve_trusted_directory(path: Path) -> Path | None:
+    """Resolve a local directory without traversing Windows reparse points.
+
+    Returns:
+        The resolved local directory, or `None` when it is unsafe.
+    """
+    if _is_windows_remote_path(path):
+        return None
+    try:
+        absolute_path = path.expanduser().absolute()
+        if os.name == "nt":
+            metadata = _windows_lstat_local_path(absolute_path)
+            if (
+                metadata is None
+                or _is_link_or_reparse(metadata)
+                or not stat.S_ISDIR(metadata.st_mode)
+            ):
+                return None
+        resolved_path = absolute_path.resolve(strict=True)
+        resolved_metadata = resolved_path.lstat()
+    except (OSError, RuntimeError):
+        return None
+    if (
+        _is_windows_remote_path(resolved_path)
+        or _is_link_or_reparse(resolved_metadata)
+        or not stat.S_ISDIR(resolved_metadata.st_mode)
+    ):
+        return None
+    return resolved_path
+
+
+def _safe_path_metadata(
+    path: Path,
+    *,
+    boundary: Path,
+    allow_final_link: bool = False,
+) -> _SafePath | None:
+    """Inspect a contained path without following link or reparse components.
+
+    Returns:
+        Guarded path metadata, or `None` when the path is unsafe.
+    """
+    if _is_windows_remote_path(path) or _is_windows_remote_path(boundary):
+        return None
+    try:
+        lexical_boundary = boundary.expanduser().absolute()
+        lexical_path = path.expanduser().absolute()
+        relative_path = lexical_path.relative_to(lexical_boundary)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+    resolved_boundary = _resolve_trusted_directory(lexical_boundary)
+    if resolved_boundary is None:
+        return None
+
+    current = resolved_boundary
+    metadata: os.stat_result
+    if not relative_path.parts:
+        try:
+            metadata = current.lstat()
+        except OSError:
+            return None
+    else:
+        for index, part in enumerate(relative_path.parts):
+            current /= part
+            try:
+                metadata = current.lstat()
+            except OSError:
+                return None
+            final = index == len(relative_path.parts) - 1
+            if _is_link_or_reparse(metadata):
+                if final and allow_final_link:
+                    return _SafePath(path=current, metadata=metadata)
+                return None
+            if not final and not stat.S_ISDIR(metadata.st_mode):
+                return None
+
+    try:
+        resolved_path = current.resolve(strict=True)
+        current_metadata = current.lstat()
+    except (OSError, RuntimeError):
+        return None
+    if (
+        _is_windows_remote_path(resolved_path)
+        or not resolved_path.is_relative_to(resolved_boundary)
+        or _is_link_or_reparse(current_metadata)
+        or not os.path.samestat(metadata, current_metadata)
+    ):
+        return None
+    return _SafePath(path=resolved_path, metadata=current_metadata)
+
+
+def _safe_is_file(path: Path, *, boundary: Path) -> bool:
+    """Return whether a contained path is a normal regular file."""
+    result = _safe_path_metadata(path, boundary=boundary)
+    return result is not None and stat.S_ISREG(result.metadata.st_mode)
+
+
+def _safe_is_dir(path: Path, *, boundary: Path) -> bool:
+    """Return whether a contained path is a normal directory."""
+    result = _safe_path_metadata(path, boundary=boundary)
+    return result is not None and stat.S_ISDIR(result.metadata.st_mode)
+
+
+def _resolve_containing_directory(path: Path, *, child: Path) -> Path | None:
+    """Resolve a trusted directory only when it contains `child`.
+
+    Returns:
+        The resolved containing directory, or `None` when it is unsafe.
+    """
+    resolved_path = _resolve_trusted_directory(path)
+    resolved_child = _resolve_trusted_directory(child)
+    if (
+        resolved_path is None
+        or resolved_child is None
+        or not resolved_child.is_relative_to(resolved_path)
+    ):
+        return None
+    return resolved_path
+
+
+def _resolve_path_executable(
+    command: str,
+    *,
+    project_root: Path | None = None,
+) -> str | None:
+    """Resolve a bare executable from trusted absolute `PATH` entries.
+
+    Empty and relative entries are ignored on every platform. Candidates whose
+    path or resolved target is controlled by the current directory or active
+    project are rejected before any subprocess can execute them.
+
+    Returns:
+        The absolute executable path, or `None` when no safe candidate exists.
+    """
+    if not command or command in {".", ".."} or "/" in command or "\\" in command:
+        return None
+
+    raw_path = os.environ.get("PATH")
+    if not raw_path:
+        return None
+
+    windows = os.name == "nt"
+    executable_names = _windows_executable_names(command) if windows else (command,)
+    if not executable_names:
+        return None
+
+    current_directory = _resolve_trusted_directory(Path.cwd())
+    if current_directory is None:
+        return None
+    rejected_roots = [current_directory]
+    if project_root is not None:
+        if _is_windows_remote_path(project_root):
+            return None
+        resolved_project_root = _resolve_trusted_directory(project_root)
+        if resolved_project_root is None:
+            try:
+                resolved_project_root = project_root.expanduser().absolute()
+            except (OSError, RuntimeError):
+                return None
+        if resolved_project_root not in rejected_roots:
+            rejected_roots.append(resolved_project_root)
+
+    for raw_directory in raw_path.split(os.pathsep):
+        if not raw_directory:
+            continue
+        path_entry = raw_directory
+        if (
+            windows
+            and len(path_entry) >= _QUOTED_PATH_ENTRY_MIN_LENGTH
+            and path_entry[0] == path_entry[-1] == '"'
+        ):
+            path_entry = path_entry[1:-1]
+        directory = Path(path_entry)
+        if not directory.is_absolute():
+            continue
+        try:
+            absolute_directory = directory.absolute()
+        except (OSError, RuntimeError):
+            continue
+        if _is_windows_remote_path(absolute_directory):
+            continue
+        if windows:
+            resolved_directory = _resolve_trusted_directory(absolute_directory)
+            if resolved_directory is None:
+                continue
+        else:
+            try:
+                resolved_directory = absolute_directory.resolve(strict=False)
+            except (OSError, RuntimeError):
+                continue
+        if any(
+            _is_within_path(absolute_directory, root)
+            or _is_within_path(resolved_directory, root)
+            for root in rejected_roots
+        ):
+            continue
+
+        for executable_name in executable_names:
+            candidate = resolved_directory / executable_name
+            if windows:
+                candidate_result = _safe_path_metadata(
+                    candidate,
+                    boundary=resolved_directory,
+                )
+                if candidate_result is None:
+                    continue
+                metadata = candidate_result.metadata
+                resolved_candidate = candidate_result.path
+            else:
+                try:
+                    metadata = candidate.stat()
+                    resolved_candidate = candidate.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    continue
+            if not stat.S_ISREG(metadata.st_mode) or not os.access(candidate, os.X_OK):
+                continue
+            if any(
+                _is_within_path(candidate, root)
+                or _is_within_path(resolved_candidate, root)
+                for root in rejected_roots
+            ):
+                continue
+            return str(candidate)
+    return None
+
+
+def _run_fixed_command(
+    argv: tuple[str, ...],
+    *,
+    cwd: Path,
+    output_limit: int = _LOCAL_COMMAND_OUTPUT_LIMIT,
+    env: dict[str, str] | None = None,
+) -> _CommandResult | None:
+    """Run a bounded fixed-argument command without invoking a shell.
+
+    Returns:
+        Bounded command output, or `None` if the probe cannot run safely.
+    """
+    try:
+        process = subprocess.Popen(  # noqa: S603  # argv is fixed by callers
+            argv,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+            env=env,
+        )
+    except OSError:
+        return None
+
+    if process.stdout is None:
+        with suppress(OSError):
+            process.kill()
+        with suppress(OSError, subprocess.SubprocessError):
+            process.wait(timeout=_LOCAL_COMMAND_TIMEOUT)
+        return None
+
+    capture = _BoundedTextBuffer(output_limit + 1)
+    reader = threading.Thread(
+        target=capture.drain,
+        args=(process.stdout,),
+        name="dcode-local-context-output",
+        daemon=True,
+    )
+    reader.start()
+    try:
+        returncode = process.wait(timeout=_LOCAL_COMMAND_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        with suppress(OSError):
+            process.kill()
+        with suppress(OSError, subprocess.SubprocessError):
+            process.wait(timeout=_LOCAL_COMMAND_TIMEOUT)
+        with suppress(OSError, ValueError):
+            process.stdout.close()
+        reader.join(timeout=_LOCAL_COMMAND_TIMEOUT)
+        return None
+
+    reader.join(timeout=_LOCAL_COMMAND_TIMEOUT)
+    if reader.is_alive() or capture.failed:
+        with suppress(OSError, ValueError):
+            process.stdout.close()
+        reader.join(timeout=_LOCAL_COMMAND_TIMEOUT)
+        return None
+
+    stdout = capture.getvalue()
+    truncated = len(stdout) > output_limit
+    if truncated:
+        stdout = stdout[:output_limit]
+    return _CommandResult(
+        returncode=returncode,
+        stdout=stdout.strip(),
+        truncated=truncated,
+    )
+
+
+def _git_probe_environment() -> dict[str, str]:
+    """Build a minimal Git environment without user-controlled injection hooks.
+
+    Returns:
+        Environment containing only required system values and fixed Git controls.
+    """
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in _GIT_PROBE_ENVIRONMENT_KEYS
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return environment
+
+
+def _run_fixed_git_command(
+    git: str,
+    arguments: tuple[str, ...],
+    *,
+    cwd: Path,
+) -> _CommandResult | None:
+    """Run a fixed Git probe with execution-capable configuration disabled.
+
+    Returns:
+        Bounded probe output, or `None` when Git cannot run safely.
+    """
+    argv = (
+        git,
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        "diff.external=",
+        "-c",
+        "pager.status=false",
+        "-c",
+        "submodule.recurse=false",
+        *arguments,
+    )
+    return _run_fixed_command(argv, cwd=cwd, env=_git_probe_environment())
+
+
+def _read_open_text_prefix(
+    file: IO[str],
+    *,
+    line_limit: int,
+    char_limit: int,
+) -> tuple[list[str], bool]:
+    lines: list[str] = []
+    characters = 0
+    truncated = False
+    for line in file:
+        if len(lines) >= line_limit or characters + len(line) > char_limit:
+            truncated = True
+            break
+        lines.append(line.rstrip("\r\n"))
+        characters += len(line)
+    return lines, truncated
+
+
+def _read_text_prefix_no_follow(
+    path: Path,
+    *,
+    boundary: Path,
+    line_limit: int,
+    char_limit: int = 20_000,
+) -> tuple[list[str], bool] | None:
+    """Read a regular file only when its opened inode stays inside `boundary`.
+
+    Returns:
+        Captured lines and truncation state, or `None` for an unsafe path.
+    """
+    file_descriptor: int | None = None
+    directory_descriptor: int | None = None
+    try:
+        safe_path = _safe_path_metadata(path, boundary=boundary)
+        if safe_path is None or not stat.S_ISREG(safe_path.metadata.st_mode):
+            return None
+
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        if os.open in os.supports_dir_fd:
+            directory_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            directory_descriptor = os.open(safe_path.path.parent, directory_flags)
+            file_descriptor = os.open(
+                safe_path.path.name,
+                flags,
+                dir_fd=directory_descriptor,
+            )
+        else:
+            file_descriptor = os.open(safe_path.path, flags)
+
+        opened_metadata = os.fstat(file_descriptor)
+        current_path = _safe_path_metadata(path, boundary=boundary)
+        if (
+            not stat.S_ISREG(opened_metadata.st_mode)
+            or current_path is None
+            or not stat.S_ISREG(current_path.metadata.st_mode)
+            or not os.path.samestat(safe_path.metadata, opened_metadata)
+            or not os.path.samestat(current_path.metadata, opened_metadata)
+            or current_path.path != safe_path.path
+        ):
+            return None
+
+        with os.fdopen(
+            file_descriptor,
+            encoding="utf-8",
+            errors="replace",
+        ) as file:
+            file_descriptor = None
+            return _read_open_text_prefix(
+                file,
+                line_limit=line_limit,
+                char_limit=char_limit,
+            )
+    except (OSError, RuntimeError, ValueError):
+        return None
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        if directory_descriptor is not None:
+            os.close(directory_descriptor)
+
+
+def _read_detection_text(path: Path, *, boundary: Path) -> str:
+    """Read enough project metadata for lightweight marker detection.
+
+    Returns:
+        Bounded project text joined with newlines.
+    """
+    result = _read_text_prefix_no_follow(
+        path,
+        boundary=boundary,
+        line_limit=400,
+        char_limit=40_000,
+    )
+    if result is None:
+        return ""
+    lines, _ = result
+    return "\n".join(lines)
+
+
+def _safe_display(value: str, *, max_length: int = 500) -> str:
+    """Sanitize a filesystem or subprocess value before prompt insertion.
+
+    Returns:
+        Sanitized text safe for prompt insertion.
+    """
+    return sanitize_control_chars(value, max_length=max_length)
+
+
+def _visible_entries(directory: Path, *, root: Path) -> list[_VisibleEntry]:
+    """Return deterministic visible children excluding generated directories."""
+    directory_result = _safe_path_metadata(directory, boundary=root)
+    if directory_result is None or not stat.S_ISDIR(directory_result.metadata.st_mode):
+        return []
+    try:
+        paths = list(directory_result.path.iterdir())
+    except OSError:
+        return []
+
+    entries: list[_VisibleEntry] = []
+    for path in paths:
+        if path.name in _LOCAL_EXCLUDED_NAMES or (
+            path.name.startswith(".") and path.name != ".deepagents"
+        ):
+            continue
+        result = _safe_path_metadata(path, boundary=root, allow_final_link=True)
+        if result is not None:
+            entries.append(_VisibleEntry(path=result.path, metadata=result.metadata))
+
+    return sorted(
+        entries,
+        key=lambda entry: (
+            not entry.is_directory,
+            entry.path.name.casefold(),
+            entry.path.name,
+        ),
+    )
+
+
+def _collect_git_context(root: Path) -> _GitContext:
+    """Collect git root, branch or commit, and available main branches.
+
+    Returns:
+        Git context summary data, or an empty context when git is unavailable.
+    """
+    git = _resolve_path_executable("git", project_root=root)
+    if git is None:
+        return _GitContext()
+
+    inside = _run_fixed_git_command(
+        git,
+        ("rev-parse", "--is-inside-work-tree"),
+        cwd=root,
+    )
+    if inside is None or inside.returncode != 0 or inside.stdout != "true":
+        return _GitContext()
+
+    root_result = _run_fixed_git_command(
+        git,
+        ("rev-parse", "--show-toplevel"),
+        cwd=root,
+    )
+    git_root = (
+        _resolve_containing_directory(Path(root_result.stdout), child=root)
+        if root_result is not None
+        and root_result.returncode == 0
+        and root_result.stdout
+        else None
+    )
+
+    branch_result = _run_fixed_git_command(
+        git,
+        ("symbolic-ref", "--quiet", "--short", "HEAD"),
+        cwd=root,
+    )
+    if (
+        branch_result is not None
+        and branch_result.returncode == 0
+        and branch_result.stdout
+    ):
+        summary = f"Current branch `{_safe_display(branch_result.stdout)}`"
+    else:
+        commit_result = _run_fixed_git_command(
+            git,
+            ("rev-parse", "--short", "HEAD"),
+            cwd=root,
+        )
+        if (
+            commit_result is None
+            or commit_result.returncode != 0
+            or not commit_result.stdout
+        ):
+            return _GitContext(root=git_root)
+        summary = f"Detached HEAD at `{_safe_display(commit_result.stdout)}`"
+
+    main_branches = []
+    for branch in ("main", "master"):
+        result = _run_fixed_git_command(
+            git,
+            ("show-ref", "--verify", "--quiet", f"refs/heads/{branch}"),
+            cwd=root,
+        )
+        if result is not None and result.returncode == 0:
+            main_branches.append(f"`{branch}`")
+    if main_branches:
+        summary += f", {', '.join(main_branches)} available"
+
+    return _GitContext(root=git_root, summary=summary)
+
+
+def _collect_project_section(root: Path, git_root: Path | None) -> str:
+    """Describe project language, monorepo markers, root, and environments.
+
+    Returns:
+        A markdown project summary, or `""` when nothing relevant is found.
+    """
+    language = ""
+    if _safe_is_file(root / "pyproject.toml", boundary=root) or _safe_is_file(
+        root / "setup.py",
+        boundary=root,
+    ):
+        language = "python"
+    elif _safe_is_file(root / "package.json", boundary=root):
+        language = "javascript/typescript"
+    elif _safe_is_file(root / "Cargo.toml", boundary=root):
+        language = "rust"
+    elif _safe_is_file(root / "go.mod", boundary=root):
+        language = "go"
+    elif _safe_is_file(root / "pom.xml", boundary=root) or _safe_is_file(
+        root / "build.gradle",
+        boundary=root,
+    ):
+        language = "java"
+
+    monorepo = (
+        _safe_is_file(root / "lerna.json", boundary=root)
+        or _safe_is_file(root / "pnpm-workspace.yaml", boundary=root)
+        or _safe_is_dir(root / "packages", boundary=root)
+        or (
+            _safe_is_dir(root / "libs", boundary=root)
+            and _safe_is_dir(root / "apps", boundary=root)
+        )
+        or _safe_is_dir(root / "workspaces", boundary=root)
+    )
+    environments = [
+        name
+        for name in (".venv", "venv", "node_modules")
+        if _safe_is_dir(root / name, boundary=root)
+    ]
+    if (
+        not language
+        and not monorepo
+        and not environments
+        and (git_root is None or git_root == root)
+    ):
+        return ""
+
+    lines = ["**Project**:"]
+    if language:
+        lines.append(f"- Language: {language}")
+    if git_root is not None and git_root != root:
+        lines.append(f"- Project root: `{_safe_display(str(git_root))}`")
+    if monorepo:
+        lines.append("- Monorepo: yes")
+    if environments:
+        lines.append(f"- Environments: {', '.join(environments)}")
+    return "\n".join(lines)
+
+
+def _collect_package_manager_section(root: Path) -> str:
+    """Detect Python and Node package managers from project files.
+
+    Returns:
+        A markdown package-manager summary, or `""` when nothing is detected.
+    """
+    managers: list[str] = []
+    pyproject = _read_detection_text(root / "pyproject.toml", boundary=root)
+    if _safe_is_file(root / "uv.lock", boundary=root) or "[tool.uv]" in pyproject:
+        managers.append("Python: uv")
+    elif (
+        _safe_is_file(
+            root / "poetry.lock",
+            boundary=root,
+        )
+        or "[tool.poetry]" in pyproject
+    ):
+        managers.append("Python: poetry")
+    elif _safe_is_file(root / "Pipfile.lock", boundary=root) or _safe_is_file(
+        root / "Pipfile",
+        boundary=root,
+    ):
+        managers.append("Python: pipenv")
+    elif _safe_is_file(
+        root / "pyproject.toml",
+        boundary=root,
+    ) or _safe_is_file(root / "requirements.txt", boundary=root):
+        managers.append("Python: pip")
+
+    if _safe_is_file(root / "bun.lockb", boundary=root) or _safe_is_file(
+        root / "bun.lock",
+        boundary=root,
+    ):
+        managers.append("Node: bun")
+    elif _safe_is_file(root / "pnpm-lock.yaml", boundary=root):
+        managers.append("Node: pnpm")
+    elif _safe_is_file(root / "yarn.lock", boundary=root):
+        managers.append("Node: yarn")
+    elif _safe_is_file(
+        root / "package-lock.json",
+        boundary=root,
+    ) or _safe_is_file(root / "package.json", boundary=root):
+        managers.append("Node: npm")
+
+    return f"**Package Manager**: {', '.join(managers)}" if managers else ""
+
+
+def _collect_runtime_section(root: Path) -> str:
+    """Report the application Python and a Node runtime available on PATH.
+
+    Returns:
+        A markdown runtime summary with the detected interpreters.
+    """
+    runtimes = [
+        (
+            "Application Python "
+            f"{sys.version_info.major}.{sys.version_info.minor}."
+            f"{sys.version_info.micro}"
+        )
+    ]
+    node = _resolve_path_executable("node", project_root=root)
+    if node is not None:
+        result = _run_fixed_command((node, "--version"), cwd=root)
+        if result is not None and result.returncode == 0 and result.stdout:
+            runtimes.append(f"Node {_safe_display(result.stdout.removeprefix('v'))}")
+    return f"**Detected Runtimes**: {', '.join(runtimes)}"
+
+
+def _extract_gh_json_fields(help_text: str) -> str:
+    """Extract and normalize the JSON FIELDS section from `gh search --help`.
+
+    Returns:
+        Normalized JSON field names, or `""` when the help text has none.
+    """
+    fields: list[str] = []
+    in_fields = False
+    for line in help_text.splitlines():
+        if line.strip() == "JSON FIELDS":
+            in_fields = True
+            continue
+        if in_fields and not line.strip():
+            break
+        if in_fields:
+            fields.extend(line.strip().split())
+    return _safe_display(" ".join(fields), max_length=2_000)
+
+
+def _collect_gh_section(root: Path) -> str:
+    """Report JSON fields exposed by installed GitHub CLI search commands.
+
+    Returns:
+        A markdown GitHub CLI summary, or `""` when `gh` is unavailable.
+    """
+    gh = _resolve_path_executable("gh", project_root=root)
+    if gh is None:
+        return ""
+
+    field_sets: dict[str, str] = {}
+    for search_type in ("prs", "issues"):
+        result = _run_fixed_command((gh, "search", search_type, "--help"), cwd=root)
+        if result is not None and result.returncode == 0:
+            fields = _extract_gh_json_fields(result.stdout)
+            if fields:
+                field_sets[search_type] = fields
+    if not field_sets:
+        return ""
+
+    lines = ["**GitHub CLI**:"]
+    for search_type in ("prs", "issues"):
+        fields = field_sets.get(search_type)
+        if fields:
+            lines.append(f"- `gh search {search_type} --json` fields: {fields}")
+    if "mergedAt" not in field_sets.get("prs", "").replace(",", " ").split():
+        lines.extend(
+            [
+                "- `gh search prs --json` does not expose `mergedAt`;",
+                "  use `gh pr view --json mergedAt` per PR for merge timestamps.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _has_dependency_group(pyproject: str, group: str) -> bool:
+    """Return whether a bounded `pyproject.toml` prefix defines a dependency group."""
+    in_dependency_groups = False
+    for raw_line in pyproject.splitlines():
+        line = raw_line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            in_dependency_groups = line == "[dependency-groups]"
+        elif in_dependency_groups and "=" in line:
+            key = line.partition("=")[0].strip().strip("'\"")
+            if key == group:
+                return True
+    return False
+
+
+def _collect_test_command_section(root: Path) -> str:
+    """Infer the most likely locally available project test command.
+
+    Returns:
+        A markdown test-command hint, or `""` when no likely command exists.
+    """
+    makefile_result = _read_text_prefix_no_follow(
+        root / "Makefile",
+        boundary=root,
+        line_limit=500,
+    )
+    makefile = makefile_result[0] if makefile_result is not None else []
+    pyproject_path = root / "pyproject.toml"
+    pyproject = _read_detection_text(pyproject_path, boundary=root)
+    unit_tests = root / "tests" / "unit_tests"
+    if (
+        any(line.startswith(("test:", "tests:")) for line in makefile)
+        and _resolve_path_executable("make", project_root=root) is not None
+    ):
+        command = "make test"
+    elif _safe_is_file(pyproject_path, boundary=root) and (
+        "[tool.pytest" in pyproject
+        or _safe_is_file(root / "pytest.ini", boundary=root)
+        or _safe_is_dir(root / "tests", boundary=root)
+        or _safe_is_dir(root / "test", boundary=root)
+    ):
+        is_uv_project = (
+            _safe_is_file(root / "uv.lock", boundary=root)
+            or "[tool.uv]" in pyproject
+            or "[project]" in pyproject
+        )
+        target = " tests/unit_tests/" if _safe_is_dir(unit_tests, boundary=root) else ""
+        if (
+            _resolve_path_executable("uv", project_root=root) is not None
+            and is_uv_project
+            and _has_dependency_group(pyproject, "test")
+        ):
+            command = f"uv run --group test pytest{target}"
+        else:
+            command = f"pytest{target}"
+    elif _safe_is_file(
+        root / "package.json",
+        boundary=root,
+    ) and '"test"' in _read_detection_text(root / "package.json", boundary=root):
+        command = "npm test"
+    else:
+        return ""
+    return f"**Run Tests**: `{command}`"
+
+
+def _collect_files_section(root: Path) -> str:
+    """List a bounded set of top-level project files and directories.
+
+    Returns:
+        A markdown file listing, or `""` when the directory is empty.
+    """
+    entries = _visible_entries(root, root=root)
+    if not entries:
+        return ""
+    shown = entries[:_LOCAL_FILE_LIMIT]
+    heading = (
+        f"**Files** (showing {len(shown)} of {len(entries)}):"
+        if len(shown) < len(entries)
+        else f"**Files** ({len(entries)}):"
+    )
+    lines = [heading]
+    for entry in shown:
+        suffix = "/" if entry.is_directory else ""
+        lines.append(f"- {_safe_display(entry.path.name)}{suffix}")
+    return "\n".join(lines)
+
+
+def _collect_tree_section(root: Path) -> str:
+    """Build a deterministic bounded directory preview without external tools.
+
+    Returns:
+        A markdown tree preview, or `""` when there are no visible entries.
+    """
+    resolved_root = _resolve_trusted_directory(root)
+    if resolved_root is None:
+        return ""
+
+    lines = ["."]
+    truncated = False
+
+    def visit(directory: Path, prefix: str, depth: int) -> None:
+        nonlocal truncated
+        if truncated or depth > _LOCAL_TREE_DEPTH:
+            return
+        entries = _visible_entries(directory, root=resolved_root)
+        for index, entry in enumerate(entries):
+            if len(lines) >= _LOCAL_TREE_LINE_LIMIT:
+                truncated = True
+                return
+            last = index == len(entries) - 1
+            connector = "└── " if last else "├── "
+            lines.append(f"{prefix}{connector}{_safe_display(entry.path.name)}")
+            if entry.is_directory:
+                visit(
+                    entry.path,
+                    prefix + ("    " if last else "│   "),
+                    depth + 1,
+                )
+
+    visit(resolved_root, "", 1)
+    if len(lines) == 1:
+        return ""
+    if truncated:
+        lines.append("... (more lines truncated)")
+    return "\n".join(["**Tree** (3 levels):", "```text", *lines, "```"])
+
+
+def _collect_makefile_section(root: Path, git_root: Path | None) -> str:
+    """Show a bounded Makefile preview from the cwd or containing git root.
+
+    Returns:
+        A markdown Makefile preview, or `""` when no Makefile is found.
+    """
+    resolved_root = _resolve_trusted_directory(root)
+    if resolved_root is None:
+        return ""
+    makefile = resolved_root / "Makefile"
+    result = _read_text_prefix_no_follow(
+        makefile,
+        boundary=resolved_root,
+        line_limit=_LOCAL_MAKEFILE_LINE_LIMIT,
+    )
+    if result is None and git_root is not None:
+        resolved_git_root = _resolve_containing_directory(
+            git_root,
+            child=resolved_root,
+        )
+        if resolved_git_root is not None and resolved_git_root != resolved_root:
+            makefile = resolved_git_root / "Makefile"
+            result = _read_text_prefix_no_follow(
+                makefile,
+                boundary=resolved_git_root,
+                line_limit=_LOCAL_MAKEFILE_LINE_LIMIT,
+            )
+    if result is None:
+        return ""
+    lines, truncated = result
+    if not lines:
+        return ""
+    display_path = "Makefile" if makefile.parent == resolved_root else str(makefile)
+    body = [
+        (
+            f"**Makefile** (`{_safe_display(display_path)}`, "
+            f"first {_LOCAL_MAKEFILE_LINE_LIMIT} lines):"
+        ),
+        "```makefile",
+        *lines,
+    ]
+    if truncated:
+        body.append("... (truncated)")
+    body.append("```")
+    return "\n".join(body)
+
+
+def _collect_local_context(local_root: Path) -> str:
+    """Collect bounded context directly from a local project directory.
+
+    Returns:
+        A combined markdown context block for the local project.
+    """
+    root = _resolve_trusted_directory(local_root)
+    if root is None:
+        return ""
+    git_context = _collect_git_context(root)
+    sections = [
+        "## Local Context",
+        f"**Current Directory**: `{_safe_display(str(root))}`",
+        _collect_project_section(root, git_context.root),
+        _collect_package_manager_section(root),
+        _collect_runtime_section(root),
+        f"**Git**: {git_context.summary}" if git_context.summary else "",
+        _collect_gh_section(root),
+        _collect_test_command_section(root),
+        _collect_files_section(root),
+        _collect_tree_section(root),
+        _collect_makefile_section(root, git_context.root),
+    ]
+    return "\n\n".join(section for section in sections if section)
 
 
 def _sanitize_error_detail(error: str | None) -> str:
@@ -261,16 +1432,38 @@ def _section_header() -> str:
     Returns:
         Bash snippet that prints the header and sets `CWD` / `IN_GIT`.
     """
-    return r"""CWD="$(pwd)"
+    return r"""CWD="$(pwd -P)"
 echo "## Local Context"
 echo ""
 echo "**Current Directory**: \`${CWD}\`"
 echo ""
 
 # --- Check git once ---
+GIT_BIN="$(command -v git 2>/dev/null || true)"
+safe_git() {
+  env -i \
+    PATH="${PATH-}" \
+    HOME="${HOME-}" \
+    TMPDIR="${TMPDIR-}" \
+    TMP="${TMP-}" \
+    TEMP="${TEMP-}" \
+    LANG="${LANG-}" \
+    LC_ALL="${LC_ALL-}" \
+    LC_CTYPE="${LC_CTYPE-}" \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_TERMINAL_PROMPT=0 \
+    "$GIT_BIN" --no-pager \
+      -c core.fsmonitor=false \
+      -c core.hooksPath=/dev/null \
+      -c diff.external= \
+      -c pager.status=false \
+      -c submodule.recurse=false \
+      "$@"
+}
 IN_GIT=false
-if command -v git >/dev/null 2>&1 \
-    && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if [ -n "$GIT_BIN" ] \
+    && safe_git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   IN_GIT=true
 fi"""
 
@@ -295,7 +1488,7 @@ MONOREPO=false
   || [ -d workspaces ]; } && MONOREPO=true
 
 ROOT=""
-$IN_GIT && ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+$IN_GIT && ROOT="$(safe_git rev-parse --show-toplevel 2>/dev/null)"
 
 ENVS=""
 { [ -d .venv ] || [ -d venv ]; } && ENVS=".venv"
@@ -366,36 +1559,29 @@ fi
 
 
 def _section_git() -> str:
-    """Git branch or detached HEAD commit, main branches, uncommitted changes.
+    """Git branch or detached HEAD commit and main branches.
 
     Returns:
         Bash snippet (requires `IN_GIT` from header).
     """
     return r"""# --- Git ---
 if $IN_GIT; then
-  BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  BRANCH="$(safe_git rev-parse --abbrev-ref HEAD 2>/dev/null)"
   if [ "$BRANCH" = "HEAD" ]; then
-    COMMIT="$(git rev-parse --short HEAD 2>/dev/null)"
+    COMMIT="$(safe_git rev-parse --short HEAD 2>/dev/null)"
     GT="**Git**: Detached HEAD at \`${COMMIT}\`"
   else
     GT="**Git**: Current branch \`${BRANCH}\`"
   fi
 
   MAINS=""
-  for b in $(git branch 2>/dev/null | sed 's/^[* ]*//'); do
+  for b in $(safe_git branch 2>/dev/null | sed 's/^[* ]*//'); do
     case "$b" in
       main) MAINS="${MAINS:+${MAINS}, }\`main\`" ;;
       master) MAINS="${MAINS:+${MAINS}, }\`master\`" ;;
     esac
   done
   [ -n "$MAINS" ] && GT="${GT}, ${MAINS} available"
-
-  DC=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
-  if [ "$DC" -gt 0 ]; then
-    if [ "$DC" -eq 1 ]; then GT="${GT}, 1 uncommitted change"
-    else GT="${GT}, ${DC} uncommitted changes"
-    fi
-  fi
 
   echo "$GT"
   echo ""
@@ -447,7 +1633,8 @@ def _section_test_command() -> str:
     """
     return r"""# --- Test command ---
 TC=""
-if [ -f Makefile ] && grep -qE '^tests?:' Makefile 2>/dev/null; then TC="make test"
+if [ -f Makefile ] && [ ! -L Makefile ] \
+    && grep -qE '^tests?:' Makefile 2>/dev/null; then TC="make test"
 elif [ -f pyproject.toml ]; then
   if grep -q '\[tool\.pytest' pyproject.toml 2>/dev/null \
       || [ -f pytest.ini ] || [ -d tests ] || [ -d test ]; then
@@ -536,10 +1723,19 @@ def _section_makefile() -> str:
     """
     return r"""# --- Makefile ---
 MK=""
-if [ -f Makefile ]; then
+MK_ROOT=""
+if [ -f Makefile ] && [ ! -L Makefile ]; then
   MK="Makefile"
-elif [ -n "$ROOT" ] && [ "$ROOT" != "$CWD" ] && [ -f "${ROOT}/Makefile" ]; then
+  MK_ROOT="$CWD"
+elif [ -n "$ROOT" ] && [ "$ROOT" != "$CWD" ] \
+    && [ -f "${ROOT}/Makefile" ] && [ ! -L "${ROOT}/Makefile" ]; then
   MK="${ROOT}/Makefile"
+  MK_ROOT="$ROOT"
+fi
+if [ -n "$MK" ]; then
+  MK_PARENT="$(cd -P -- "$(dirname -- "$MK")" 2>/dev/null && pwd -P)"
+  SAFE_ROOT="$(cd -P -- "$MK_ROOT" 2>/dev/null && pwd -P)"
+  [ -n "$MK_PARENT" ] && [ "$MK_PARENT" = "$SAFE_ROOT" ] || MK=""
 fi
 if [ -n "$MK" ]; then
   echo "**Makefile** (\`${MK}\`, first 20 lines):"
@@ -607,9 +1803,9 @@ class LocalContextState(AgentState):
     """Private formatted local context cached for prompt injection.
 
     The context is intentionally stored in private state rather than recomputed
-    before every model call: volatile sections such as git status, file lists,
-    and directory trees would otherwise churn the system prompt and reduce
-    provider prompt-cache hits across a conversation.
+    before every model call: volatile sections such as file lists and directory
+    trees would otherwise churn the system prompt and reduce provider
+    prompt-cache hits across a conversation.
     """
 
     _local_context_refreshed_at_cutoff: NotRequired[Annotated[int, PrivateStateAttr]]
@@ -627,30 +1823,32 @@ class LocalContextState(AgentState):
 
 
 class LocalContextMiddleware(AgentMiddleware):
-    """Inject local context (git state, project structure, etc.) into the system prompt.
+    """Inject runtime and project context into the system prompt.
 
-    Runs a bash detection script via `backend.execute()` on first interaction
-    and again after each summarization event, stores the result in state, and
-    appends it to the system prompt on every model call.
-
-    Because the script runs inside the backend, it works for both local shells
-    and remote sandboxes.
+    Local sessions collect context directly from `local_root`. Remote sessions
+    run the Bash detection script through the backend. Context is collected on
+    first interaction and after each summarization event, cached in state, and
+    appended to every model request.
     """
 
     state_schema = LocalContextState
 
     def __init__(
         self,
-        backend: _ExecutableBackend | _AsyncExecutableBackend,
+        backend: object,
         *,
+        local_root: str | Path | None = None,
         mcp_server_info: list[MCPServerInfo] | None = None,
         tracing_project: str | None = None,
         user_tracing_project: str | None = None,
     ) -> None:
-        """Initialize with a backend that supports shell execution.
+        """Initialize local or backend-based context collection.
 
         Args:
-            backend: Backend instance that provides shell command execution.
+            backend: Backend used for remote context collection. It is not
+                invoked when `local_root` is supplied.
+            local_root: Captured local project working directory. When set,
+                context is collected in-process instead of through the backend.
             mcp_server_info: MCP server metadata to include in the system prompt.
             tracing_project: LangSmith project the agent's own runs trace to, or
                 `None` when tracing is disabled (the tracing section is omitted).
@@ -658,6 +1856,7 @@ class LocalContextMiddleware(AgentMiddleware):
                 shell commands the agent runs.
         """
         self.backend = backend
+        self._local_root = Path(local_root) if local_root is not None else None
         self._mcp_context = _build_mcp_context(mcp_server_info or [])
         self._tracing_context = _build_tracing_context(
             tracing_project, user_tracing_project
@@ -691,11 +1890,23 @@ class LocalContextMiddleware(AgentMiddleware):
         return output or None
 
     def _run_detect_script(self) -> str | None:
-        """Run the environment detection script.
+        """Collect local context or run the remote detection script.
 
         Returns:
-            Stripped script output, or `None` on failure/empty output.
+            Formatted context, or `None` on failure/empty output.
         """
+        if self._local_root is not None:
+            try:
+                return _collect_local_context(self._local_root)
+            except Exception:
+                logger.warning(
+                    "Local context collection failed for %s; context will be "
+                    "omitted from system prompt",
+                    self._local_root,
+                    exc_info=True,
+                )
+                return None
+
         backend = self.backend
         if not isinstance(backend, _ExecutableBackend):
             logger.debug(
@@ -786,15 +1997,29 @@ class LocalContextMiddleware(AgentMiddleware):
         return None
 
     async def _arun_detect_script(self) -> str | None:
-        """Run the environment detection script asynchronously.
+        """Collect context asynchronously without blocking the event loop.
 
-        Prefers `aexecute` when the backend implements `_AsyncExecutableBackend`.
-        Falls back to running the sync detection script in a thread pool
-        for sync-only backends.
+        Local collection and sync-only remote backends run in a worker thread.
+        Async-capable remote backends use `aexecute`.
 
         Returns:
             Stripped script output, or `None` on failure/empty output.
         """
+        if self._local_root is not None:
+            try:
+                return await asyncio.to_thread(
+                    _collect_local_context,
+                    self._local_root,
+                )
+            except Exception:
+                logger.warning(
+                    "Async local context collection failed for %s; context "
+                    "will be omitted from system prompt",
+                    self._local_root,
+                    exc_info=True,
+                )
+                return None
+
         backend = self.backend
         if not (
             isinstance(backend, _AsyncExecutableBackend)

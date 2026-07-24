@@ -21,6 +21,8 @@ import re
 import shlex
 import shutil
 import signal
+import stat
+import subprocess  # ruff: ignore[suspicious-subprocess-import]  # Display formatting.
 import sys
 import tempfile
 import time
@@ -37,10 +39,486 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
+from deepagents_code import model_config
 from deepagents_code._version import PYPI_URL, SDK_PYPI_URL, USER_AGENT, __version__
 from deepagents_code.model_config import DEFAULT_CONFIG_PATH, DEFAULT_STATE_DIR
 
 logger = logging.getLogger(__name__)
+
+_WINDOWS_NATIVE_EXECUTABLE_SUFFIXES = (".COM", ".EXE")
+"""Native application suffixes accepted for Windows package managers."""
+
+_WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+"""Windows file attribute identifying symlinks and other reparse points."""
+
+_QUOTED_PATH_ENTRY_MIN_LENGTH = 2
+"""Minimum length of a PATH entry wrapped in matching quote characters."""
+
+_VCS_DIRECTORY_MARKERS = (".hg", ".svn")
+"""VCS directories that establish a workspace boundary."""
+
+_PROJECT_MARKERS = (
+    "Cargo.toml",
+    "Gemfile",
+    "build.gradle",
+    "build.gradle.kts",
+    "composer.json",
+    "go.mod",
+    "package.json",
+    "pom.xml",
+    "pyproject.toml",
+)
+"""Conservative project files used only when no enclosing VCS root exists."""
+
+_INSTALL_ENVIRONMENT_KEYS = frozenset(
+    {
+        "ALL_PROXY",
+        "COMSPEC",
+        "CURL_CA_BUNDLE",
+        "FTP_PROXY",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "HOME",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "NO_PROXY",
+        "PATH",
+        "PATHEXT",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USERPROFILE",
+        "UV_NATIVE_TLS",
+        "WINDIR",
+    }
+)
+"""Non-source environment inputs allowed into package-manager subprocesses."""
+
+_INSTALL_PATH_ENVIRONMENT_KEYS = (
+    "UV_CACHE_DIR",
+    "UV_TOOL_BIN_DIR",
+    "UV_TOOL_DIR",
+    "XDG_BIN_HOME",
+    "XDG_DATA_HOME",
+)
+"""Optional package-manager storage paths retained only when outside a workspace."""
+
+
+def _absolute_path(value: str | os.PathLike[str]) -> Path | None:
+    """Return a normalized absolute path, or `None` for unsafe input."""
+    try:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            return None
+        return path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+
+
+def _is_reparse_point(metadata: os.stat_result) -> bool:
+    """Return whether stat metadata identifies a Windows reparse point."""
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return bool(attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _windows_path_has_reparse_component(path: Path) -> bool:
+    """Return whether an existing Windows path traverses a reparse point."""
+    current = Path(path.anchor)
+    try:
+        for part in path.parts[1:]:
+            current /= part
+            metadata = current.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def _is_no_follow_marker(path: Path, *, regular_file: bool | None) -> bool:
+    """Check one marker without following symlinks or reparse points.
+
+    Args:
+        path: Marker path to inspect.
+        regular_file: `True` for a regular file, `False` for a directory, or
+            `None` to accept either type.
+
+    Returns:
+        Whether the marker has the requested no-follow file type.
+    """
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+        return False
+    if regular_file is None:
+        return stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        if regular_file
+        else stat.S_ISDIR(metadata.st_mode)
+    )
+
+
+def _has_vcs_marker(directory: Path) -> bool:
+    """Return whether `directory` is a no-follow VCS worktree root."""
+    git_marker = directory / ".git"
+    if _is_no_follow_marker(git_marker, regular_file=None):
+        return True
+    return any(
+        _is_no_follow_marker(directory / marker, regular_file=False)
+        for marker in _VCS_DIRECTORY_MARKERS
+    )
+
+
+def _has_project_marker(directory: Path) -> bool:
+    """Return whether `directory` has a conservative no-follow project marker."""
+    return any(
+        _is_no_follow_marker(directory / marker, regular_file=True)
+        for marker in _PROJECT_MARKERS
+    )
+
+
+def _find_workspace_boundary(start: Path) -> Path | None:
+    """Return the enclosing VCS root or nearest conservative project root.
+
+    The walk is lexical and inspects markers with `lstat`, so a repository
+    cannot redirect discovery through symlinked marker files. An enclosing VCS
+    root wins over a nearer language-specific marker.
+    """
+    if not start.is_absolute():
+        return None
+    current = Path(os.path.normpath(start))
+    nearest_project: Path | None = None
+    for directory in (current, *current.parents):
+        if _has_vcs_marker(directory):
+            return directory
+        if nearest_project is None and _has_project_marker(directory):
+            nearest_project = directory
+    return nearest_project
+
+
+def _active_workspace_boundary() -> Path | None:
+    """Discover the workspace boundary from the process's real cwd.
+
+    Server transport variables may have been populated by a project `.env`, so
+    they are not inputs to executable trust decisions.
+
+    Returns:
+        The detected workspace boundary, or `None` when cwd has no marker.
+    """
+    try:
+        return _find_workspace_boundary(Path.cwd())
+    except OSError:
+        return None
+
+
+def _windows_path_executable_names(command: str) -> tuple[str, ...]:
+    """Return native Windows application names for a bare command."""
+    suffix = Path(command).suffix.casefold()
+    if suffix:
+        allowed = {
+            extension.casefold() for extension in _WINDOWS_NATIVE_EXECUTABLE_SUFFIXES
+        }
+        return (command,) if suffix in allowed else ()
+    return tuple(
+        f"{command}{extension}" for extension in _WINDOWS_NATIVE_EXECUTABLE_SUFFIXES
+    )
+
+
+def _is_within_path(path: Path, boundary: Path) -> bool:
+    """Return whether `path` is equal to or contained by `boundary`."""
+    return path == boundary or path.is_relative_to(boundary)
+
+
+def _trusted_executable_candidate(
+    candidate: Path,
+    workspace_boundary: Path | None,
+) -> str | None:
+    """Validate one absolute executable candidate outside the active project.
+
+    Returns:
+        The absolute candidate path, or `None` when it is not trusted.
+    """
+    if not candidate.is_absolute():
+        return None
+    try:
+        # Lexical normalization is required here; `resolve()` would follow a
+        # Windows reparse point before the no-follow validation below.
+        absolute_candidate = Path(
+            os.path.abspath(candidate)  # noqa: PTH100
+        )
+        metadata = (
+            absolute_candidate.lstat() if os.name == "nt" else absolute_candidate.stat()
+        )
+        if os.name == "nt" and _windows_path_has_reparse_component(absolute_candidate):
+            return None
+        resolved_candidate = absolute_candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        return None
+    if os.name == "nt" and (
+        absolute_candidate.suffix.casefold()
+        not in {
+            extension.casefold() for extension in _WINDOWS_NATIVE_EXECUTABLE_SUFFIXES
+        }
+        or stat.S_ISLNK(metadata.st_mode)
+        or _is_reparse_point(metadata)
+    ):
+        return None
+    if not os.access(absolute_candidate, os.X_OK):
+        return None
+    if workspace_boundary is not None and (
+        _is_within_path(absolute_candidate, workspace_boundary)
+        or _is_within_path(resolved_candidate, workspace_boundary)
+    ):
+        return None
+    return str(absolute_candidate)
+
+
+def _resolve_trusted_path_executable(command: str) -> str | None:
+    """Resolve a bare executable through trusted absolute `PATH` entries only.
+
+    Empty and relative entries are ignored on every platform. When a
+    cwd-discovered workspace exists, the returned absolute PATH candidate and
+    its resolved target must both be outside that workspace. A marker-free home
+    directory is not treated as a project, so user-installed tools under paths
+    such as `~/.local` and `~/.agency` remain usable.
+
+    Args:
+        command: Bare executable name without path separators.
+
+    Returns:
+        Absolute PATH candidate, or `None` when no trusted executable exists.
+    """
+    if not command or command in {".", ".."} or "/" in command or "\\" in command:
+        return None
+    raw_path = os.environ.get("PATH")
+    if not raw_path:
+        return None
+    workspace_boundary = _active_workspace_boundary()
+
+    windows = os.name == "nt"
+    executable_names = (
+        _windows_path_executable_names(command) if windows else (command,)
+    )
+    if not executable_names:
+        return None
+
+    for raw_directory in raw_path.split(os.pathsep):
+        if not raw_directory:
+            continue
+        path_entry = raw_directory
+        if (
+            windows
+            and len(path_entry) >= _QUOTED_PATH_ENTRY_MIN_LENGTH
+            and path_entry[0] == path_entry[-1] == '"'
+        ):
+            path_entry = path_entry[1:-1]
+        directory = Path(path_entry)
+        if not directory.is_absolute():
+            continue
+        try:
+            absolute_directory = directory.absolute()
+            resolved_directory = absolute_directory.resolve(strict=False)
+        except (OSError, RuntimeError):
+            continue
+        if workspace_boundary is not None and (
+            _is_within_path(absolute_directory, workspace_boundary)
+            or _is_within_path(resolved_directory, workspace_boundary)
+        ):
+            continue
+
+        for executable_name in executable_names:
+            candidate = absolute_directory / executable_name
+            trusted = _trusted_executable_candidate(candidate, workspace_boundary)
+            if trusted is not None:
+                return trusted
+    return None
+
+
+def _trusted_executable_error(command: str) -> str:
+    """Return actionable guidance when a trusted executable cannot be resolved."""
+    name = Path(command).name or command or "command"
+    guidance = (
+        "Install uv from https://docs.astral.sh/uv/ or fix PATH."
+        if name.casefold() in {"uv", "uv.exe"}
+        else f"Install {name} or fix PATH."
+    )
+    return (
+        f"`{name}` not found in a trusted PATH location. PATH entries must be "
+        "absolute, and the executable must be outside the active project when "
+        "one is detected. "
+        f"{guidance}"
+    )
+
+
+def _prepare_install_argv(
+    argv: Sequence[str],
+    *,
+    executable: str | None,
+) -> tuple[str, ...] | None:
+    """Replace argv[0] with one absolute trusted executable path.
+
+    Returns:
+        Prepared arguments, or `None` when the executable is not trusted.
+    """
+    if not argv:
+        return None
+    requested = argv[0]
+    workspace_boundary = _active_workspace_boundary()
+    if executable is not None:
+        trusted = _trusted_executable_candidate(
+            Path(executable),
+            workspace_boundary,
+        )
+    else:
+        requested_path = Path(requested)
+        if requested_path.is_absolute():
+            trusted = _trusted_executable_candidate(
+                requested_path,
+                workspace_boundary,
+            )
+        else:
+            trusted = _resolve_trusted_path_executable(requested)
+    if trusted is None:
+        return None
+    return (trusted, *argv[1:])
+
+
+def _install_subprocess_path(workspace_boundary: Path | None) -> str | None:
+    """Return an absolute `PATH` with active-workspace entries removed."""
+    raw_path = os.environ.get("PATH")
+    if raw_path is None:
+        return None
+
+    directories: list[str] = []
+    windows = os.name == "nt"
+    for raw_directory in raw_path.split(os.pathsep):
+        if not raw_directory:
+            continue
+        path_entry = raw_directory
+        if (
+            windows
+            and len(path_entry) >= _QUOTED_PATH_ENTRY_MIN_LENGTH
+            and path_entry[0] == path_entry[-1] == '"'
+        ):
+            path_entry = path_entry[1:-1]
+        directory = Path(path_entry)
+        if not directory.is_absolute():
+            continue
+        try:
+            absolute_directory = directory.absolute()
+            resolved_directory = absolute_directory.resolve(strict=False)
+        except (OSError, RuntimeError):
+            continue
+        if workspace_boundary is not None and (
+            _is_within_path(absolute_directory, workspace_boundary)
+            or _is_within_path(resolved_directory, workspace_boundary)
+        ):
+            continue
+        directories.append(str(absolute_directory))
+    return os.pathsep.join(directories)
+
+
+def _install_subprocess_environment() -> dict[str, str]:
+    """Build the curated environment used for package-manager subprocesses.
+
+    Repository-controlled Python, virtualenv, shell startup, package index,
+    find-links, and config variables are excluded by construction. Required
+    platform, temporary-directory, TLS, and proxy values are retained.
+
+    Returns:
+        Curated environment for an updater or package-manager subprocess.
+    """
+    from deepagents_code.config import _project_dotenv_applied_keys
+
+    project_dotenv_keys = _project_dotenv_applied_keys()
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in _INSTALL_ENVIRONMENT_KEYS
+        and key.upper() != "PATH"
+        and key.upper() not in project_dotenv_keys
+    }
+    workspace_boundary = _active_workspace_boundary()
+    if "PATH" not in project_dotenv_keys:
+        path = _install_subprocess_path(workspace_boundary)
+        if path is not None:
+            environment["PATH"] = path
+    for key in _INSTALL_PATH_ENVIRONMENT_KEYS:
+        if key in project_dotenv_keys:
+            continue
+        value = os.environ.get(key)
+        if value is None:
+            continue
+        path = _absolute_path(value)
+        if path is None:
+            continue
+        if workspace_boundary is not None and _is_within_path(
+            path,
+            workspace_boundary,
+        ):
+            continue
+        environment[key] = value
+    return environment
+
+
+def _install_subprocess_directory() -> Path:
+    """Create and return the trusted state directory used as install cwd.
+
+    Returns:
+        Absolute, resolved Deep Agents install working directory.
+
+    Raises:
+        OSError: If the directory cannot be created or resolves inside the
+            active workspace.
+    """
+    directory = model_config.DEFAULT_STATE_DIR / "install"
+    directory.mkdir(parents=True, exist_ok=True)
+    absolute_directory = directory.absolute()
+    resolved_directory = directory.resolve(strict=True)
+    workspace_boundary = _active_workspace_boundary()
+    if workspace_boundary is not None and (
+        _is_within_path(absolute_directory, workspace_boundary)
+        or _is_within_path(resolved_directory, workspace_boundary)
+    ):
+        msg = (
+            "Deep Agents install state directory resolves inside the active "
+            f"project: {resolved_directory}"
+        )
+        raise OSError(msg)
+    return resolved_directory
+
+
+def _format_command(argv: Sequence[str]) -> str:
+    """Format structured arguments for display without using a shell.
+
+    Returns:
+        A platform-appropriate command-line representation of `argv`.
+    """
+    if os.name == "nt":
+        parts: list[str] = []
+        for value in argv:
+            formatted = subprocess.list2cmdline([value])
+            if any(
+                character in value for character in "&|<>()^"
+            ) and not formatted.startswith('"'):
+                formatted = f'"{formatted}"'
+            parts.append(formatted)
+        return " ".join(parts)
+    return shlex.join(argv)
+
 
 CACHE_FILE: Path = DEFAULT_STATE_DIR / "latest_version.json"
 """On-disk cache of the latest published dcode/SDK versions and SDK release times.
@@ -118,7 +596,7 @@ _PRERELEASE_CONSTRAINTS_FILE_PREFIX = "dcode-prereleases-"
 
 InstallMethod = Literal["uv", "brew", "other", "unknown"]
 
-FALLBACK_UPGRADE_COMMAND = "uv tool install -U deepagents-code"
+FALLBACK_UPGRADE_COMMAND = "uv --no-config tool install -U deepagents-code"
 """Generic upgrade hint used when install-method detection fails.
 
 Callers that surface an upgrade command in user-facing text should prefer
@@ -178,6 +656,386 @@ _UPGRADE_TIMEOUT = 120  # seconds
 
 _TERMINATE_WAIT_TIMEOUT = 5  # seconds
 """Cap on reaping a killed install subprocess so cleanup cannot hang launch."""
+
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_WINDOWS_CREATE_SUSPENDED = 0x00000004
+_WINDOWS_WAIT_OBJECT_0 = 0
+_PROCESS_EXIT_POLL_INTERVAL = 0.01
+
+
+def _set_windows_job_kill_on_close(handle: int, *, enabled: bool) -> bool:
+    """Configure whether closing a Windows Job Object terminates its processes.
+
+    Returns:
+        Whether Windows accepted the Job Object limit update.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("read_operation_count", ctypes.c_ulonglong),
+            ("write_operation_count", ctypes.c_ulonglong),
+            ("other_operation_count", ctypes.c_ulonglong),
+            ("read_transfer_count", ctypes.c_ulonglong),
+            ("write_transfer_count", ctypes.c_ulonglong),
+            ("other_transfer_count", ctypes.c_ulonglong),
+        ]
+
+    class _BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("per_process_user_time_limit", ctypes.c_longlong),
+            ("per_job_user_time_limit", ctypes.c_longlong),
+            ("limit_flags", wintypes.DWORD),
+            ("minimum_working_set_size", ctypes.c_size_t),
+            ("maximum_working_set_size", ctypes.c_size_t),
+            ("active_process_limit", wintypes.DWORD),
+            ("affinity", ctypes.c_size_t),
+            ("priority_class", wintypes.DWORD),
+            ("scheduling_class", wintypes.DWORD),
+        ]
+
+    class _ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("basic_limit_information", _BasicLimitInformation),
+            ("io_info", _IoCounters),
+            ("process_memory_limit", ctypes.c_size_t),
+            ("job_memory_limit", ctypes.c_size_t),
+            ("peak_process_memory_used", ctypes.c_size_t),
+            ("peak_job_memory_used", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetInformationJobObject.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+
+    limits = _ExtendedLimitInformation()
+    if enabled:
+        limits.basic_limit_information.limit_flags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    return bool(
+        kernel32.SetInformationJobObject(
+            handle,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        )
+    )
+
+
+def _close_windows_handle(handle: int) -> bool:
+    """Close a native Windows handle.
+
+    Returns:
+        Whether Windows closed the handle successfully.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return bool(kernel32.CloseHandle(handle))
+
+
+def _terminate_and_wait_windows_job(handle: int) -> bool:
+    """Terminate every process in a Job Object and wait for it to empty.
+
+    Returns:
+        Whether the Job reached the empty state before the cleanup deadline.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.TerminateJobObject.argtypes = (
+        wintypes.HANDLE,
+        wintypes.UINT,
+    )
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.WaitForSingleObject.argtypes = (
+        wintypes.HANDLE,
+        wintypes.DWORD,
+    )
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+
+    if not kernel32.TerminateJobObject(handle, 1):
+        return False
+    wait_milliseconds = int(_TERMINATE_WAIT_TIMEOUT * 1000)
+    return (
+        kernel32.WaitForSingleObject(handle, wait_milliseconds)
+        == _WINDOWS_WAIT_OBJECT_0
+    )
+
+
+class _WindowsJobObject:
+    """Own a Windows Job Object containing one subprocess tree."""
+
+    def __init__(self, handle: int) -> None:
+        self._handle: int | None = handle
+
+    @classmethod
+    def create_for_process_handle(
+        cls,
+        process_handle: int,
+    ) -> _WindowsJobObject:
+        """Create a kill-on-close job and assign a suspended process.
+
+        Returns:
+            The assigned Job Object.
+
+        Raises:
+            OSError: If Windows cannot create, configure, or assign the Job.
+        """
+        if os.name != "nt":
+            msg = "Windows Job Objects are unavailable on this platform"
+            raise OSError(msg)
+
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = (
+            ctypes.c_void_p,
+            wintypes.LPCWSTR,
+        )
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.AssignProcessToJobObject.argtypes = (
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+        )
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+
+        job_handle = kernel32.CreateJobObjectW(None, None)
+        if not job_handle:
+            error = ctypes.get_last_error()
+            msg = "CreateJobObjectW failed"
+            raise OSError(error, msg)
+
+        def configure_and_assign() -> None:
+            if not _set_windows_job_kill_on_close(job_handle, enabled=True):
+                error = ctypes.get_last_error()
+                msg = "SetInformationJobObject failed"
+                raise OSError(error, msg)
+            if not kernel32.AssignProcessToJobObject(job_handle, process_handle):
+                error = ctypes.get_last_error()
+                msg = "AssignProcessToJobObject failed"
+                raise OSError(error, msg)
+
+        try:
+            configure_and_assign()
+            return cls(job_handle)
+        except BaseException:
+            _close_windows_handle(job_handle)
+            raise
+
+    def terminate(self) -> bool:
+        """Terminate the full tree, wait for it to exit, and close the Job.
+
+        Returns:
+            Whether Windows terminated the Job and closed its handle.
+        """
+        handle = self._handle
+        if handle is None:
+            return True
+        self._handle = None
+        terminated = False
+        try:
+            terminated = _terminate_and_wait_windows_job(handle)
+        finally:
+            closed = _close_windows_handle(handle)
+        return terminated and closed
+
+    def close(self) -> None:
+        """Release the job without terminating processes after normal exit."""
+        handle = self._handle
+        if handle is None:
+            return
+        self._handle = None
+        _set_windows_job_kill_on_close(handle, enabled=False)
+        _close_windows_handle(handle)
+
+
+def _windows_asyncio_process_handle(proc: asyncio.subprocess.Process) -> int:
+    """Return the native process handle retained by an asyncio transport.
+
+    Raises:
+        OSError: If asyncio's native process handle is unavailable.
+    """
+    transport = getattr(proc, "_transport", None)
+    native_process = getattr(transport, "_proc", None)
+    handle = getattr(native_process, "_handle", None)
+    if not isinstance(handle, int):
+        msg = "Windows asyncio subprocess process handle is unavailable"
+        raise OSError(msg)
+    return handle
+
+
+async def _wait_for_install_process_root(
+    proc: asyncio.subprocess.Process,
+) -> int:
+    """Wait for the root process independently from descendant-held pipes.
+
+    Returns:
+        The root process exit code.
+    """
+    while proc.returncode is None:  # noqa: ASYNC110  # `wait()` also waits for descendant-held pipes.
+        await asyncio.sleep(_PROCESS_EXIT_POLL_INTERVAL)
+    return proc.returncode
+
+
+def _resume_windows_process(process_handle: int) -> None:
+    """Resume every thread in a process created with `CREATE_SUSPENDED`.
+
+    Raises:
+        OSError: If Windows cannot resume the process.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtResumeProcess.argtypes = (wintypes.HANDLE,)
+    ntdll.NtResumeProcess.restype = wintypes.LONG
+    status = int(ntdll.NtResumeProcess(process_handle))
+    if status < 0:
+        msg = f"NtResumeProcess failed with NTSTATUS 0x{status & 0xFFFFFFFF:08x}"
+        raise OSError(msg)
+
+
+def _windows_taskkill_path() -> str | None:
+    """Return a trusted absolute system `taskkill.exe` path when available."""
+    windows_dir = os.environ.get("SYSTEMROOT") or os.environ.get("WINDIR")
+    if not windows_dir:
+        return None
+    return _trusted_executable_candidate(
+        Path(windows_dir) / "System32" / "taskkill.exe",
+        _active_workspace_boundary(),
+    )
+
+
+async def _taskkill_windows_process_tree(pid: int) -> None:
+    """Run bounded, fixed-argv `taskkill` for one process tree."""
+    taskkill = _windows_taskkill_path()
+    if taskkill is None:
+        return
+    killer: asyncio.subprocess.Process | None = None
+    try:
+        killer = await asyncio.create_subprocess_exec(
+            taskkill,
+            "/PID",
+            str(pid),
+            "/T",
+            "/F",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(killer.wait(), timeout=_TERMINATE_WAIT_TIMEOUT)
+    except (OSError, TimeoutError):
+        if killer is not None:
+            with suppress(OSError, ProcessLookupError):
+                killer.kill()
+            with suppress(OSError, TimeoutError):
+                await asyncio.wait_for(
+                    killer.wait(),
+                    timeout=_TERMINATE_WAIT_TIMEOUT,
+                )
+
+
+async def _wait_for_windows_process_root_exit(
+    proc: asyncio.subprocess.Process,
+    *,
+    wait_seconds: float,
+) -> bool:
+    """Wait a bounded interval for the Windows root process to exit.
+
+    Returns:
+        Whether the root exited before the deadline.
+    """
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=wait_seconds)
+    except (OSError, ProcessLookupError, TimeoutError):
+        return proc.returncode is not None
+    return True
+
+
+async def _terminate_windows_process_tree(
+    proc: asyncio.subprocess.Process,
+    job: _WindowsJobObject | None,
+) -> None:
+    """Terminate the owned Job first, using `taskkill` only as a fallback."""
+    job_terminated = False
+    if job is not None:
+        with suppress(OSError):
+            job_terminated = job.terminate()
+
+    root_exited = proc.returncode is not None
+    root_waited = False
+    taskkill_required = job is not None and not job_terminated
+    if job_terminated and not root_exited:
+        root_exited = await _wait_for_windows_process_root_exit(
+            proc,
+            wait_seconds=_TERMINATE_WAIT_TIMEOUT,
+        )
+        root_waited = True
+        taskkill_required = not root_exited
+    elif job is None:
+        taskkill_required = not root_exited
+
+    if taskkill_required:
+        await _taskkill_windows_process_tree(proc.pid)
+        root_exited = await _wait_for_windows_process_root_exit(
+            proc,
+            wait_seconds=_TERMINATE_WAIT_TIMEOUT,
+        )
+        root_waited = True
+
+    if not root_exited:
+        with suppress(OSError, ProcessLookupError):
+            proc.kill()
+        await _wait_for_windows_process_root_exit(
+            proc,
+            wait_seconds=_TERMINATE_WAIT_TIMEOUT,
+        )
+    elif not root_waited:
+        await _wait_for_windows_process_root_exit(
+            proc,
+            wait_seconds=_TERMINATE_WAIT_TIMEOUT,
+        )
+
+
+def _close_asyncio_subprocess_transport(proc: asyncio.subprocess.Process) -> None:
+    """Close an asyncio subprocess transport while its loop is still alive."""
+    transport = getattr(proc, "_transport", None)
+    if transport is not None:
+        with suppress(Exception):
+            transport.close()
+
+
+async def _assign_windows_job_and_resume(
+    proc: asyncio.subprocess.Process,
+) -> _WindowsJobObject:
+    """Assign a suspended process to a Job Object, then let it execute.
+
+    Returns:
+        The Job Object containing the resumed process.
+    """
+    job: _WindowsJobObject | None = None
+    try:
+        process_handle = _windows_asyncio_process_handle(proc)
+        job = _WindowsJobObject.create_for_process_handle(process_handle)
+        _resume_windows_process(process_handle)
+    except BaseException:
+        await _terminate_windows_process_tree(proc, job)
+        _close_asyncio_subprocess_transport(proc)
+        raise
+    return job
+
 
 INSTALL_SCRIPT_COMMAND = "curl -LsSf https://langch.in/dcode | bash"
 """Promoted public install command for Deep Agents Code."""
@@ -1336,13 +2194,51 @@ def detect_install_method() -> InstallMethod:
     return "other"
 
 
+def _upgrade_command_argv(
+    method: InstallMethod | None = None,
+    *,
+    include_prereleases: bool | None = None,
+    version: str | None = None,
+) -> tuple[str, ...]:
+    """Return structured arguments that upgrade `deepagents-code`."""
+    include_prereleases = _resolve_include_prereleases(include_prereleases)
+    if version is not None:
+        argv = [
+            "uv",
+            "--no-config",
+            "tool",
+            "install",
+            "-U",
+            _dcode_extras_requirement((), version=version),
+        ]
+        if include_prereleases:
+            argv.extend(("--prerelease", "allow"))
+        return tuple(argv)
+    if include_prereleases:
+        return (
+            "uv",
+            "--no-config",
+            "tool",
+            "install",
+            "-U",
+            "deepagents-code",
+            "--prerelease",
+            "allow",
+        )
+    if method is None:
+        method = detect_install_method()
+    if method == "brew":
+        return ("brew", "upgrade", "deepagents-code")
+    return ("uv", "--no-config", "tool", "install", "-U", "deepagents-code")
+
+
 def upgrade_command(
     method: InstallMethod | None = None,
     *,
     include_prereleases: bool | None = None,
     version: str | None = None,
 ) -> str:
-    """Return the shell command to upgrade `deepagents-code`.
+    """Return the display command to upgrade `deepagents-code`.
 
     Falls back to the documented uv command for display-only guidance.
 
@@ -1356,18 +2252,13 @@ def upgrade_command(
             only uv can be steered onto the pre-release channel.
         version: Optional exact `deepagents-code` version pin for uv guidance.
     """
-    include_prereleases = _resolve_include_prereleases(include_prereleases)
-    if version is not None:
-        requirement = _dcode_extras_requirement((), version=version)
-        cmd = f"uv tool install -U {requirement}"
-        if include_prereleases:
-            cmd += " --prerelease allow"
-        return cmd
-    if include_prereleases:
-        return _UV_PRERELEASE_UPGRADE_COMMAND
-    if method is None:
-        method = detect_install_method()
-    return _UPGRADE_COMMANDS.get(method, FALLBACK_UPGRADE_COMMAND)
+    return _format_command(
+        _upgrade_command_argv(
+            method,
+            include_prereleases=include_prereleases,
+            version=version,
+        )
+    )
 
 
 def prerelease_upgrade_supported(
@@ -1683,8 +2574,8 @@ def format_shadowed_dcode_warning(shadow: ShadowedDcode) -> str:
         "will keep running the old version on relaunch:\n"
         f"  Shadowing binary: {shadow.shadowing_bin}\n"
         f"  Upgraded shim:    {shadow.upgraded_bin}\n"
-        "After closing dcode, run this to make the upgraded shim win in this "
-        "terminal:\n"
+        "After closing dcode, run the command for your shell to make the "
+        "upgraded shim win in this terminal:\n"
         f"  {indented_command}\n"
         "Then relaunch dcode. To make the fix permanent, add the PATH change "
         "to your shell profile, or uninstall the older dcode if you no longer "
@@ -1693,29 +2584,32 @@ def format_shadowed_dcode_warning(shadow: ShadowedDcode) -> str:
 
 
 def format_shadowed_dcode_fix_command(shadow: ShadowedDcode) -> str:
-    """Return a session-scoped shell command to prefer the upgraded shim.
+    """Return session-scoped shell commands to prefer the upgraded shim.
 
-    The command targets the shell that matches the current platform: PowerShell
-    on Windows (where `_uv_tool_bin_dir` can resolve `%USERPROFILE%/.local/bin`
-    and `export`/`hash` are not valid), and POSIX `sh`/`bash`/`zsh` elsewhere.
+    Windows output names both supported shells rather than assuming that dcode
+    was launched from PowerShell. POSIX output remains a command for
+    `sh`/`bash`/`zsh`.
 
     Args:
         shadow: The shadowing-binary description returned by
             `detect_shadowed_dcode`.
 
     Returns:
-        A copy-pasteable shell command that updates only the current terminal
-            session and, on POSIX, clears the shell's command-path cache.
+        Copy-pasteable shell commands that update only the current terminal
+            session and, on POSIX, clear the shell's command-path cache.
     """
     bin_dir = str(shadow.upgraded_bin_dir)
     if os.name == "nt":
-        # PowerShell, the default Windows shell. Single-quote the literal path so
-        # `$`, `$()`, and backticks in directory names are not expanded, then
-        # concatenate the live session PATH outside the literal. No cache flush is
-        # needed — PowerShell resolves executables per invocation rather than
-        # caching like POSIX shells' `hash`.
-        quoted = bin_dir.replace("'", "''")
-        return f"$env:PATH = '{quoted};' + $env:PATH"
+        powershell_path = bin_dir.replace("'", "''")
+        powershell_command = f"$env:PATH = '{powershell_path};' + $env:PATH"
+        if "%" in bin_dir:
+            # A cmd.exe FOR variable expands after `%NAME%` environment
+            # expansion, preserving literal percent signs in the path.
+            cmd_path = bin_dir.replace("%", "%#")
+            cmd_command = f'for %# in (%) do @set "PATH={cmd_path};%PATH%"'
+        else:
+            cmd_command = f'set "PATH={bin_dir};%PATH%"'
+        return f"PowerShell:\n  {powershell_command}\ncmd.exe:\n  {cmd_command}"
     quoted = shlex.quote(bin_dir)
     return f"export PATH={quoted}:$PATH\nhash -r 2>/dev/null || true"
 
@@ -1788,7 +2682,12 @@ async def _read_stream(
         await _emit_progress(progress, line)
 
 
-async def _terminate_install_process(proc: asyncio.subprocess.Process) -> None:
+async def _terminate_install_process(
+    proc: asyncio.subprocess.Process,
+    *,
+    windows_job: _WindowsJobObject | None = None,
+    close_transport: bool = True,
+) -> None:
     """Best-effort kill of an install subprocess and its descendants.
 
     On POSIX the sole caller starts the child in its own session
@@ -1812,6 +2711,8 @@ async def _terminate_install_process(proc: asyncio.subprocess.Process) -> None:
             # back to killing the direct child so at least it is reaped.
             with suppress(OSError):
                 proc.kill()
+    elif os.name == "nt":
+        await _terminate_windows_process_tree(proc, windows_job)
     elif proc.returncode is None:
         with suppress(OSError):
             proc.kill()
@@ -1825,19 +2726,192 @@ async def _terminate_install_process(proc: asyncio.subprocess.Process) -> None:
     # raises "Event loop is closed" (surfaced as PytestUnraisableExceptionWarning
     # under pytest). Close it eagerly while the loop is still alive. `_transport`
     # is the only handle asyncio exposes, and close() must not break teardown.
-    transport = getattr(proc, "_transport", None)
-    if transport is not None:
-        with suppress(Exception):
-            transport.close()
+    if close_transport:
+        _close_asyncio_subprocess_transport(proc)
+
+
+async def _start_install_process(
+    argv: tuple[str, ...],
+) -> tuple[asyncio.subprocess.Process, _WindowsJobObject | None]:
+    """Start an update subprocess without a shell.
+
+    Returns:
+        The subprocess and its Windows Job Object, when applicable.
+
+    Raises:
+        ValueError: If `argv` does not start with an absolute executable path.
+    """
+    if not argv or not os.path.isabs(argv[0]):  # noqa: PTH117
+        msg = "Install subprocesses require an absolute executable path"
+        raise ValueError(msg)
+
+    install_directory = _install_subprocess_directory()
+    install_environment = _install_subprocess_environment()
+
+    if os.name == "posix":
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=install_directory,
+            env=install_environment,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return proc, None
+
+    if os.name == "nt":
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=install_directory,
+            env=install_environment,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            creationflags=_WINDOWS_CREATE_SUSPENDED,
+        )
+        windows_job = await _assign_windows_job_and_resume(proc)
+        return proc, windows_job
+
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        cwd=install_directory,
+        env=install_environment,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    return proc, None
+
+
+async def _wait_for_install_tasks(
+    stream_tasks: Sequence[asyncio.Task[None]],
+    process_task: asyncio.Task[int],
+) -> int:
+    """Wait for stream readers and detect a nonzero root exit immediately.
+
+    Returns:
+        The root process exit code.
+    """
+    pending: set[asyncio.Task[None] | asyncio.Task[int]] = {
+        *stream_tasks,
+        process_task,
+    }
+    while pending:
+        done, pending = await asyncio.wait(
+            pending,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            if task is not process_task:
+                task.result()
+        if process_task in done:
+            return_code = process_task.result()
+            if return_code != 0:
+                return return_code
+    return process_task.result()
+
+
+async def _drain_install_stream_tasks(
+    stream_tasks: Sequence[asyncio.Task[None]],
+) -> None:
+    """Bound stream draining after a failed process tree has been terminated."""
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*stream_tasks, return_exceptions=True),
+            timeout=_TERMINATE_WAIT_TIMEOUT,
+        )
+    except TimeoutError:
+        for task in stream_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*stream_tasks, return_exceptions=True)
+
+
+async def _wait_for_install_process(
+    proc: asyncio.subprocess.Process,
+    *,
+    output_lines: list[str],
+    log_file: TextIO | None,
+    progress: UpgradeProgressCallback | None,
+    wait_seconds: float,
+    windows_job: _WindowsJobObject | None,
+) -> tuple[int, bool]:
+    """Drain streams, terminating the tree immediately after a nonzero exit.
+
+    Returns:
+        The root exit code and whether this function terminated its process tree.
+    """
+    stream_tasks: list[asyncio.Task[None]] = []
+    process_task: asyncio.Task[int] | None = None
+    tree_terminated = False
+    try:
+        stream_tasks.append(  # noqa: FURB113  # Register before the next task.
+            asyncio.create_task(
+                _read_stream(
+                    proc.stdout,  # ty: ignore[invalid-argument-type]
+                    lines=output_lines,
+                    log_file=log_file,
+                    progress=progress,
+                )
+            )
+        )
+        stream_tasks.append(
+            asyncio.create_task(
+                _read_stream(
+                    proc.stderr,  # ty: ignore[invalid-argument-type]
+                    lines=output_lines,
+                    log_file=log_file,
+                    progress=progress,
+                )
+            )
+        )
+        process_task = asyncio.create_task(_wait_for_install_process_root(proc))
+        return_code = await asyncio.wait_for(
+            _wait_for_install_tasks(stream_tasks, process_task),
+            timeout=wait_seconds,
+        )
+        if return_code != 0:
+            await _terminate_install_process(
+                proc,
+                windows_job=windows_job,
+                close_transport=False,
+            )
+            tree_terminated = True
+            try:
+                await _drain_install_stream_tasks(stream_tasks)
+            finally:
+                _close_asyncio_subprocess_transport(proc)
+        else:
+            await asyncio.wait_for(
+                proc.wait(),
+                timeout=_TERMINATE_WAIT_TIMEOUT,
+            )
+    except BaseException:
+        tasks: list[asyncio.Task[None] | asyncio.Task[int]] = [*stream_tasks]
+        if process_task is not None:
+            tasks.append(process_task)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tree_terminated:
+            _close_asyncio_subprocess_transport(proc)
+        else:
+            await _terminate_install_process(proc, windows_job=windows_job)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    else:
+        return return_code, tree_terminated
 
 
 async def _run_install_subprocess(
-    cmd: str,
+    argv: Sequence[str],
     *,
     progress: UpgradeProgressCallback | None,
     log_path: Path | None,
+    executable: str | None = None,
 ) -> tuple[bool, str]:
-    """Run a shell command, streaming stdout/stderr to *progress* and a log file.
+    """Run structured arguments, streaming output to *progress* and a log file.
 
     Shared subprocess plumbing for `perform_upgrade` and
     `perform_install_extra`. Returns `(success, combined_output)` where
@@ -1848,10 +2922,12 @@ async def _run_install_subprocess(
     is `_UPGRADE_TIMEOUT`.
 
     Args:
-        cmd: Shell command to execute.
+        argv: Executable and argument values to run without a shell.
         progress: Optional callback invoked for each output line.
         log_path: Optional path to persist command output. Falls back to a
             fresh `create_update_log_path()` when `None`.
+        executable: Absolute executable resolved once by the caller. When
+            omitted, this helper resolves or validates `argv[0]` itself.
 
     Returns:
         `(success, output)` — *success* is `True` iff the subprocess exited 0.
@@ -1860,16 +2936,31 @@ async def _run_install_subprocess(
         asyncio.CancelledError: If the calling task is cancelled.
     """
     timeout = _UPGRADE_TIMEOUT
+    requested_argv = tuple(argv)
+    command_argv = _prepare_install_argv(
+        requested_argv,
+        executable=executable,
+    )
+    if command_argv is None:
+        command = requested_argv[0] if requested_argv else "command"
+        msg = _trusted_executable_error(command)
+        await _emit_progress(progress, msg)
+        logger.warning(msg)
+        return False, msg
+    display_command = _format_command(command_argv)
     if log_path is None:
         log_path = create_update_log_path()
 
     output_lines: list[str] = []
     proc: asyncio.subprocess.Process | None = None
+    windows_job: _WindowsJobObject | None = None
+    return_code: int | None = None
+    tree_terminated = False
     log_file: TextIO | None = None
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_file = log_path.open("w", encoding="utf-8")
-        log_file.write(f"$ {cmd}\n")
+        log_file.write(f"$ {display_command}\n")
         log_file.flush()
     except OSError:
         logger.warning(
@@ -1881,74 +2972,57 @@ async def _run_install_subprocess(
         log_file = None
 
     try:
-        if os.name == "posix":
-            proc = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        else:
-            proc = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL,
-            )
-        await asyncio.wait_for(
-            asyncio.gather(
-                _read_stream(
-                    proc.stdout,  # ty: ignore[invalid-argument-type]
-                    lines=output_lines,
-                    log_file=log_file,
-                    progress=progress,
-                ),
-                _read_stream(
-                    proc.stderr,  # ty: ignore[invalid-argument-type]
-                    lines=output_lines,
-                    log_file=log_file,
-                    progress=progress,
-                ),
-                proc.wait(),
-            ),
-            timeout=timeout,
+        proc, windows_job = await _start_install_process(command_argv)
+        return_code, tree_terminated = await _wait_for_install_process(
+            proc,
+            output_lines=output_lines,
+            log_file=log_file,
+            progress=progress,
+            wait_seconds=timeout,
+            windows_job=windows_job,
         )
     except TimeoutError:
-        if proc is not None:
-            await _terminate_install_process(proc)
-        msg = f"Command timed out after {timeout}s: {cmd}"
+        msg = f"Command timed out after {timeout}s: {display_command}"
         if log_file is not None:
             with suppress(OSError):
                 log_file.write(f"{msg}\n")
-                log_file.close()
         await _emit_progress(progress, msg)
         logger.warning(msg)
         return False, msg
     except asyncio.CancelledError:
-        if proc is not None:
-            await _terminate_install_process(proc)
-        if log_file is not None:
-            with suppress(OSError):
-                log_file.close()
         raise
     except OSError as exc:
+        logger.warning(
+            "Failed to execute command: %s",
+            display_command,
+            exc_info=True,
+        )
+        return (
+            False,
+            f"Failed to execute: {display_command}\n{type(exc).__name__}: {exc}",
+        )
+    except BaseException:
+        raise
+    else:
+        if return_code == 0:
+            if windows_job is not None:
+                windows_job.close()
+        elif not tree_terminated:
+            await _terminate_install_process(
+                proc,
+                windows_job=windows_job,
+            )
+    finally:
         if log_file is not None:
             with suppress(OSError):
                 log_file.close()
-        logger.warning("Failed to execute command: %s", cmd, exc_info=True)
-        return False, f"Failed to execute: {cmd}\n{type(exc).__name__}: {exc}"
-
-    if log_file is not None:
-        with suppress(OSError):
-            log_file.close()
     output = "\n".join(output_lines).strip()
-    if proc.returncode == 0:
+    if return_code == 0:
         return True, output
     logger.warning(
         "Command exited with code %d: %s\n%s",
-        proc.returncode,
-        cmd,
+        return_code,
+        display_command,
         output,
     )
     return False, output
@@ -2016,9 +3090,12 @@ async def perform_upgrade(
         if not supported:
             return False, reason or _PRERELEASE_UNSUPPORTED_MESSAGE
 
-    # Skip brew if binary not on PATH (before touching temp files).
-    if method == "brew" and not shutil.which("brew"):
-        return False, "brew not found on PATH."
+    executable_name = "brew" if method == "brew" else "uv"
+    executable: str | None = None
+    if method == "brew":
+        executable = _resolve_trusted_path_executable(executable_name)
+        if executable is None:
+            return False, _trusted_executable_error(executable_name)
 
     prerelease_strategy = _UV_TARGETED_PRERELEASE_STRATEGY if targeted_pins else None
     constraints_staged = False
@@ -2040,7 +3117,7 @@ async def perform_upgrade(
                 from deepagents_code.extras_info import ExtrasIntrospectionError
 
                 try:
-                    cmd = upgrade_install_command(
+                    command_argv = _upgrade_install_argv(
                         include_prereleases=resolved_include_prereleases,
                         version=pin_target_version,
                         constraints_path=constraints_path,
@@ -2058,27 +3135,33 @@ async def perform_upgrade(
                         exc,
                     )
                     fell_back_to_bare_command = True
-                    cmd = upgrade_command(
-                        method,
-                        include_prereleases=resolved_include_prereleases,
-                        version=pin_target_version,
+                    fallback_argv = list(
+                        _upgrade_command_argv(
+                            method,
+                            include_prereleases=resolved_include_prereleases,
+                            version=pin_target_version,
+                        )
                     )
                     # The bare display command has no constraints knob, so add
                     # the targeted flags here too — the fallback must not revert
                     # to a global `--prerelease allow`.
-                    cmd = _append_uv_prerelease_flags(
-                        cmd,
+                    _append_uv_prerelease_args(
+                        fallback_argv,
                         constraints_path=constraints_path,
                         prerelease_strategy=prerelease_strategy,
                     )
+                    command_argv = tuple(fallback_argv)
             else:
-                cmd = upgrade_command(
+                command_argv = _upgrade_command_argv(
                     method,
                     include_prereleases=resolved_include_prereleases,
                 )
 
             success, output = await _run_install_subprocess(
-                cmd, progress=progress, log_path=log_path
+                command_argv,
+                progress=progress,
+                log_path=log_path,
+                executable=(executable if command_argv[0] == executable_name else None),
             )
     except OSError as exc:
         if constraints_staged:
@@ -2149,13 +3232,14 @@ async def perform_dependency_refresh(
     supported, reason = dependency_refresh_supported()
     if not supported:
         return False, reason or ""
-    if not shutil.which("uv"):
-        return False, "`uv` not found on PATH."
+    executable = _resolve_trusted_path_executable("uv")
+    if executable is None:
+        return False, _trusted_executable_error("uv")
 
     from deepagents_code.extras_info import ExtrasIntrospectionError
 
     try:
-        cmd = dependency_refresh_command(
+        command_argv = _dependency_refresh_argv(
             include_prereleases=include_prereleases,
         )
     except (
@@ -2164,7 +3248,12 @@ async def perform_dependency_refresh(
         ValueError,
     ) as exc:
         return False, f"{type(exc).__name__}: {exc}"
-    return await _run_install_subprocess(cmd, progress=progress, log_path=log_path)
+    return await _run_install_subprocess(
+        command_argv,
+        progress=progress,
+        log_path=log_path,
+        executable=executable if command_argv[0] == "uv" else None,
+    )
 
 
 async def perform_dependency_refresh_dry_run(
@@ -2193,13 +3282,14 @@ async def perform_dependency_refresh_dry_run(
     supported, reason = dependency_refresh_supported()
     if not supported:
         return False, reason or ""
-    if not shutil.which("uv"):
-        return False, "`uv` not found on PATH."
+    executable = _resolve_trusted_path_executable("uv")
+    if executable is None:
+        return False, _trusted_executable_error("uv")
 
     from deepagents_code.extras_info import ExtrasIntrospectionError
 
     try:
-        cmd = dependency_refresh_dry_run_command(
+        command_argv = _dependency_refresh_dry_run_argv(
             include_prereleases=include_prereleases,
         )
     except (
@@ -2208,7 +3298,12 @@ async def perform_dependency_refresh_dry_run(
         ValueError,
     ) as exc:
         return False, f"{type(exc).__name__}: {exc}"
-    return await _run_install_subprocess(cmd, progress=progress, log_path=log_path)
+    return await _run_install_subprocess(
+        command_argv,
+        progress=progress,
+        log_path=log_path,
+        executable=executable if command_argv[0] == "uv" else None,
+    )
 
 
 class DependencyChange(NamedTuple):
@@ -2496,7 +3591,7 @@ def _dcode_extras_requirement(
     extras survive a `uv tool install` reinstall — a bare `deepagents-code`
     request would replace the tool and drop them. Returns plain
     `deepagents-code` when no extras or version are selected; otherwise the
-    shell-quoted requirement form, which keeps zsh from globbing brackets.
+    requirement form. Display callers quote the returned token for their shell.
 
     Args:
         extras: Extra names to encode. Each is validated against PEP 508
@@ -2507,8 +3602,8 @@ def _dcode_extras_requirement(
         version: Optional exact `deepagents-code` version pin.
 
     Returns:
-        Shell-safe requirement token, e.g. `deepagents-code` or
-            `'deepagents-code[baseten,nvidia]==1.0.0'`.
+        Requirement token, e.g. `deepagents-code` or
+            `deepagents-code[baseten,nvidia]==1.0.0`.
 
     Raises:
         ValueError: If any extra fails PEP 508 validation.
@@ -2530,13 +3625,10 @@ def _dcode_extras_requirement(
             raise ValueError(msg) from exc
         version_suffix = f"=={parsed}"
     extras_part = f"[{','.join(names)}]" if names else ""
-    requirement = f"deepagents-code{extras_part}{version_suffix}"
-    if not names and version is None:
-        return requirement
-    return shlex.quote(requirement)
+    return f"deepagents-code{extras_part}{version_suffix}"
 
 
-def _uv_tool_install_command(
+def _uv_tool_install_argv(
     *,
     version: str | None,
     include_prereleases: bool | None,
@@ -2546,8 +3638,8 @@ def _uv_tool_install_command(
     reinstall: bool = False,
     constraints_path: Path | None = None,
     prerelease_strategy: UvPrereleaseStrategy | None = None,
-) -> str:
-    """Return the receipt-preserving `uv tool install -U` command.
+) -> tuple[str, ...]:
+    """Return receipt-preserving `uv tool install -U` arguments.
 
     Args:
         version: Optional exact `deepagents-code` version pin.
@@ -2560,8 +3652,7 @@ def _uv_tool_install_command(
         with_packages_to_add: Package names to merge with the receipt's existing
             `--with` packages. Names already present (compared canonically) are
             not duplicated; genuinely new names are appended after the preserved
-            ones. Callers must validate these names before passing them — the
-            builder only `shlex.quote`-s them.
+            ones. Callers must validate these names before passing them.
         reinstall: When `True`, add `--reinstall` so uv rebuilds the tool
             environment from scratch instead of patching it in place. An
             in-place `-U` upgrade can leave stale files behind (e.g. an old
@@ -2604,11 +3695,14 @@ def _uv_tool_install_command(
             raise
         msg = f"Distribution metadata yielded an invalid extra name: {exc}"
         raise ExtrasIntrospectionError(msg) from exc
-    cmd = "uv tool install --reinstall -U" if reinstall else "uv tool install -U"
+    argv = ["uv", "--no-config", "tool", "install"]
+    if reinstall:
+        argv.append("--reinstall")
+    argv.append("-U")
     python = _uv_tool_python()
     if python is not None:
-        cmd += f" --python {shlex.quote(python)}"
-    cmd += f" {requirement}"
+        argv.extend(("--python", python))
+    argv.append(requirement)
     with_packages = list(_uv_tool_with_packages(distribution_name=distribution_name))
     known = {canonicalize_name(package) for package in with_packages}
     for package in with_packages_to_add:
@@ -2616,40 +3710,61 @@ def _uv_tool_install_command(
             with_packages.append(package)
             known.add(canonicalize_name(package))
     for package in with_packages:
-        cmd += f" --with {shlex.quote(package)}"
+        argv.extend(("--with", package))
     if constraints_path is not None or prerelease_strategy is not None:
-        return _append_uv_prerelease_flags(
-            cmd,
+        _append_uv_prerelease_args(
+            argv,
             constraints_path=constraints_path,
             prerelease_strategy=prerelease_strategy,
         )
-    if _resolve_include_prereleases(include_prereleases):
-        cmd += " --prerelease allow"
-    return cmd
+    elif _resolve_include_prereleases(include_prereleases):
+        argv.extend(("--prerelease", "allow"))
+    return tuple(argv)
 
 
-def _append_uv_prerelease_flags(
-    cmd: str,
+def _uv_tool_install_command(
+    *,
+    version: str | None,
+    include_prereleases: bool | None,
+    distribution_name: str,
+    extras_to_add: Iterable[str] = (),
+    with_packages_to_add: Iterable[str] = (),
+    reinstall: bool = False,
+    constraints_path: Path | None = None,
+    prerelease_strategy: UvPrereleaseStrategy | None = None,
+) -> str:
+    """Return the display form of receipt-preserving uv install arguments."""
+    return _format_command(
+        _uv_tool_install_argv(
+            version=version,
+            include_prereleases=include_prereleases,
+            distribution_name=distribution_name,
+            extras_to_add=extras_to_add,
+            with_packages_to_add=with_packages_to_add,
+            reinstall=reinstall,
+            constraints_path=constraints_path,
+            prerelease_strategy=prerelease_strategy,
+        )
+    )
+
+
+def _append_uv_prerelease_args(
+    argv: list[str],
     *,
     constraints_path: Path | None,
     prerelease_strategy: UvPrereleaseStrategy | None,
-) -> str:
-    """Append targeted `--constraints`/`--prerelease` flags to a uv command.
+) -> None:
+    """Append targeted `--constraints` and `--prerelease` arguments.
 
     Shared by the receipt-aware builder and `perform_upgrade`'s bare-command
     fallback so both emit the scoped pre-release form identically: a constraints
     file pinning the exact pre-release dependency plus a non-`allow` strategy
-    (e.g. `if-necessary-or-explicit`). The constraints path is `shlex.quote`-d;
-    the strategy is a fixed internal literal.
-
-    Returns:
-        `cmd` with any `--constraints`/`--prerelease` flags appended.
+    (e.g. `if-necessary-or-explicit`). The strategy is a fixed internal literal.
     """
     if constraints_path is not None:
-        cmd += f" --constraints {shlex.quote(str(constraints_path))}"
+        argv.extend(("--constraints", str(constraints_path)))
     if prerelease_strategy is not None:
-        cmd += f" --prerelease {prerelease_strategy}"
-    return cmd
+        argv.extend(("--prerelease", prerelease_strategy))
 
 
 @contextmanager
@@ -2705,6 +3820,24 @@ def _prerelease_constraints_file(pins: Sequence[str]) -> Iterator[Path | None]:
             )
 
 
+def _upgrade_install_argv(
+    *,
+    include_prereleases: bool | None = None,
+    distribution_name: str = "deepagents-code",
+    version: str | None = None,
+    constraints_path: Path | None = None,
+    prerelease_strategy: UvPrereleaseStrategy | None = None,
+) -> tuple[str, ...]:
+    """Return uv arguments that upgrade dcode while clearing stale pins."""
+    return _uv_tool_install_argv(
+        version=version,
+        include_prereleases=include_prereleases,
+        distribution_name=distribution_name,
+        constraints_path=constraints_path,
+        prerelease_strategy=prerelease_strategy,
+    )
+
+
 def upgrade_install_command(
     *,
     include_prereleases: bool | None = None,
@@ -2713,7 +3846,7 @@ def upgrade_install_command(
     constraints_path: Path | None = None,
     prerelease_strategy: UvPrereleaseStrategy | None = None,
 ) -> str:
-    """Return the uv command that upgrades dcode while clearing stale pins.
+    """Return the display command that upgrades dcode while clearing stale pins.
 
     Built specifically to avoid the `uv tool upgrade` receipt-pin trap: when
     the tool was originally installed via `uv tool install deepagents-code==X.Y.Z`
@@ -2742,7 +3875,7 @@ def upgrade_install_command(
             pre-release instead of a global `allow`.
 
     Returns:
-        Shell command string suitable for execution via the shell.
+        Platform-formatted command string matching the structured update argv.
 
     Propagates `ExtrasIntrospectionError` if installed extras cannot be
     determined safely from distribution metadata, or a metadata-sourced extra name
@@ -2752,12 +3885,28 @@ def upgrade_install_command(
     failures or fall back to a simpler unpinned upgrade command with a
     user-facing warning.
     """
-    return _uv_tool_install_command(
+    return _format_command(
+        _upgrade_install_argv(
+            include_prereleases=include_prereleases,
+            distribution_name=distribution_name,
+            version=version,
+            constraints_path=constraints_path,
+            prerelease_strategy=prerelease_strategy,
+        )
+    )
+
+
+def _dependency_refresh_argv(
+    *,
+    version: str = __version__,
+    include_prereleases: bool | None = None,
+    distribution_name: str = "deepagents-code",
+) -> tuple[str, ...]:
+    """Return uv arguments that refresh dependencies for this dcode version."""
+    return _uv_tool_install_argv(
         version=version,
         include_prereleases=include_prereleases,
         distribution_name=distribution_name,
-        constraints_path=constraints_path,
-        prerelease_strategy=prerelease_strategy,
     )
 
 
@@ -2767,7 +3916,7 @@ def dependency_refresh_command(
     include_prereleases: bool | None = None,
     distribution_name: str = "deepagents-code",
 ) -> str:
-    """Return the uv command that refreshes deps for the current dcode version.
+    """Return the display command that refreshes deps for this dcode version.
 
     Args:
         version: Exact `deepagents-code` version to keep installed.
@@ -2777,7 +3926,7 @@ def dependency_refresh_command(
             already-installed extras.
 
     Returns:
-        Shell command string suitable for execution via the shell.
+        Platform-formatted command string matching the structured update argv.
 
     Propagates `ExtrasIntrospectionError` if installed extras cannot be
     determined safely from distribution metadata, or a metadata-sourced extra name
@@ -2786,11 +3935,51 @@ def dependency_refresh_command(
     tool receipt. `perform_dependency_refresh` converts both into a user-facing
     failure.
     """
-    return _uv_tool_install_command(
-        version=version,
-        include_prereleases=include_prereleases,
-        distribution_name=distribution_name,
+    return _format_command(
+        _dependency_refresh_argv(
+            version=version,
+            include_prereleases=include_prereleases,
+            distribution_name=distribution_name,
+        )
     )
+
+
+def _dependency_refresh_dry_run_argv(
+    *,
+    version: str = __version__,
+    include_prereleases: bool | None = None,
+    distribution_name: str = "deepagents-code",
+    python: str | None = None,
+) -> tuple[str, ...]:
+    """Return uv arguments that plan a dependency refresh.
+
+    Raises:
+        ToolRequirementIntrospectionError: If the target Python cannot be
+            determined.
+    """
+    from deepagents_code.extras_info import installed_extra_names
+
+    target_python = python or sys.executable
+    if not target_python:
+        msg = "Could not determine the running Python executable"
+        raise ToolRequirementIntrospectionError(msg)
+    extras = installed_extra_names(distribution_name, strict=True)
+    requirement = _dcode_extras_requirement(extras, version=version)
+    argv = [
+        "uv",
+        "--no-config",
+        "pip",
+        "install",
+        "--dry-run",
+        "--python",
+        target_python,
+        "-U",
+        requirement,
+    ]
+    argv.extend(_uv_tool_with_packages(distribution_name=distribution_name))
+    if _resolve_include_prereleases(include_prereleases):
+        argv.extend(("--prerelease", "allow"))
+    return tuple(argv)
 
 
 def dependency_refresh_dry_run_command(
@@ -2800,7 +3989,7 @@ def dependency_refresh_dry_run_command(
     distribution_name: str = "deepagents-code",
     python: str | None = None,
 ) -> str:
-    """Return the uv command that plans a dependency refresh without installing.
+    """Return the display command that plans a dependency refresh.
 
     Args:
         version: Exact `deepagents-code` version to keep installed.
@@ -2812,30 +4001,44 @@ def dependency_refresh_dry_run_command(
             running interpreter, which is the current dcode tool environment.
 
     Returns:
-        Shell command string suitable for execution via the shell.
+        Platform-formatted command string matching the structured update argv.
+
+    Propagates `ToolRequirementIntrospectionError` if the target Python or uv
+    tool receipt requirements cannot be determined safely.
+    """
+    return _format_command(
+        _dependency_refresh_dry_run_argv(
+            version=version,
+            include_prereleases=include_prereleases,
+            distribution_name=distribution_name,
+            python=python,
+        )
+    )
+
+
+def _install_package_argv(
+    package: str,
+    *,
+    distribution_name: str = "deepagents-code",
+) -> tuple[str, ...]:
+    """Return uv arguments that add a package to the dcode tool environment.
 
     Raises:
-        ToolRequirementIntrospectionError: If the target Python or uv tool receipt
-            requirements cannot be determined safely.
+        ValueError: If `package` fails PEP 508 validation.
     """
-    from deepagents_code.extras_info import installed_extra_names
-
-    target_python = python or sys.executable
-    if not target_python:
-        msg = "Could not determine the running Python executable"
-        raise ToolRequirementIntrospectionError(msg)
-    extras = installed_extra_names(distribution_name, strict=True)
-    requirement = _dcode_extras_requirement(extras, version=version)
-    cmd = (
-        "uv pip install --dry-run --python "
-        f"{shlex.quote(target_python)} -U {requirement}"
+    if not _PACKAGE_NAME_RE.fullmatch(package):
+        msg = (
+            f"Invalid package name {package!r}: must match PEP 508 "
+            f"({_PACKAGE_NAME_RE.pattern})"
+        )
+        raise ValueError(msg)
+    return _uv_tool_install_argv(
+        version=__version__,
+        include_prereleases=True,
+        distribution_name=distribution_name,
+        with_packages_to_add=(package,),
+        reinstall=True,
     )
-    with_packages = _uv_tool_with_packages(distribution_name=distribution_name)
-    for package in with_packages:
-        cmd += f" {shlex.quote(package)}"
-    if _resolve_include_prereleases(include_prereleases):
-        cmd += " --prerelease allow"
-    return cmd
 
 
 def install_package_command(
@@ -2843,14 +4046,12 @@ def install_package_command(
     *,
     distribution_name: str = "deepagents-code",
 ) -> str:
-    """Return the shell command that adds a package to the dcode tool env.
+    """Return the display command that adds a package to the dcode tool env.
 
-    The result is built for *execution* (via `perform_install_package`), not for
-    display — surfacing raw `uv tool` invocations to the user is intentionally
-    avoided. `package` is validated here against PEP 508 grammar and then
-    `shlex.quote`-d by the shared builder: the validation already blocks shell
-    metacharacters, so the quoting is defense in depth that keeps the command
-    safe even if the pattern is later loosened.
+    The result mirrors the structured arguments used by
+    `perform_install_package`; surfacing raw `uv tool` invocations to the user
+    is intentionally avoided. `package` is validated here against PEP 508
+    grammar before it becomes an argument.
 
     Delegates to `_uv_tool_install_command` (the same builder the extras path
     uses), passing the new package as a `--with` requirement. That builder folds
@@ -2873,29 +4074,20 @@ def install_package_command(
             already-installed extras and uv receipt requirements.
 
     Returns:
-        Shell command string suitable for execution via the shell.
+        Platform-formatted command string matching the structured update argv.
 
-    Raises:
-        ValueError: If `package` fails PEP 508 validation.
-
-    Propagates `ExtrasIntrospectionError` if installed extras cannot be
+    Propagates `ValueError` if `package` fails PEP 508 validation,
+    `ExtrasIntrospectionError` if installed extras cannot be
     determined safely from distribution metadata (or a metadata-sourced extra
     name fails PEP 508 validation), and `ToolRequirementIntrospectionError` if
     the uv tool receipt's interpreter or `--with` packages cannot be determined
     safely.
     """
-    if not _PACKAGE_NAME_RE.fullmatch(package):
-        msg = (
-            f"Invalid package name {package!r}: must match PEP 508 "
-            f"({_PACKAGE_NAME_RE.pattern})"
+    return _format_command(
+        _install_package_argv(
+            package,
+            distribution_name=distribution_name,
         )
-        raise ValueError(msg)
-    return _uv_tool_install_command(
-        version=__version__,
-        include_prereleases=True,
-        distribution_name=distribution_name,
-        with_packages_to_add=(package,),
-        reinstall=True,
     )
 
 
@@ -2983,12 +4175,37 @@ def install_extra_recovery_command(extra: str) -> str:
     return install_extra_command(extra)
 
 
+def _install_extra_uv_tool_argv(
+    extra: str,
+    *,
+    distribution_name: str = "deepagents-code",
+) -> tuple[str, ...]:
+    """Return receipt-preserving uv arguments that install one dcode extra.
+
+    Raises:
+        ValueError: If `extra` fails PEP 508 validation.
+    """
+    if not is_valid_extra_name(extra):
+        msg = (
+            f"Invalid extra name {extra!r}: must match PEP 508 "
+            f"({_EXTRA_NAME_RE.pattern})"
+        )
+        raise ValueError(msg)
+    return _uv_tool_install_argv(
+        version=__version__,
+        include_prereleases=True,
+        distribution_name=distribution_name,
+        extras_to_add=(extra,),
+        reinstall=True,
+    )
+
+
 def _install_extra_uv_tool_command(
     extra: str,
     *,
     distribution_name: str = "deepagents-code",
 ) -> str:
-    """Return the receipt-preserving uv command that installs one dcode extra.
+    """Return the display command that installs one dcode extra.
 
     Pins the running `deepagents-code` version and allows prerelease dependency
     resolution so adding an extra cannot make uv backtrack to an older app release.
@@ -3002,26 +4219,17 @@ def _install_extra_uv_tool_command(
         distribution_name: Name of the installed distribution to inspect for
             already-installed extras and uv receipt requirements.
 
-    Raises:
-        ValueError: If `extra` fails PEP 508 validation.
-
-    Propagates `ExtrasIntrospectionError` if installed extras cannot be
+    Propagates `ValueError` if `extra` fails PEP 508 validation,
+    `ExtrasIntrospectionError` if installed extras cannot be
     determined safely from distribution metadata, and
     `ToolRequirementIntrospectionError` if the uv tool receipt's interpreter or
     `--with` packages cannot be preserved safely.
     """
-    if not is_valid_extra_name(extra):
-        msg = (
-            f"Invalid extra name {extra!r}: must match PEP 508 "
-            f"({_EXTRA_NAME_RE.pattern})"
+    return _format_command(
+        _install_extra_uv_tool_argv(
+            extra,
+            distribution_name=distribution_name,
         )
-        raise ValueError(msg)
-    return _uv_tool_install_command(
-        version=__version__,
-        include_prereleases=True,
-        distribution_name=distribution_name,
-        extras_to_add=(extra,),
-        reinstall=True,
     )
 
 
@@ -3106,23 +4314,29 @@ async def perform_install_extra(
             "install with extras."
         )
 
-    if not shutil.which("uv"):
+    executable = _resolve_trusted_path_executable("uv")
+    if executable is None:
         return False, (
-            "`uv` not found on PATH. Reinstall dcode following the docs, or "
-            "install uv (https://docs.astral.sh/uv/) so extras can be added."
+            f"{_trusted_executable_error('uv')} Reinstall dcode following the "
+            "docs so extras can be added."
         )
 
     from deepagents_code.extras_info import ExtrasIntrospectionError
 
     try:
-        cmd = _install_extra_uv_tool_command(extra)
+        command_argv = _install_extra_uv_tool_argv(extra)
     except (
         ExtrasIntrospectionError,
         ToolRequirementIntrospectionError,
         ValueError,
     ) as exc:
         return False, f"{type(exc).__name__}: {exc}"
-    return await _run_install_subprocess(cmd, progress=progress, log_path=log_path)
+    return await _run_install_subprocess(
+        command_argv,
+        progress=progress,
+        log_path=log_path,
+        executable=executable if command_argv[0] == "uv" else None,
+    )
 
 
 async def perform_install_package(
@@ -3181,17 +4395,17 @@ async def perform_install_package(
             "adding packages."
         )
 
-    if not shutil.which("uv"):
+    executable = _resolve_trusted_path_executable("uv")
+    if executable is None:
         return False, (
-            "Package installs require uv, which was not found. Reinstall "
-            "dcode following the installation docs so packages can be "
-            "added."
+            f"{_trusted_executable_error('uv')} Reinstall dcode following the "
+            "installation docs so packages can be added."
         )
 
     from deepagents_code.extras_info import ExtrasIntrospectionError
 
     try:
-        cmd = install_package_command(package)
+        command_argv = _install_package_argv(package)
     except ValueError as exc:
         return False, f"{type(exc).__name__}: {exc}"
     except (ExtrasIntrospectionError, ToolRequirementIntrospectionError) as exc:
@@ -3206,7 +4420,12 @@ async def perform_install_package(
             exc_info=True,
         )
         return False, f"{type(exc).__name__}: {exc}"
-    return await _run_install_subprocess(cmd, progress=progress, log_path=log_path)
+    return await _run_install_subprocess(
+        command_argv,
+        progress=progress,
+        log_path=log_path,
+        executable=executable if command_argv[0] == "uv" else None,
+    )
 
 
 # ---------------------------------------------------------------------------

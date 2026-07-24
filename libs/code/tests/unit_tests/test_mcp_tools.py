@@ -4490,7 +4490,7 @@ class TestSelectiveProjectMcpTrust:
 
         entries = [
             "{ "
-            f'project_root = "{project_root}", '
+            f"project_root = {json.dumps(str(project_root))}, "
             f'name = "{name}", '
             f'fingerprint = "{fingerprint_mcp_server_config(servers[name])}"'
             " }"
@@ -4524,6 +4524,7 @@ class TestSelectiveProjectMcpTrust:
         home = project_root.parent / "home"
         (home / ".deepagents").mkdir(parents=True, exist_ok=True)
         monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
         monkeypatch.setattr(
             "deepagents_code.model_config.DEFAULT_CONFIG_PATH", user_config
         )
@@ -4919,7 +4920,8 @@ class TestSelectiveProjectMcpTrust:
         user_config.write_text(
             "[mcp]\n"
             "enabled_project_server_approvals = [\n"
-            f'  {{ project_root = "{project}", name = "docs" }},\n'
+            f"  {{ project_root = {json.dumps(str(project))}, name = "
+            '"docs" },\n'
             "]\n"
         )
 

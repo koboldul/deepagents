@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from deepagents_code.mcp_tools import MCPServerInfo
     from deepagents_code.output import OutputFormat
     from deepagents_code.plugins.adapters.skills import CodeSkillSource
+    from deepagents_code.project_utils import ProjectContext
 
 from langchain.agents.middleware import (
     HumanInTheLoopMiddleware,
@@ -93,7 +94,6 @@ from deepagents_code.offload import (
 )
 from deepagents_code.offload_middleware import _create_cli_compaction_middleware
 from deepagents_code.plugins.adapters.skills_middleware import PluginSkillsMiddleware
-from deepagents_code.project_utils import ProjectContext, get_server_project_context
 from deepagents_code.reliable_rubric import ReliableRubricMiddleware
 from deepagents_code.subagents import list_subagents
 from deepagents_code.unicode_security import (
@@ -106,6 +106,12 @@ from deepagents_code.unicode_security import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _use_virtual_local_paths() -> bool:
+    """Return whether local file tools need Windows virtual-root semantics."""
+    return os.name == "nt"
+
 
 _MEMORY_READONLY_SYSTEM_PROMPT = (
     "<agent_memory>\n"
@@ -959,10 +965,12 @@ def get_system_prompt(
         ```
     """
     prompt_dir = Path(__file__).parent
-    template = (prompt_dir / "system_prompt.md").read_text()
+    template = (prompt_dir / "system_prompt.md").read_text(encoding="utf-8")
     todo_list_section = ""
     if not is_env_truthy(EXPERIMENTAL):
-        todo_list_section = (prompt_dir / "todo_list_prompt.md").read_text().rstrip()
+        todo_list_section = (
+            (prompt_dir / "todo_list_prompt.md").read_text(encoding="utf-8").rstrip()
+        )
 
     skills_path = f"~/.deepagents/{assistant_id}/skills"
 
@@ -1058,17 +1066,38 @@ def get_system_prompt(
                 )
                 resolved_cwd = Path()
         cwd = resolved_cwd
-        working_dir_section = (
-            f"### Current Working Directory\n\n"
-            f"The filesystem backend is currently operating in: `{cwd}`\n\n"
-            f"### File System and Paths\n\n"
-            f"**IMPORTANT - Path Handling:**\n"
-            f"- All file paths must be absolute paths (e.g., `{cwd}/file.txt`)\n"
-            f"- Use the working directory to construct absolute paths\n"
-            f"- Example: To create a file in your working directory, "
-            f"use `{cwd}/research_project/file.md`\n"
-            f"- Never use relative paths - always construct full absolute paths\n\n"
-        )
+        if _use_virtual_local_paths():
+            host_example = cwd / "research_project" / "file.md"
+            working_dir_section = (
+                f"### Current Working Directory\n\n"
+                f"The local project directory is: `{cwd}`\n\n"
+                f"### File System and Paths\n\n"
+                f"**IMPORTANT - Path Handling:**\n"
+                f"- File tools use virtual POSIX paths rooted at `/`\n"
+                f"- `/research_project/file.md` maps to `{host_example}`\n"
+                f"- Never pass host project paths, including drive-qualified Windows "
+                f"paths, to file tools\n"
+                f"- The only host-path exception is an exact routed artifact path "
+                f"returned by a tool (for example, "
+                f"`//?/C:/.../large_tool_results/...`); pass that exact path unchanged "
+                f"to a file tool only for subsequent reads\n"
+                f"- The `execute` tool uses host paths and runs in the host shell "
+                f"with `{cwd}` as its working directory\n"
+                f"- Use shell-native relative paths for project files in `execute` "
+                f"commands\n\n"
+            )
+        else:
+            working_dir_section = (
+                f"### Current Working Directory\n\n"
+                f"The filesystem backend is currently operating in: `{cwd}`\n\n"
+                f"### File System and Paths\n\n"
+                f"**IMPORTANT - Path Handling:**\n"
+                f"- All file paths must be absolute paths (e.g., `{cwd}/file.txt`)\n"
+                f"- Use the working directory to construct absolute paths\n"
+                f"- Example: To create a file in your working directory, "
+                f"use `{cwd}/research_project/file.md`\n"
+                f"- Never use relative paths - always construct full absolute paths\n\n"
+            )
 
     result = (
         template.replace("{mode_description}", mode_description)
@@ -1090,19 +1119,14 @@ def get_system_prompt(
 
 
 def _format_write_file_description(
-    tool_call: ToolCall, _state: AgentState[Any], _runtime: Runtime[Any]
+    _tool_call: ToolCall, _state: AgentState[Any], _runtime: Runtime[Any]
 ) -> str:
     """Format write_file tool call for approval prompt.
 
     Returns:
         Formatted description string for the write_file tool call.
     """
-    args = tool_call["args"]
-    file_path = args.get("file_path", "unknown")
-
-    action = "Overwrite" if Path(file_path).exists() else "Create"
-
-    return f"Action: {action} file"
+    return "Action: Create or overwrite file"
 
 
 def _format_edit_file_description(
@@ -1216,7 +1240,11 @@ def _format_task_description(
 
 
 def _format_execute_description(
-    tool_call: ToolCall, _state: AgentState[Any], _runtime: Runtime[Any]
+    tool_call: ToolCall,
+    _state: AgentState[Any],
+    _runtime: Runtime[Any],
+    *,
+    working_directory: str | Path = ".",
 ) -> str:
     """Format execute tool call for approval prompt.
 
@@ -1226,13 +1254,10 @@ def _format_execute_description(
     args = tool_call["args"]
     command_raw = str(args.get("command", "N/A"))
     command = strip_dangerous_unicode(command_raw)
-    project_context = get_server_project_context()
-    effective_cwd = (
-        str(project_context.user_cwd)
-        if project_context is not None
-        else str(Path.cwd())
-    )
-    lines = [f"Execute Command: {command}", f"Working Directory: {effective_cwd}"]
+    lines = [
+        f"Execute Command: {command}",
+        f"Working Directory: {working_directory}",
+    ]
 
     issues = detect_dangerous_unicode(command_raw)
     if issues:
@@ -1498,9 +1523,8 @@ class AsyncApprovalHITLMiddleware(HumanInTheLoopMiddleware[Any, Any, Any]):
         """Warn and fail closed if driven synchronously.
 
         This middleware exists to read the live mode from an async Store. A
-        synchronous run never resolves an autonomous mode (the sync Store read
-        is rejected on the event loop and fails closed to Manual), so surface it
-        loudly rather than letting a wiring change silently over-gate.
+        synchronous run must not read that Store, so it injects a trusted Manual
+        routing decision before stock HITL evaluates any gated calls.
 
         Args:
             state: Agent state after the model response has been appended.
@@ -1513,7 +1537,11 @@ class AsyncApprovalHITLMiddleware(HumanInTheLoopMiddleware[Any, Any, Any]):
             "AsyncApprovalHITLMiddleware ran synchronously; live autonomous "
             "modes will not take effect and gated calls fall back to Manual"
         )
-        return super().after_model(state, runtime)
+        routed_state = dict(state)
+        routed_state[_ASYNC_APPROVAL_ROUTING_KEY] = _RoutingDecision(
+            ApprovalMode.MANUAL
+        )
+        return super().after_model(cast("AgentState[Any]", routed_state), runtime)
 
 
 def _interrupt_predicate(
@@ -1538,6 +1566,7 @@ def _add_interrupt_on(
     *,
     mcp_tools: Sequence[BaseTool] = (),
     auto_mode_enabled: bool = True,
+    working_directory: str | Path = ".",
 ) -> dict[str, InterruptOnConfig]:
     """Configure human-in-the-loop interrupt settings for all gated tools.
 
@@ -1554,6 +1583,7 @@ def _add_interrupt_on(
         mcp_tools: Exact MCP tools to extend the static interrupt map with.
         auto_mode_enabled: Whether `auto` bypasses stock HITL for delegated
             subagents. Ineligible runtimes treat `auto` as Manual.
+        working_directory: Working directory displayed for `execute` approvals.
 
     Returns:
         Dictionary mapping tool names to their interrupt configuration.
@@ -1563,9 +1593,13 @@ def _add_interrupt_on(
         if auto_mode_enabled
         else _interrupt_predicate(auto_mode_enabled=False)
     )
+    execute_description = functools.partial(
+        _format_execute_description,
+        working_directory=working_directory,
+    )
     execute_interrupt_config: InterruptOnConfig = {
         "allowed_decisions": ["approve", "reject"],
-        "description": _format_execute_description,  # ty: ignore[invalid-argument-type]  # Callable description narrower than TypedDict expects
+        "description": execute_description,  # ty: ignore[invalid-argument-type]  # Callable description narrower than TypedDict expects
         "when": when,
     }
 
@@ -1821,6 +1855,7 @@ def create_cli_agent(
             - `composite_backend`: `CompositeBackend` for file operations
 
     Raises:
+        RuntimeError: If local mode is entered without an effective cwd.
         ValueError: When `enable_interpreter=True` is paired with a
             non-`None` `sandbox`, when `settings.interpreter_ptc` contains
             unknown tool names, or when `interpreter_ptc="all"` is used
@@ -1845,6 +1880,14 @@ def create_cli_agent(
         if cwd is not None
         else (project_context.user_cwd if project_context is not None else None)
     )
+    if sandbox is None:
+        if effective_cwd is None:
+            effective_cwd = Path.cwd()
+        approval_working_directory: str | Path = effective_cwd
+    else:
+        approval_working_directory = (
+            get_default_working_dir(sandbox_type) if sandbox_type is not None else "/"
+        )
 
     # Setup agent directory for persistent memory (if enabled)
     if enable_memory or enable_skills:
@@ -1899,6 +1942,7 @@ def create_cli_agent(
         _add_interrupt_on(
             mcp_tools=mcp_tools,
             auto_mode_enabled=auto_mode_enabled,
+            working_directory=approval_working_directory,
         )
         if hitl_active
         else None
@@ -2108,9 +2152,14 @@ def create_cli_agent(
         )
 
     # CONDITIONAL SETUP: Local vs Remote Sandbox
+    use_virtual_project_root = sandbox is None and _use_virtual_local_paths()
+    shell_environment: dict[str, str] | None = None
     if sandbox is None:
         # ========== LOCAL MODE ==========
-        root_dir = effective_cwd if effective_cwd is not None else Path.cwd()
+        if effective_cwd is None:
+            msg = "Local mode requires an effective_cwd."
+            raise RuntimeError(msg)
+        root_dir = effective_cwd
         if enable_shell:
             # Create environment for shell commands.
             # Restore the user's original LANGSMITH_PROJECT so their code traces
@@ -2127,6 +2176,13 @@ def create_cli_agent(
             # Re-apply a launch-time PYTHONPATH that was stripped from the server
             # interpreter but relayed for approval-gated `execute` commands.
             _apply_inherited_pythonpath(shell_env)
+            if auto_mode_enabled:
+                from deepagents_code.auto_mode import (
+                    _harden_auto_shell_environment,
+                )
+
+                shell_env = _harden_auto_shell_environment(shell_env)
+            shell_environment = shell_env
 
             # Use LocalShellBackend for filesystem + shell execution.
             # The SDK's FilesystemMiddleware exposes per-command timeout
@@ -2139,13 +2195,16 @@ def create_cli_agent(
             # `LANGSMITH_API_KEY` and undo the restore, leaking it into `execute`.
             backend = LocalShellBackend(
                 root_dir=root_dir,
-                virtual_mode=False,
+                virtual_mode=use_virtual_project_root,
                 inherit_env=False,
                 env=shell_env,
             )
         else:
             # No shell access - use plain FilesystemBackend
-            backend = FilesystemBackend(root_dir=root_dir, virtual_mode=False)
+            backend = FilesystemBackend(
+                root_dir=root_dir,
+                virtual_mode=use_virtual_project_root,
+            )
     else:
         # ========== REMOTE SANDBOX MODE ==========
         backend = sandbox  # Remote sandbox (ModalSandbox, etc.)
@@ -2191,10 +2250,13 @@ def create_cli_agent(
             )
 
     # Local context middleware (git info, directory tree, etc.).
-    if isinstance(backend, (_ExecutableBackend, _AsyncExecutableBackend)):
+    if sandbox is None or isinstance(
+        backend, (_ExecutableBackend, _AsyncExecutableBackend)
+    ):
         agent_middleware.append(
             LocalContextMiddleware(
                 backend=backend,
+                local_root=effective_cwd if sandbox is None else None,
                 mcp_server_info=mcp_server_info,
                 tracing_project=get_langsmith_project_name(),
                 user_tracing_project=settings.user_langchain_project,
@@ -2238,24 +2300,24 @@ def create_cli_agent(
                 project_context.project_root
                 if project_context is not None
                 and project_context.project_root is not None
-                else effective_cwd or Path.cwd()
+                else cast("Path", effective_cwd)
             )
             agent_middleware.append(
                 AutoModeHITLMiddleware(
                     resolved_interrupt_on,
                     worktree_root=trusted_root,
+                    execution_cwd=effective_cwd,
+                    shell_environment=shell_environment,
                     shell_allow_list=narrow_allow_list,
                 )
             )
 
     # Set up composite backend with routing.
     if sandbox is None:
-        # Local mode normally lets large results fall through to the default
-        # backend at the real, hardened `artifacts_root`, so filesystem tools and
-        # `execute` receive the same host path. If that predictable directory is
-        # unusable, `_artifacts_root` supplies a stable virtual root plus private
-        # temporary storage, and `large_tool_results` is routed there explicitly.
-        # Conversation history always has a dedicated route to persistent storage.
+        # Large results and conversation history use dedicated routes outside the
+        # project backend. If the predictable artifacts directory is unusable,
+        # `_artifacts_root` supplies a stable virtual prefix plus private temporary
+        # storage for the large-results route.
         # The fallback alias remains installed even after the predictable directory
         # recovers, so archive paths saved during fallback stay resolvable.
         artifacts_storage = _artifacts_root()
@@ -2269,13 +2331,13 @@ def create_cli_agent(
             f"{artifacts_root}/conversation_history/": conversation_history_backend,
             fallback_history_root: conversation_history_backend,
         }
-        if artifacts_storage.large_results_dir is not None:
-            artifact_routes[f"{artifacts_root}/large_tool_results/"] = (
-                FilesystemBackend(
-                    root_dir=artifacts_storage.large_results_dir,
-                    virtual_mode=True,
-                )
-            )
+        large_results_dir = artifacts_storage.large_results_dir
+        if large_results_dir is None:
+            large_results_dir = Path(artifacts_root) / "large_tool_results"
+        artifact_routes[f"{artifacts_root}/large_tool_results/"] = FilesystemBackend(
+            root_dir=large_results_dir,
+            virtual_mode=True,
+        )
         composite_backend = CompositeBackend(
             default=backend,
             routes=artifact_routes,

@@ -12,6 +12,7 @@ from pathlib import Path, PurePath
 logger = logging.getLogger(__name__)
 
 _FALLBACK_ARTIFACTS_ROOT = "/dcode-artifacts-fallback"
+_NATIVE_WINDOWS = os.name == "nt"
 
 
 @dataclass(frozen=True)
@@ -110,24 +111,39 @@ def _probe_writable(path: Path) -> None:
         pass
 
 
+def _temporary_user_suffix() -> str:
+    """Return the best available per-user suffix for temporary storage."""
+    getuid = getattr(os, "getuid", None)
+    return str(getuid()) if getuid is not None else str(os.getpid())
+
+
+def _predictable_artifacts_root() -> Path:
+    """Return the stable per-user host directory for offloaded artifacts."""
+    if _NATIVE_WINDOWS:
+        from deepagents_code.model_config import DEFAULT_STATE_DIR
+
+        return DEFAULT_STATE_DIR / "artifacts"
+    return Path(tempfile.gettempdir()) / f"dcode-artifacts-{_temporary_user_suffix()}"
+
+
 def _artifacts_root() -> _ArtifactsStorage:
     """Return storage configuration for offloaded artifacts.
 
-    The normal path is a stable, hardened host directory that filesystem tools
-    and shell commands can use directly. If that predictable directory is
-    unusable, large results use a private unique directory behind a stable virtual
-    root. Keeping the virtual root stable lets conversation archive paths persisted
-    in thread state continue matching their dedicated route after a restart.
+    The normal path is a stable, hardened host directory that filesystem tools and
+    shell commands can use directly. Windows stores artifacts in the app-managed
+    per-user state directory so the path survives process restarts; POSIX retains
+    the existing UID-qualified temporary directory. If that predictable directory
+    is unusable, large results use a private unique directory behind a stable
+    virtual root. Keeping the virtual root stable lets conversation archive paths
+    persisted in thread state continue matching their dedicated route after a
+    restart.
 
     Returns:
         The agent-visible artifacts root and an optional directory to which large
         results must be routed.
     """
-    getuid = getattr(os, "getuid", None)
-    suffix = str(getuid()) if getuid is not None else str(os.getpid())
-    temp_root = Path(tempfile.gettempdir())
-    root = temp_root / f"dcode-artifacts-{suffix}"
     try:
+        root = _predictable_artifacts_root()
         _harden_dir(root)
         _probe_writable(root)
     except (OSError, RuntimeError):
@@ -136,6 +152,8 @@ def _artifacts_root() -> _ArtifactsStorage:
             "large results from a stable virtual prefix to private temporary storage",
             exc_info=True,
         )
+        temp_root = Path(tempfile.gettempdir())
+        suffix = _temporary_user_suffix()
         unique = Path(
             tempfile.mkdtemp(prefix=f"dcode-artifacts-{suffix}-", dir=temp_root)
         )

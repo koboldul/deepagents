@@ -472,6 +472,29 @@ class TestConnectHelper:
             "aiosqlite worker thread should be joined after _connect exit"
         )
 
+    def test_drains_worker_when_context_entry_is_cancelled(self) -> None:
+        """Cancellation during connection startup still drains its worker."""
+        connection = MagicMock()
+        connection.__aenter__ = AsyncMock(side_effect=asyncio.CancelledError)
+        connection.__aexit__ = AsyncMock()
+
+        async def _test() -> None:
+            with (
+                patch("aiosqlite.connect", return_value=connection),
+                patch.object(
+                    sessions,
+                    "_drain_aiosqlite_worker",
+                    new_callable=AsyncMock,
+                ) as drain,
+                pytest.raises(asyncio.CancelledError),
+            ):
+                async with sessions._connect():
+                    pass
+
+            drain.assert_awaited_once_with(connection)
+
+        asyncio.run(_test())
+
 
 class TestFormatTimestamp:
     """Tests for format_timestamp helper."""

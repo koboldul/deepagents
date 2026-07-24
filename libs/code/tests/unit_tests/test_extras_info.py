@@ -3,6 +3,7 @@
 import tomllib
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
@@ -18,6 +19,7 @@ from deepagents_code.extras_info import (
     DistributionVersion,
     VersionReport,
     _editable_sdk_source_root,
+    _file_uri_to_path,
     _requirement_satisfied,
     collect_cli_version_info,
     collect_sdk_version_info,
@@ -588,6 +590,8 @@ class TestResolveSdkVersion:
             ("file://server/share/proj", Path("//server/share/proj")),
             # ...but the conventional `localhost` authority is dropped.
             ("file://localhost/repo", Path("/repo")),
+            # Percent-encoded path segments are decoded before Path() wraps them.
+            ("file:///repo%20src", Path("/repo src")),
         ],
     )
     def test_editable_source_root_handles_url_authority(
@@ -600,6 +604,25 @@ class TestResolveSdkVersion:
         )
         with patch("deepagents_code.extras_info.distribution", return_value=dist):
             assert _editable_sdk_source_root() == expected
+
+    @pytest.mark.parametrize(
+        ("os_name", "url", "expected"),
+        [
+            ("posix", "file:///repo/src", "/repo/src"),
+            ("posix", "file:///repo%20src/pkg%23one", "/repo src/pkg#one"),
+            ("posix", "file://server/share/proj", "//server/share/proj"),
+            ("posix", "file://localhost/repo", "/repo"),
+            ("nt", "file:///C:/repo%20src", r"C:\repo src"),
+            ("nt", "file://server/share/proj%20data", r"\\server\share\proj data"),
+            ("nt", "file://localhost/repo", r"\repo"),
+        ],
+    )
+    def test_file_uri_to_path_handles_drive_paths_uncs_and_percent_encoding(
+        self, os_name: str, url: str, expected: str
+    ) -> None:
+        """`file:` URIs keep platform-specific path semantics and decode escapes."""
+        with patch("deepagents_code.extras_info.os", SimpleNamespace(name=os_name)):
+            assert _file_uri_to_path(url) == expected
 
     def test_not_installed_distinguished_from_error(self) -> None:
         """A missing package reports `not_installed`, never `error`."""
@@ -650,7 +673,9 @@ class TestContractHome:
         with patch(
             "deepagents_code.extras_info.Path.home", return_value=Path("/home/dev")
         ):
-            assert _contract_home(Path("/home/dev/src/proj")) == "~/src/proj"
+            assert _contract_home(Path("/home/dev/src/proj")) == str(
+                Path("~") / "src/proj"
+            )
 
     def test_exact_home_becomes_tilde(self) -> None:
         """The home directory itself contracts to a bare `~`."""
@@ -668,14 +693,14 @@ class TestContractHome:
         with patch(
             "deepagents_code.extras_info.Path.home", return_value=Path("/home/dev")
         ):
-            assert _contract_home(Path("/opt/other")) == "/opt/other"
+            assert _contract_home(Path("/opt/other")) == str(Path("/opt/other"))
 
     def test_unresolvable_home_returns_raw_path(self) -> None:
         """When the home directory cannot be determined, the raw path is kept."""
         from deepagents_code.extras_info import _contract_home
 
         with patch("deepagents_code.extras_info.Path.home", side_effect=RuntimeError):
-            assert _contract_home(Path("/home/dev/x")) == "/home/dev/x"
+            assert _contract_home(Path("/home/dev/x")) == str(Path("/home/dev/x"))
 
 
 class TestDistributionVersion:

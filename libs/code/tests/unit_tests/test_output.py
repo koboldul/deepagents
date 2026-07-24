@@ -43,7 +43,7 @@ class TestWriteJson:
         with patch("sys.stdout", buf):
             write_json("test", {"path": Path("/tmp/foo")})
         result = json.loads(buf.getvalue())
-        assert result["data"]["path"] == "/tmp/foo"
+        assert result["data"]["path"] == str(Path("/tmp/foo"))
 
     def test_trailing_newline(self) -> None:
         """Output ends with a single newline."""

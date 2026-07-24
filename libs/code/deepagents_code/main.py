@@ -102,6 +102,13 @@ def _install_termination_signal_handlers() -> None:
 
 def _tail_log_command(log_path: Path | str) -> str:
     """Return a copy-pasteable command for following a log file."""
+    if sys.platform == "win32":
+        quoted_path = str(log_path).replace("'", "''")
+        return (
+            'powershell -NoProfile -Command "'
+            f"Get-Content -Wait -LiteralPath '{quoted_path}'"
+            '"'
+        )
     return f"tail -f {shlex.quote(str(log_path))}"
 
 

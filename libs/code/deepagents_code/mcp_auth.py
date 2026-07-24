@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import re
-import secrets
 import stat
 import threading
 import time
@@ -785,16 +784,22 @@ class _LoopbackCallbackUnavailableError(RuntimeError):
 
 
 def _choose_loopback_port() -> int:
-    """Return a high local TCP port candidate without opening a socket.
+    """Return an available local TCP port candidate.
 
     The OAuth redirect URI must be known before the provider starts the
     handshake, but the actual callback server should not keep a socket open
-    unless a browser redirect is needed.
+    unless a browser redirect is needed. Ask the OS for an available port
+    instead of choosing randomly from the ephemeral range, where active
+    outbound connections commonly occupy ports on Windows.
 
     Returns:
-        A port number from the dynamic/private port range.
+        An available local TCP port.
     """
-    return 49152 + secrets.randbelow(65535 - 49152 + 1)
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((_LOOPBACK_BIND_HOST, 0))
+        return sock.getsockname()[1]
 
 
 class _LoopbackOAuthCallbackServer:

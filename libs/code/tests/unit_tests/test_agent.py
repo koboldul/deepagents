@@ -1,6 +1,7 @@
 """Unit tests for agent formatting functions."""
 
 import asyncio
+import os
 import warnings
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -11,12 +12,15 @@ from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import Mock, patch
 
 import pytest
+from deepagents.backends.filesystem import FilesystemBackend
 from langchain.agents.middleware import TodoListMiddleware
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 from langgraph.errors import GraphInterrupt
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from langchain.agents.middleware.types import AgentState
     from langchain.messages import ToolCall
     from langgraph.prebuilt.tool_node import ToolCallRequest
@@ -147,6 +151,32 @@ def test_add_interrupt_on_attaches_auto_approve_predicate() -> None:
         assert config.get("when") is _should_interrupt_tool_call
 
 
+def test_add_interrupt_on_binds_execute_working_directory() -> None:
+    """Execute approval descriptions use the construction-time working directory."""
+    interrupt_on = _add_interrupt_on(working_directory=r"C:\work\project")
+    description = interrupt_on["execute"]["description"]
+
+    assert callable(description)
+    description_factory = cast(
+        "Callable[[ToolCall, AgentState[Any], Runtime[Any]], str]",
+        description,
+    )
+    result = description_factory(
+        cast(
+            "ToolCall",
+            {
+                "name": "execute",
+                "args": {"command": "python script.py"},
+                "id": "call-execute",
+            },
+        ),
+        cast("AgentState[Any]", None),
+        cast("Runtime[Any]", None),
+    )
+
+    assert "Working Directory: C:\\work\\project" in result
+
+
 def test_local_conversation_history_route_is_persistent(tmp_path: Path) -> None:
     """Local archives use the stable user data directory across server restarts."""
     history_root = tmp_path / ".deepagents"
@@ -178,11 +208,11 @@ def test_local_conversation_history_route_is_persistent(tmp_path: Path) -> None:
 
 
 def test_local_large_tool_results_land_on_real_filesystem(tmp_path: Path) -> None:
-    """Offloaded large results write to the real default fs, not a virtual mount.
+    """Offloaded bulk data stays on real storage outside the virtual project root.
 
-    `<artifacts_root>/large_tool_results/` has no composite route, so writes fall
-    through to the default backend at a real path the agent can inspect with
-    `execute` -- the whole point of the local-mode rewire.
+    The dedicated composite route preserves a host path that `execute` can
+    inspect while the default filesystem backend maps `/` to the local project
+    directory.
     """
     artifacts_root = tmp_path / "artifacts"
     tool_root = _filesystem_tool_path(artifacts_root)
@@ -310,6 +340,99 @@ def test_goal_criteria_tools_wire_fallback_and_none_backend(tmp_path: Path) -> N
         is make_criteria.call_args.kwargs["model"]
     )
     make_middleware.assert_called_once_with("criteria-agent", "fallback-agent")
+
+
+def _capture_project_criteria_backend(
+    tmp_path: Path,
+    project_root: Path,
+    *,
+    native_windows: bool,
+) -> tuple[FilesystemBackend, str]:
+    model = _make_fake_chat_model()
+    mock_agent = Mock()
+    mock_agent.with_config.return_value = mock_agent
+    make_criteria = Mock(return_value="criteria-agent")
+
+    with (
+        patch(
+            "deepagents_code.agent._offload_fallback_root",
+            return_value=tmp_path / ".deepagents",
+        ),
+        patch(
+            "deepagents_code.agent._use_virtual_local_paths",
+            return_value=native_windows,
+        ),
+        patch("deepagents_code.agent.create_deep_agent", return_value=mock_agent),
+        patch("deepagents_code.goal_rubric._create_goal_criteria_agent", make_criteria),
+        patch(
+            "deepagents_code.goal_rubric.create_goal_criteria_fallback_agent",
+            return_value="fallback-agent",
+        ),
+        patch("deepagents_code.goal_rubric.GoalCriteriaMiddleware"),
+    ):
+        create_cli_agent(
+            model=model,
+            assistant_id="test-agent",
+            enable_memory=False,
+            enable_skills=False,
+            enable_shell=False,
+            system_prompt="test prompt",
+            cwd=project_root,
+            project_context=ProjectContext(
+                user_cwd=project_root,
+                project_root=project_root,
+            ),
+            goal_criteria_tools=[],
+        )
+
+    backend = make_criteria.call_args.kwargs["repository_backend"]
+    assert isinstance(backend, FilesystemBackend)
+    return backend, cast("str", make_criteria.call_args.kwargs["repository_root"])
+
+
+@pytest.mark.parametrize("native_windows", [False, True])
+def test_goal_criteria_project_backend_is_always_virtual(
+    tmp_path: Path,
+    *,
+    native_windows: bool,
+) -> None:
+    """Criteria paths stay repository-relative on every local platform."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+
+    backend, repository_root = _capture_project_criteria_backend(
+        tmp_path,
+        project_root,
+        native_windows=native_windows,
+    )
+
+    assert backend.cwd == project_root.resolve()
+    assert backend.virtual_mode is True
+    assert repository_root == "/"
+
+
+def test_goal_criteria_project_backend_rejects_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    """Criteria reads cannot follow a repository symlink to an outside directory."""
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret")
+    try:
+        (project_root / "escape").symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("platform does not support directory symlinks")
+
+    backend, _ = _capture_project_criteria_backend(
+        tmp_path,
+        project_root,
+        native_windows=False,
+    )
+
+    with pytest.raises(ValueError, match="outside root directory"):
+        backend.read("/escape/secret.txt")
 
 
 def test_goal_criteria_disabled_skips_middleware(tmp_path: Path) -> None:
@@ -796,6 +919,27 @@ async def test_async_hitl_store_failure_interrupts() -> None:
     assert store.get_calls == 0
 
 
+def test_sync_hitl_fails_closed_without_store_read() -> None:
+    """Synchronous routing injects Manual without consulting the Store."""
+    store = _LoopBoundAsyncStore({"mode": "yolo"})
+    middleware = AsyncApprovalHITLMiddleware(_add_interrupt_on())
+
+    with (
+        patch(
+            "langchain.agents.middleware.human_in_the_loop.interrupt",
+            side_effect=GraphInterrupt(()),
+        ),
+        pytest.raises(GraphInterrupt),
+    ):
+        middleware.after_model(
+            cast("Any", _gated_tool_state()),
+            cast("Any", _async_hitl_runtime(store)),
+        )
+
+    assert store.aget_calls == 0
+    assert store.get_calls == 0
+
+
 async def test_async_hitl_auto_is_ineligible_without_classifier_mode() -> None:
     """A live Auto record cannot bypass stock HITL in an ineligible graph."""
     store = _LoopBoundAsyncStore({"mode": "auto"})
@@ -966,51 +1110,26 @@ def test_sanitize_agent_message_name_replaces_provider_unsafe_chars() -> None:
     assert _sanitize_agent_message_name("  ") == DEFAULT_AGENT_NAME
 
 
-def test_format_write_file_description_create_new_file(tmp_path: Path) -> None:
-    """Test write_file description for creating a new file."""
-    new_file = tmp_path / "new_file.py"
+def test_format_write_file_description_is_static() -> None:
+    """Write approval truthfully describes either outcome without filesystem I/O."""
     tool_call = cast(
         "ToolCall",
         {
             "name": "write_file",
             "args": {
-                "file_path": str(new_file),
+                "file_path": "/new_file.py",
                 "content": "def hello():\n    return 'world'\n",
             },
             "id": "call-1",
         },
     )
 
-    description = _format_write_file_description(
-        tool_call, cast("AgentState[Any]", None), cast("Runtime[Any]", None)
-    )
+    with patch.object(Path, "exists", side_effect=AssertionError("filesystem read")):
+        description = _format_write_file_description(
+            tool_call, cast("AgentState[Any]", None), cast("Runtime[Any]", None)
+        )
 
-    assert "Action: Create file" in description
-    assert "File:" not in description
-
-
-def test_format_write_file_description_overwrite_existing_file(tmp_path: Path) -> None:
-    """Test write_file description for overwriting an existing file."""
-    existing_file = tmp_path / "existing.py"
-    existing_file.write_text("old content")
-
-    tool_call = cast(
-        "ToolCall",
-        {
-            "name": "write_file",
-            "args": {
-                "file_path": str(existing_file),
-                "content": "line1\nline2\nline3\n",
-            },
-            "id": "call-2",
-        },
-    )
-
-    description = _format_write_file_description(
-        tool_call, cast("AgentState[Any]", None), cast("Runtime[Any]", None)
-    )
-
-    assert "Action: Overwrite file" in description
+    assert description == "Action: Create or overwrite file"
     assert "File:" not in description
 
 
@@ -1243,8 +1362,8 @@ def test_format_task_description_truncates_long_description():
     assert len(description) < len(long_description) + 300
 
 
-def test_format_execute_description():
-    """Test execute command description formatting."""
+def test_format_execute_description_is_pure() -> None:
+    """Execute formatting uses its argument without cwd or filesystem lookups."""
     tool_call = cast(
         "ToolCall",
         {
@@ -1256,12 +1375,27 @@ def test_format_execute_description():
         },
     )
 
-    description = _format_execute_description(
-        tool_call, cast("AgentState[Any]", None), cast("Runtime[Any]", None)
-    )
+    with (
+        patch.object(Path, "cwd", side_effect=AssertionError("cwd lookup")),
+        patch.object(
+            Path,
+            "resolve",
+            side_effect=AssertionError("filesystem lookup"),
+        ),
+        patch(
+            "deepagents_code.project_utils.get_server_project_context",
+            side_effect=AssertionError("server context lookup"),
+        ),
+    ):
+        description = _format_execute_description(
+            tool_call,
+            cast("AgentState[Any]", None),
+            cast("Runtime[Any]", None),
+            working_directory=r"C:\work\project",
+        )
 
     assert "Execute Command: python script.py" in description
-    assert "Working Directory:" in description
+    assert "Working Directory: C:\\work\\project" in description
 
 
 def test_format_execute_description_with_hidden_unicode():
@@ -1627,6 +1761,78 @@ class TestGetSystemPromptCwdOSError:
             prompt = get_system_prompt("test-agent")
 
         assert "Current Working Directory" in prompt
+
+
+class TestGetSystemPromptLocalPaths:
+    """Tests for platform-specific local file and shell path instructions."""
+
+    def test_windows_cwd_uses_virtual_posix_file_paths(self) -> None:
+        """A Windows project path is context, never a file-tool instruction."""
+        mock_settings = Mock()
+        mock_settings.model_name = None
+        windows_cwd = r"C:\work\project"
+
+        with (
+            patch("deepagents_code.agent.settings", mock_settings),
+            patch(
+                "deepagents_code.agent._use_virtual_local_paths",
+                return_value=True,
+            ),
+        ):
+            prompt = get_system_prompt("test-agent", cwd=windows_cwd)
+
+        assert "File tools use virtual POSIX paths rooted at `/`" in prompt
+        assert "`/research_project/file.md` maps to" in prompt
+        assert (
+            "Never pass host project paths, including drive-qualified Windows paths, "
+            "to file tools"
+        ) in prompt
+        assert (
+            "The only host-path exception is an exact routed artifact path returned "
+            "by a tool"
+        ) in prompt
+        assert "`//?/C:/.../large_tool_results/...`" in prompt
+        assert (
+            "pass that exact path unchanged to a file tool only for subsequent reads"
+            in prompt
+        )
+        assert "Never pass host paths" not in prompt
+        assert (
+            f"The `execute` tool uses host paths and runs in the host shell with "
+            f"`{windows_cwd}` "
+            "as its working directory"
+        ) in prompt
+        assert (
+            "Use shell-native relative paths for project files in `execute` "
+            "commands" in prompt
+        )
+        assert "All file paths must be absolute paths" not in prompt
+
+    def test_posix_cwd_preserves_host_absolute_file_paths(self) -> None:
+        """POSIX file tools retain unrestricted host-absolute path semantics."""
+        mock_settings = Mock()
+        mock_settings.model_name = None
+        posix_cwd = "/home/user/project"
+
+        with (
+            patch("deepagents_code.agent.settings", mock_settings),
+            patch(
+                "deepagents_code.agent._use_virtual_local_paths",
+                return_value=False,
+            ),
+        ):
+            prompt = get_system_prompt("test-agent", cwd=posix_cwd)
+        prompt = prompt.replace(posix_cwd.replace("/", "\\"), posix_cwd)
+
+        assert (
+            f"The filesystem backend is currently operating in: `{posix_cwd}`" in prompt
+        )
+        assert (
+            f"All file paths must be absolute paths (e.g., `{posix_cwd}/file.txt`)"
+            in prompt
+        )
+        assert "Never use relative paths" in prompt
+        assert "virtual POSIX paths" not in prompt
 
 
 class TestGetSystemPromptSandbox:
@@ -2579,6 +2785,8 @@ class TestCreateCliAgentProjectContext:
         tmp_path: Path,
         *,
         user_langchain_project: str | None,
+        native_windows: bool = False,
+        auto_mode_enabled: bool = False,
     ) -> tuple[Mock, Path]:
         """Build a shell-enabled CLI agent and return the `LocalShellBackend` mock.
 
@@ -2619,11 +2827,14 @@ class TestCreateCliAgentProjectContext:
         mock_settings.model_context_limit = None
         mock_settings.project_root = None
         mock_settings.user_langchain_project = user_langchain_project
+        mock_settings.shell_allow_list = []
 
         mock_agent = Mock()
         mock_agent.with_config.return_value = mock_agent
         mock_backend = Mock()
         monkeypatch.setenv("LANGSMITH_PROJECT", "deepagents-code")
+        if auto_mode_enabled:
+            monkeypatch.setenv(EXPERIMENTAL, "1")
 
         fake_model = _make_fake_chat_model()
         with (
@@ -2631,9 +2842,16 @@ class TestCreateCliAgentProjectContext:
             patch("deepagents_code.agent.MemoryMiddleware"),
             patch("deepagents_code.agent.PluginSkillsMiddleware"),
             patch(
+                "deepagents_code.agent._use_virtual_local_paths",
+                return_value=native_windows,
+            ),
+            patch(
                 "deepagents_code.agent.LocalShellBackend", return_value=mock_backend
             ) as mock_shell,
-            patch("deepagents_code.agent.create_deep_agent", return_value=mock_agent),
+            patch(
+                "deepagents_code.agent.create_deep_agent",
+                return_value=mock_agent,
+            ) as mock_create,
             patch("deepagents._models.init_chat_model", return_value=fake_model),
         ):
             create_cli_agent(
@@ -2642,15 +2860,26 @@ class TestCreateCliAgentProjectContext:
                 enable_memory=False,
                 enable_skills=False,
                 enable_shell=True,
+                auto_mode_enabled=auto_mode_enabled,
                 project_context=project_context,
             )
 
+        mock_shell.agent_kwargs = mock_create.call_args.kwargs
         return mock_shell, user_cwd
 
-    def test_project_context_sets_local_shell_root_dir(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    @pytest.mark.parametrize(
+        ("native_windows", "expected_virtual_mode"),
+        [(False, False), (True, True)],
+    )
+    def test_project_context_sets_platform_local_shell_root_dir(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        *,
+        native_windows: bool,
+        expected_virtual_mode: bool,
     ) -> None:
-        """Shell backend root follows the cwd; agent override is dropped.
+        """Shell backend root follows the cwd and platform path semantics.
 
         With no user `LANGSMITH_PROJECT` (`user_langchain_project is None`),
         the agent's `deepagents-code` override must not leak into the shell
@@ -2658,10 +2887,14 @@ class TestCreateCliAgentProjectContext:
         project.
         """
         mock_shell, user_cwd = self._build_shell_agent(
-            monkeypatch, tmp_path, user_langchain_project=None
+            monkeypatch,
+            tmp_path,
+            user_langchain_project=None,
+            native_windows=native_windows,
         )
 
         assert mock_shell.call_args.kwargs["root_dir"] == user_cwd
+        assert mock_shell.call_args.kwargs["virtual_mode"] is expected_virtual_mode
         assert "LANGSMITH_PROJECT" not in mock_shell.call_args.kwargs["env"]
 
     @pytest.mark.parametrize("user_project", ["user-project", ""])
@@ -2719,10 +2952,52 @@ class TestCreateCliAgentProjectContext:
             config_mod._bootstrap_state.done = original_done
             config_mod._bootstrap_state.original_tracing_api_keys = original_api_keys
 
-    def test_cwd_sets_local_filesystem_root_dir_without_shell(
-        self, tmp_path: Path
+    def test_auto_mode_hardens_shell_environment_and_wires_execution_context(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
-        """Filesystem backend root should follow the explicit working directory."""
+        from deepagents_code.auto_mode import AutoModeHITLMiddleware
+
+        trusted_bin = tmp_path / "trusted-bin"
+        trusted_bin.mkdir()
+        separator = ";" if os.name == "nt" else ":"
+        monkeypatch.setenv(
+            "PATH",
+            separator.join((".", "", "relative-bin", str(trusted_bin))),
+        )
+
+        mock_shell, user_cwd = self._build_shell_agent(
+            monkeypatch,
+            tmp_path,
+            user_langchain_project=None,
+            auto_mode_enabled=True,
+        )
+
+        shell_environment = mock_shell.call_args.kwargs["env"]
+        assert shell_environment["PATH"] == str(trusted_bin)
+        if os.name == "nt":
+            assert shell_environment["NoDefaultCurrentDirectoryInExePath"] == "1"
+        middleware = next(
+            item
+            for item in mock_shell.agent_kwargs["middleware"]
+            if isinstance(item, AutoModeHITLMiddleware)
+        )
+        assert middleware._execution_cwd == user_cwd
+        assert middleware._shell_environment == shell_environment
+
+    @pytest.mark.parametrize(
+        ("native_windows", "expected_virtual_mode"),
+        [(False, False), (True, True)],
+    )
+    def test_cwd_sets_platform_filesystem_root_dir_without_shell(
+        self,
+        tmp_path: Path,
+        *,
+        native_windows: bool,
+        expected_virtual_mode: bool,
+    ) -> None:
+        """Filesystem root and virtual mode follow the explicit platform."""
         user_cwd = tmp_path / "project" / "src"
         user_cwd.mkdir(parents=True)
 
@@ -2756,8 +3031,15 @@ class TestCreateCliAgentProjectContext:
             patch("deepagents_code.agent.settings", mock_settings),
             patch("deepagents_code.agent.MemoryMiddleware"),
             patch("deepagents_code.agent.PluginSkillsMiddleware"),
+            patch(
+                "deepagents_code.agent._use_virtual_local_paths",
+                return_value=native_windows,
+            ),
             patch("deepagents_code.agent.FilesystemBackend") as mock_filesystem,
-            patch("deepagents_code.agent.create_deep_agent", return_value=mock_agent),
+            patch(
+                "deepagents_code.agent.create_deep_agent",
+                return_value=mock_agent,
+            ) as mock_create_deep_agent,
             patch("deepagents._models.init_chat_model", return_value=fake_model),
         ):
             create_cli_agent(
@@ -2770,6 +3052,27 @@ class TestCreateCliAgentProjectContext:
             )
 
         assert mock_filesystem.call_args_list[0].kwargs["root_dir"] == user_cwd
+        assert (
+            mock_filesystem.call_args_list[0].kwargs["virtual_mode"]
+            is expected_virtual_mode
+        )
+        execute_description = mock_create_deep_agent.call_args.kwargs["interrupt_on"][
+            "execute"
+        ]["description"]
+        assert callable(execute_description)
+        approval = execute_description(
+            cast(
+                "ToolCall",
+                {
+                    "name": "execute",
+                    "args": {"command": "python script.py"},
+                    "id": "call-execute",
+                },
+            ),
+            cast("AgentState[Any]", None),
+            cast("Runtime[Any]", None),
+        )
+        assert f"Working Directory: {user_cwd}" in approval
 
 
 class TestMiddlewareStackConformance:

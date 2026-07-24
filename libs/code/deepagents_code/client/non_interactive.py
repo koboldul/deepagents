@@ -25,8 +25,11 @@ import logging
 import sys
 import threading
 import time
+from contextlib import suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
+from functools import wraps
+from typing import TYPE_CHECKING, Any, ParamSpec, cast
 
 from langchain.agents.middleware.human_in_the_loop import ActionRequest, HITLRequest
 from langchain_core.messages import AIMessage, ToolMessage
@@ -40,6 +43,11 @@ from rich.style import Style
 from rich.text import Text
 
 from deepagents_code._cli_context import CLIContext
+from deepagents_code._posix_shell import (
+    _PosixOwnerGuard,
+    _PosixOwnerRegistry,
+    _start_posix_shell_process,
+)
 from deepagents_code._session_stats import SessionStats, print_usage_table
 from deepagents_code._tool_stream import (
     UNRENDERABLE_TOOL_OUTPUT,
@@ -82,11 +90,18 @@ from deepagents_code.unicode_security import (
 
 if TYPE_CHECKING:
     from asyncio.subprocess import Process
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
 
     from langchain_core.runnables import RunnableConfig
 
+    from deepagents_code.update_check import _WindowsJobObject
+
 logger = logging.getLogger(__name__)
+
+_STARTUP_COMMAND_TIMEOUT_SECONDS = 60
+_STARTUP_TERMINATE_TIMEOUT_SECONDS = 5.0
+_STARTUP_PROCESS_GROUP_POLL_SECONDS = 0.05
 
 
 class HITLIterationLimitError(RuntimeError):
@@ -204,78 +219,287 @@ class _ConsoleSpinner:
                 self._live = None
 
 
-async def _terminate_startup_process(proc: Process) -> None:
-    """Terminate and reap a startup command subprocess.
+async def _start_startup_process(
+    command: str,
+) -> tuple[Process, _WindowsJobObject | None, _PosixOwnerGuard | None]:
+    """Start a shell command in an owned process tree.
 
     Args:
-        proc: Process returned by `asyncio.create_subprocess_shell`.
+        command: Shell command to execute.
+
+    Returns:
+        The subprocess and its platform ownership handle, when applicable.
     """
-    import sys
+    if sys.platform == "win32":
+        from deepagents_code.update_check import (
+            _WINDOWS_CREATE_SUSPENDED,
+            _assign_windows_job_and_resume,
+        )
 
-    if proc.returncode is not None:
-        return
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            creationflags=_WINDOWS_CREATE_SUSPENDED,
+        )
+        windows_job = await _assign_windows_job_and_resume(proc)
+        return proc, windows_job, None
 
+    proc, owner_guard = await _start_posix_shell_process(command)
+    return proc, None, owner_guard
+
+
+def _startup_process_group_exists(process_group_id: int) -> bool:
+    """Return whether a POSIX startup-command process group still exists."""
+    import os
+
+    killpg = getattr(os, "killpg", None)
+    if not callable(killpg):
+        return False
     try:
-        if sys.platform != "win32":
-            import os
-            import signal
-
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        else:
-            proc.kill()
+        killpg(process_group_id, 0)
     except ProcessLookupError:
-        return
+        return False
     except OSError:
-        logger.warning(
-            "Failed to terminate startup command (pid=%s)",
-            proc.pid,
-            exc_info=True,
+        return True
+    return True
+
+
+async def _wait_for_startup_process_group_exit(
+    process_group_id: int,
+    *,
+    wait_seconds: float,
+) -> bool:
+    """Wait a bounded interval for a POSIX process group to disappear.
+
+    Returns:
+        Whether the group disappeared before the deadline.
+    """
+    deadline = time.monotonic() + wait_seconds
+    while _startup_process_group_exists(process_group_id):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(_STARTUP_PROCESS_GROUP_POLL_SECONDS, remaining))
+    return True
+
+
+async def _wait_for_startup_root_exit(proc: Process) -> bool:
+    """Wait a bounded interval for the startup-command root to exit.
+
+    Returns:
+        Whether the root exited before the deadline.
+    """
+    try:
+        await asyncio.wait_for(
+            proc.wait(),
+            timeout=_STARTUP_TERMINATE_TIMEOUT_SECONDS,
         )
+    except (OSError, ProcessLookupError, TimeoutError):
+        return proc.returncode is not None
+    return True
+
+
+async def _terminate_posix_startup_process(proc: Process) -> None:
+    """Terminate a dedicated POSIX startup-command process group."""
+    import os
+    import signal
+
+    process_group_id = proc.pid
+    process_group_signaled = False
+    killpg = getattr(os, "killpg", None)
+
+    if not callable(killpg):
+        if proc.returncode is None:
+            with suppress(OSError, ProcessLookupError):
+                proc.kill()
+        await _wait_for_startup_root_exit(proc)
         return
 
     try:
-        await asyncio.wait_for(proc.wait(), timeout=5)
-    except TimeoutError:
-        logger.warning(
-            "Startup command (pid=%s) did not exit after termination; sending SIGKILL",
-            proc.pid,
-        )
-        try:
-            if sys.platform != "win32":
-                import os
-                import signal
-
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            else:
-                proc.kill()
-        except ProcessLookupError:
-            return
-        except OSError:
-            logger.warning(
-                "Failed to SIGKILL startup command (pid=%s); process may leak",
-                proc.pid,
-                exc_info=True,
-            )
-            return
-        try:
-            await proc.wait()
-        except ProcessLookupError:
-            pass
-        except OSError:
-            logger.warning(
-                "Failed to reap startup command (pid=%s) after SIGKILL",
-                proc.pid,
-                exc_info=True,
-            )
+        killpg(process_group_id, signal.SIGTERM)
     except ProcessLookupError:
         pass
     except OSError:
         logger.warning(
-            "Failed to wait on startup command (pid=%s) after SIGTERM; "
-            "process may leak",
-            proc.pid,
+            "Failed to terminate startup command process group (pgid=%s)",
+            process_group_id,
             exc_info=True,
         )
+    else:
+        process_group_signaled = True
+
+    if process_group_signaled and not await _wait_for_startup_process_group_exit(
+        process_group_id,
+        wait_seconds=_STARTUP_TERMINATE_TIMEOUT_SECONDS,
+    ):
+        logger.warning(
+            "Startup command process group (pgid=%s) survived SIGTERM; sending SIGKILL",
+            process_group_id,
+        )
+        with suppress(ProcessLookupError, OSError):
+            killpg(process_group_id, getattr(signal, "SIGKILL", 9))
+        await _wait_for_startup_process_group_exit(
+            process_group_id,
+            wait_seconds=_STARTUP_TERMINATE_TIMEOUT_SECONDS,
+        )
+    elif not process_group_signaled and proc.returncode is None:
+        with suppress(OSError, ProcessLookupError):
+            proc.kill()
+
+    if await _wait_for_startup_root_exit(proc):
+        return
+
+    with suppress(OSError, ProcessLookupError):
+        proc.kill()
+    await _wait_for_startup_root_exit(proc)
+
+
+async def _terminate_startup_process(
+    proc: Process,
+    windows_job: _WindowsJobObject | None,
+    posix_owner_guard: _PosixOwnerGuard | None,
+) -> None:
+    """Terminate a live startup tree and close its ownership handles."""
+    from deepagents_code.update_check import _close_asyncio_subprocess_transport
+
+    try:
+        if sys.platform == "win32":
+            from deepagents_code.update_check import (
+                _terminate_windows_process_tree,
+            )
+
+            await _terminate_windows_process_tree(proc, windows_job)
+        else:
+            try:
+                await _terminate_posix_startup_process(proc)
+            finally:
+                if posix_owner_guard is not None:
+                    await posix_owner_guard.terminate()
+    finally:
+        _close_asyncio_subprocess_transport(proc)
+
+
+async def _terminate_retained_startup_process(
+    proc: Process,
+    windows_job: _WindowsJobObject | None,
+    posix_owner_guard: _PosixOwnerGuard | None,
+) -> None:
+    """Terminate a successful root through its durable ownership handle.
+
+    Windows Job containment is enforced. On POSIX, later cleanup addresses only
+    the retained watchdog and never signals the completed root's reusable PGID.
+    Descendants that deliberately call `setsid()` or `setpgid()` can escape
+    portable process-group containment.
+    """
+    from deepagents_code.update_check import _close_asyncio_subprocess_transport
+
+    try:
+        if sys.platform == "win32":
+            from deepagents_code.update_check import (
+                _terminate_windows_process_tree,
+            )
+
+            await _terminate_windows_process_tree(proc, windows_job)
+        elif posix_owner_guard is not None:
+            await posix_owner_guard.terminate()
+        await _wait_for_startup_root_exit(proc)
+    finally:
+        _close_asyncio_subprocess_transport(proc)
+
+
+class _StartupProcessRegistry:
+    """Own successful startup-command process trees until headless shutdown."""
+
+    def __init__(self) -> None:
+        self._processes: list[
+            tuple[Process, _WindowsJobObject | None, _PosixOwnerGuard | None]
+        ] = []
+        self._posix_owner_guards = _PosixOwnerRegistry()
+        self._closed = False
+
+    async def retain(
+        self,
+        proc: Process,
+        windows_job: _WindowsJobObject | None,
+        posix_owner_guard: _PosixOwnerGuard | None,
+    ) -> None:
+        """Register one completed root whose descendants remain session-owned.
+
+        POSIX ownership is best-effort against deliberate process-group or
+        session escape; Windows descendants remain enforced by their Job.
+
+        Raises:
+            RuntimeError: If session cleanup already closed the registry.
+        """
+        if self._closed:
+            msg = "Startup process registry is already closed"
+            raise RuntimeError(msg)
+        if posix_owner_guard is not None:
+            await self._posix_owner_guards.retain(posix_owner_guard)
+            return
+        self._processes.append((proc, windows_job, posix_owner_guard))
+
+    async def close(self) -> None:
+        """Terminate every retained startup-command process tree."""
+        if self._closed:
+            return
+        self._closed = True
+        processes = self._processes
+        self._processes = []
+        try:
+            await self._posix_owner_guards.close()
+        except Exception:
+            logger.warning(
+                "Failed to terminate retained POSIX startup command before exit",
+                exc_info=True,
+            )
+        for proc, windows_job, posix_owner_guard in reversed(processes):
+            try:
+                await _terminate_retained_startup_process(
+                    proc,
+                    windows_job,
+                    posix_owner_guard,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to terminate retained startup command before exit",
+                    exc_info=True,
+                )
+
+
+_RunNonInteractiveP = ParamSpec("_RunNonInteractiveP")
+_STARTUP_PROCESS_REGISTRY: ContextVar[_StartupProcessRegistry | None] = ContextVar(
+    "_STARTUP_PROCESS_REGISTRY",
+    default=None,
+)
+
+
+def _with_startup_process_cleanup(
+    function: Callable[_RunNonInteractiveP, Awaitable[int]],
+) -> Callable[_RunNonInteractiveP, Awaitable[int]]:
+    """Give one headless invocation an isolated startup-process registry.
+
+    Returns:
+        A wrapper that terminates retained startup processes before returning.
+    """
+
+    @wraps(function)
+    async def wrapped(
+        *args: _RunNonInteractiveP.args,
+        **kwargs: _RunNonInteractiveP.kwargs,
+    ) -> int:
+        registry = _StartupProcessRegistry()
+        token = _STARTUP_PROCESS_REGISTRY.set(registry)
+        try:
+            return await function(*args, **kwargs)
+        finally:
+            try:
+                await registry.close()
+            finally:
+                _STARTUP_PROCESS_REGISTRY.reset(token)
+
+    return wrapped
 
 
 @dataclass(frozen=True)
@@ -1270,6 +1494,7 @@ async def _run_startup_command(
     console: Console,
     *,
     quiet: bool,
+    process_registry: _StartupProcessRegistry | None = None,
 ) -> None:
     """Run the `--startup-cmd` shell command before the agent loop.
 
@@ -1285,59 +1510,114 @@ async def _run_startup_command(
         quiet: When `True`, suppresses the "Running startup command" header
             so piped output stays minimal; warnings still appear (on stderr
             when the caller wired the console there).
+        process_registry: Owner for background descendants that should persist
+            until the headless session exits. The active invocation's registry
+            is used by default. Windows Job containment is enforced; POSIX
+            process-group cleanup is best-effort against deliberate
+            `setsid()`/`setpgid()` session escape.
 
     Raises:
         asyncio.CancelledError: If the caller cancels while the startup command
             is running.
     """
-    import sys
-
     if not quiet:
         console.print(Text(f"Running startup command: {command}", style="dim"))
 
     try:
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=(sys.platform != "win32"),
-        )
-    except OSError as e:
+        proc, windows_job, posix_owner_guard = await _start_startup_process(command)
+    except OSError as exc:
         console.print(
             "[yellow]Warning:[/yellow] startup command failed to launch: "
-            f"{escape_markup(str(e))}"
+            f"{escape_markup(str(exc))}"
         )
         return
 
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=60
+            proc.communicate(),
+            timeout=_STARTUP_COMMAND_TIMEOUT_SECONDS,
         )
+
+        stdout_text = (stdout_bytes or b"").decode(errors="replace").rstrip("\n")
+        stderr_text = (stderr_bytes or b"").decode(errors="replace").rstrip("\n")
+        if stdout_text:
+            # Wrap in `Text` so Rich treats the shell output as literal — otherwise
+            # brackets in tool output (e.g. `[INFO]`, `[1/3]`) would be parsed as
+            # markup and either silently stripped or raise `MarkupError`.
+            console.print(Text(stdout_text), highlight=False)
+        if stderr_text:
+            console.print(Text(stderr_text, style="dim"), highlight=False)
+
+        if proc.returncode:
+            console.print(
+                "[yellow]Warning:[/yellow] startup command exited with code "
+                f"{proc.returncode} — continuing anyway"
+            )
     except asyncio.CancelledError:
-        await _terminate_startup_process(proc)
+        await _terminate_startup_process(
+            proc,
+            windows_job,
+            posix_owner_guard,
+        )
         raise
     except TimeoutError:
-        await _terminate_startup_process(proc)
-        console.print("[yellow]Warning:[/yellow] startup command timed out (60s limit)")
-        return
-
-    stdout_text = (stdout_bytes or b"").decode(errors="replace").rstrip("\n")
-    stderr_text = (stderr_bytes or b"").decode(errors="replace").rstrip("\n")
-    if stdout_text:
-        # Wrap in `Text` so Rich treats the shell output as literal — otherwise
-        # brackets in tool output (e.g. `[INFO]`, `[1/3]`) would be parsed as
-        # markup and either silently stripped or raise `MarkupError`.
-        console.print(Text(stdout_text), highlight=False)
-    if stderr_text:
-        console.print(Text(stderr_text, style="dim"), highlight=False)
-
-    if proc.returncode:
-        console.print(
-            "[yellow]Warning:[/yellow] startup command exited with code "
-            f"{proc.returncode} — continuing anyway"
+        await _terminate_startup_process(
+            proc,
+            windows_job,
+            posix_owner_guard,
         )
+        console.print(
+            "[yellow]Warning:[/yellow] startup command timed out "
+            f"({_STARTUP_COMMAND_TIMEOUT_SECONDS}s limit)"
+        )
+    except BaseException:
+        await _terminate_startup_process(
+            proc,
+            windows_job,
+            posix_owner_guard,
+        )
+        raise
+    else:
+        registry = process_registry or _STARTUP_PROCESS_REGISTRY.get()
+        has_retained_processes = sys.platform == "win32" or (
+            posix_owner_guard is not None and posix_owner_guard.has_processes()
+        )
+        if not has_retained_processes:
+            if posix_owner_guard is not None:
+                await posix_owner_guard.close()
+            from deepagents_code.update_check import (
+                _close_asyncio_subprocess_transport,
+            )
+
+            _close_asyncio_subprocess_transport(proc)
+        elif registry is None:
+            await _terminate_retained_startup_process(
+                proc,
+                windows_job,
+                posix_owner_guard,
+            )
+        else:
+            try:
+                await registry.retain(
+                    proc,
+                    windows_job,
+                    posix_owner_guard,
+                )
+            except BaseException:
+                await _terminate_retained_startup_process(
+                    proc,
+                    windows_job,
+                    posix_owner_guard,
+                )
+                raise
+            from deepagents_code.update_check import (
+                _close_asyncio_subprocess_transport,
+            )
+
+            _close_asyncio_subprocess_transport(proc)
 
 
+@_with_startup_process_cleanup
 async def run_non_interactive(
     message: str,
     assistant_id: str = DEFAULT_AGENT_NAME,

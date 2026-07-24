@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -264,6 +265,7 @@ class TestFileTokenStorage:
 
         assert not write_barrier.broken
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are unavailable")
     async def test_sets_file_permissions_on_posix(self, fake_home: Path) -> None:
         """Token files are created with private user-only permissions."""
         storage = FileTokenStorage("notion")

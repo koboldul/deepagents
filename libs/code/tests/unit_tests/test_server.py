@@ -9,25 +9,109 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import threading
+import time
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Any, Self
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from deepagents_code._posix_shell import _SyncPosixOwnerGuard
 from deepagents_code.client.launch.server import (
     ServerProcess,
     _find_free_port,
     _port_in_use,
     _server_process_group,
+    _spawn_posix_server_process,
     _terminate_server_process,
     _wait_for_process_group_exit,
     wait_for_server_healthy,
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from typing import IO
+
+_SIGKILL = getattr(signal, "SIGKILL", 9)
+
+
+@pytest.fixture
+def _posix_process_api(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Provide POSIX-only process symbols for tests that simulate Linux."""
+    if not hasattr(os, "getpgid"):
+        monkeypatch.setattr(os, "getpgid", None, raising=False)
+    if not hasattr(os, "killpg"):
+        monkeypatch.setattr(os, "killpg", None, raising=False)
+    if not hasattr(signal, "SIGKILL"):
+        monkeypatch.setattr(signal, "SIGKILL", 9, raising=False)
+
+
+@pytest.fixture
+def _real_posix_server_lifecycle() -> None:
+    """Opt a test into the real gated POSIX watchdog launch."""
+
+
+@pytest.fixture(autouse=True)
+def _stub_posix_server_lifecycle(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep ordinary subprocess mocks independent of POSIX watchdog processes."""
+    if "_real_posix_server_lifecycle" in request.fixturenames:
+        return
+
+    def spawn(
+        cmd: list[str],
+        *,
+        cwd: str,
+        env: dict[str, str],
+        stdout: int | IO[str] | None,
+    ) -> tuple[subprocess.Popen[Any], None]:
+        process = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=env,
+            stdout=stdout,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            creationflags=0,
+        )
+        return process, None
+
+    monkeypatch.setattr(
+        "deepagents_code.client.launch.server._spawn_posix_server_process",
+        spawn,
+    )
+
+
+@pytest.fixture
+def _real_windows_server_lifecycle() -> None:
+    """Opt a test into real Windows Job assignment instead of the mock."""
+
+
+@pytest.fixture(autouse=True)
+def _stub_windows_server_job_assignment(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[MagicMock]:
+    """Keep ordinary subprocess mocks independent of native Windows handles."""
+    jobs: list[MagicMock] = []
+    if "_real_windows_server_lifecycle" in request.fixturenames:
+        return jobs
+
+    def assign(_process: subprocess.Popen[bytes]) -> MagicMock:
+        job = MagicMock()
+        job.terminate.return_value = True
+        jobs.append(job)
+        return job
+
+    monkeypatch.setattr(
+        "deepagents_code.client.launch.server._assign_windows_server_job_and_resume",
+        assign,
+    )
+    return jobs
 
 
 class _FakeSocket:
@@ -364,16 +448,19 @@ class TestServerProcess:
 
         `_stop_process` now tears down the server's whole process group via
         `os.getpgid`/`os.killpg`. These tests drive `MagicMock` subprocesses
-        with fake pids, so let `_server_process_group` return `None` (by making
-        `os.getpgid` raise) to keep teardown deterministic and guarantee no
-        unrelated real pid is ever signaled. Group-teardown behavior is covered
-        explicitly in `TestTerminateServerProcess`.
+        with fake pids, so patch `_server_process_group` to return `None`. This
+        keeps teardown deterministic and guarantees no unrelated real pid is
+        ever signaled. Group-teardown behavior is covered explicitly in
+        `TestTerminateServerProcess`.
         """
-
-        def _raise(_pid: int) -> int:
-            raise ProcessLookupError
-
-        monkeypatch.setattr("deepagents_code.client.launch.server.os.getpgid", _raise)
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server._server_process_group",
+            lambda _pid: None,
+        )
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.sys.platform",
+            "linux",
+        )
 
     async def test_start_is_noop_when_already_running(self) -> None:
         """`start()` on an already-running server spawns no second process.
@@ -1353,14 +1440,280 @@ class TestServerSessionIsolation:
         popen = await self._spawn_and_capture(tmp_path, "linux", monkeypatch)
         assert popen.call_args.kwargs["start_new_session"] is True
 
-    async def test_windows_spawn_without_new_session(
+    async def test_windows_spawn_suspended_without_new_session(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """On Windows the unsupported `setsid()` call is not requested."""
+        """Windows suspends the root before Job assignment and skips `setsid()`."""
+        from deepagents_code.update_check import _WINDOWS_CREATE_SUSPENDED
+
         popen = await self._spawn_and_capture(tmp_path, "win32", monkeypatch)
         assert popen.call_args.kwargs["start_new_session"] is False
+        assert popen.call_args.kwargs["creationflags"] == _WINDOWS_CREATE_SUSPENDED
 
 
+@pytest.mark.usefixtures("_posix_process_api")
+class TestPosixServerOwnership:
+    """Tests for durable POSIX process-group ownership."""
+
+    def test_spawn_arms_owner_before_opening_exec_gate(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The server command cannot execute before its watchdog is ready."""
+        events: list[str] = []
+        process = MagicMock(pid=4321)
+        owner = MagicMock()
+        popen = MagicMock(
+            side_effect=lambda *_args, **_kwargs: events.append("spawn") or process
+        )
+
+        def start_owner(process_group_id: int, *, term_timeout: float) -> MagicMock:
+            assert process_group_id == 4321
+            assert term_timeout > 0
+            events.append("owner")
+            return owner
+
+        def open_gate(file_descriptor: int, payload: bytes) -> int:
+            assert file_descriptor == 42
+            assert payload == b"G"
+            events.append("gate")
+            return 1
+
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.subprocess.Popen",
+            popen,
+        )
+        monkeypatch.setattr(
+            "deepagents_code._posix_shell._start_sync_posix_owner_guard",
+            start_owner,
+        )
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.os.pipe",
+            lambda: (41, 42),
+        )
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.os.write",
+            open_gate,
+        )
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server._close_posix_file_descriptor",
+            lambda _file_descriptor: None,
+        )
+
+        spawned, retained_owner = _spawn_posix_server_process(
+            ["python", "-m", "langgraph_cli"],
+            cwd="runtime",
+            env={"PATH": "test"},
+            stdout=subprocess.DEVNULL,
+        )
+
+        assert events == ["spawn", "owner", "gate"]
+        assert spawned is process
+        assert retained_owner is owner
+        assert popen.call_args.kwargs["start_new_session"] is True
+        assert popen.call_args.kwargs["pass_fds"] == (41,)
+        assert popen.call_args.args[0][-3:] == [
+            "python",
+            "-m",
+            "langgraph_cli",
+        ]
+
+    def test_spawn_interruption_after_gate_terminates_owner(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An interruption after exec is allowed still tears down the group."""
+        process = MagicMock(pid=4321)
+        owner = MagicMock()
+        owner.terminate.return_value = True
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.subprocess.Popen",
+            MagicMock(return_value=process),
+        )
+        monkeypatch.setattr(
+            "deepagents_code._posix_shell._start_sync_posix_owner_guard",
+            MagicMock(return_value=owner),
+        )
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.os.pipe",
+            lambda: (41, 42),
+        )
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server._close_posix_file_descriptor",
+            lambda _file_descriptor: None,
+        )
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server._open_posix_server_launch_gate",
+            MagicMock(side_effect=KeyboardInterrupt),
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            _spawn_posix_server_process(
+                ["python", "-m", "langgraph_cli"],
+                cwd="runtime",
+                env={"PATH": "test"},
+                stdout=subprocess.DEVNULL,
+            )
+
+        owner.terminate.assert_called_once_with(reap=process.poll)
+        owner.close.assert_not_called()
+        process.wait.assert_called_once()
+
+    def test_dead_owner_never_signals_reused_process_group(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A completed watchdog prevents fallback to the exited root's PGID."""
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.sys.platform",
+            "linux",
+        )
+        process = MagicMock(pid=4321)
+        process.poll.return_value = 7
+        watchdog = MagicMock()
+        watchdog.poll.return_value = 0
+        watchdog.wait.return_value = 0
+        owner = _SyncPosixOwnerGuard(93, watchdog, wait_timeout=0)
+
+        with (
+            patch(
+                "deepagents_code._posix_shell._close_file_descriptor",
+            ) as close_control,
+            patch(
+                "deepagents_code._posix_shell.os.write",
+            ) as write_control,
+            patch(
+                "deepagents_code.client.launch.server._server_process_group",
+            ) as resolve_group,
+            patch("os.killpg") as killpg,
+        ):
+            _terminate_server_process(process, posix_owner=owner)
+
+        close_control.assert_called_once_with(93)
+        write_control.assert_not_called()
+        resolve_group.assert_not_called()
+        killpg.assert_not_called()
+        process.send_signal.assert_not_called()
+        process.kill.assert_not_called()
+
+    def test_stop_uses_owner_after_root_exit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An exited root does not suppress owned descendant teardown."""
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.sys.platform",
+            "linux",
+        )
+        server = ServerProcess()
+        process = MagicMock(pid=4321)
+        process.poll.return_value = 7
+        owner = MagicMock()
+        owner.terminate.return_value = True
+        server._process = process
+        server._posix_owner = owner
+
+        server._stop_process()
+
+        owner.terminate.assert_called_once_with(reap=process.poll)
+        process.send_signal.assert_not_called()
+        process.kill.assert_not_called()
+        assert server._process is None
+        assert server._posix_owner is None
+
+    def test_repeated_stop_terminates_owner_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repeated terminal shutdown consumes the ownership token once."""
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.sys.platform",
+            "linux",
+        )
+        server = ServerProcess()
+        process = MagicMock(pid=4321)
+        process.poll.return_value = 7
+        owner = MagicMock()
+        owner.terminate.return_value = True
+        server._process = process
+        server._posix_owner = owner
+
+        server.stop()
+        server.stop()
+
+        owner.terminate.assert_called_once_with(reap=process.poll)
+
+    @pytest.mark.parametrize(
+        ("failure", "error_type"),
+        [
+            pytest.param(
+                RuntimeError("Server did not become healthy within 0.01s"),
+                RuntimeError,
+                id="health-timeout",
+            ),
+            pytest.param(
+                asyncio.CancelledError(),
+                asyncio.CancelledError,
+                id="cancellation",
+            ),
+        ],
+    )
+    async def test_failed_start_terminates_owner(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure: BaseException,
+        error_type: type[BaseException],
+    ) -> None:
+        """Health timeout and cancellation both consume POSIX ownership."""
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.sys.platform",
+            "linux",
+        )
+        config_dir = tmp_path / "runtime"
+        config_dir.mkdir()
+        (config_dir / "langgraph.json").write_text("{}")
+        process = MagicMock(pid=4321)
+        process.poll.return_value = None
+        owner = MagicMock()
+
+        def terminate(*, reap: object) -> bool:
+            assert reap == process.poll
+            process.poll.return_value = 7
+            return True
+
+        owner.terminate.side_effect = terminate
+        log_file = MagicMock()
+        log_file.name = str(tmp_path / "server.log")
+        server = ServerProcess(config_dir=config_dir)
+
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server._spawn_posix_server_process",
+            lambda *_args, **_kwargs: (process, owner),
+        )
+        with (
+            patch(
+                "deepagents_code.client.launch.server._find_free_port",
+                return_value=12345,
+            ),
+            patch(
+                "deepagents_code.client.launch.server.tempfile.NamedTemporaryFile",
+                return_value=log_file,
+            ),
+            patch(
+                "deepagents_code.client.launch.server.wait_for_server_healthy",
+                new=AsyncMock(side_effect=failure),
+            ),
+            pytest.raises(error_type),
+        ):
+            await server.start()
+
+        owner.terminate.assert_called_once_with(reap=process.poll)
+        assert server._process is None
+        assert server._posix_owner is None
+
+
+@pytest.mark.usefixtures("_posix_process_api")
 class TestServerProcessGroup:
     """Tests for `_server_process_group` targeting logic."""
 
@@ -1443,6 +1796,7 @@ class TestServerProcessGroup:
         assert "falling back to root-only signaling" in caplog.text
 
 
+@pytest.mark.usefixtures("_posix_process_api")
 class TestTerminateServerProcess:
     """Tests for detached process-group teardown."""
 
@@ -1496,7 +1850,7 @@ class TestTerminateServerProcess:
 
         def _killpg(_pgid: int, sig: int) -> None:
             nonlocal group_killed
-            if sig == signal.SIGKILL:
+            if sig == _SIGKILL:
                 group_killed = True
             elif sig == 0 and group_killed:
                 raise ProcessLookupError
@@ -1511,7 +1865,7 @@ class TestTerminateServerProcess:
         assert killpg.call_args_list == [
             ((4321, signal.SIGTERM),),
             ((4321, 0),),
-            ((4321, signal.SIGKILL),),
+            ((4321, _SIGKILL),),
             ((4321, 0),),
         ]
         process.wait.assert_called_once_with()
@@ -1673,7 +2027,7 @@ class TestTerminateServerProcess:
         self._patch_own_group(monkeypatch)
 
         def _killpg(_pgid: int, sig: int) -> None:
-            if sig == signal.SIGKILL:
+            if sig == _SIGKILL:
                 raise ProcessLookupError
 
         killpg = MagicMock(side_effect=_killpg)
@@ -1686,7 +2040,7 @@ class TestTerminateServerProcess:
         assert killpg.call_args_list == [
             ((4321, signal.SIGTERM),),
             ((4321, 0),),
-            ((4321, signal.SIGKILL),),
+            ((4321, _SIGKILL),),
         ]
 
     def test_sigkill_oserror_reports_orphan(
@@ -1696,7 +2050,7 @@ class TestTerminateServerProcess:
         self._patch_own_group(monkeypatch)
 
         def _killpg(_pgid: int, sig: int) -> None:
-            if sig == signal.SIGKILL:
+            if sig == _SIGKILL:
                 raise PermissionError
 
         killpg = MagicMock(side_effect=_killpg)
@@ -1727,7 +2081,7 @@ class TestTerminateServerProcess:
         assert killpg.call_args_list == [
             ((4321, signal.SIGTERM),),
             ((4321, 0),),
-            ((4321, signal.SIGKILL),),
+            ((4321, _SIGKILL),),
             ((4321, 0),),
         ]
         assert "did not exit after SIGKILL" in caplog.text
@@ -1891,3 +2245,667 @@ class TestTerminateServerProcess:
 
         assert "Dropping handle to server pid=4321 that is still running" in caplog.text
         assert server._process is None
+
+
+_WINDOWS_PROCESS_TEST_TIMEOUT = 10.0
+_POSIX_PROCESS_TEST_TIMEOUT = 10.0
+
+
+def _wait_for_pid_file(path: Path) -> int:
+    """Wait for a subprocess to publish a child pid."""
+    deadline = time.monotonic() + _WINDOWS_PROCESS_TEST_TIMEOUT
+    while time.monotonic() < deadline:
+        if path.exists():
+            try:
+                return int(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+        time.sleep(0.02)
+    msg = f"Timed out waiting for pid file: {path}"
+    raise AssertionError(msg)
+
+
+def _posix_root_exits_with_child_script(
+    pid_file: Path,
+    terminated_file: Path,
+) -> str:
+    """Build a POSIX root that exits after starting a long-lived child."""
+    child_code = (
+        "import os, signal, time\n"
+        "from pathlib import Path\n"
+        f"pid_file = Path({str(pid_file)!r})\n"
+        f"terminated_file = Path({str(terminated_file)!r})\n"
+        "def stop(_signal, _frame):\n"
+        "    terminated_file.write_text('terminated', encoding='utf-8')\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "pid_file.write_text(str(os.getpid()), encoding='utf-8')\n"
+        "while True:\n"
+        "    time.sleep(1)\n"
+    )
+    return (
+        "import subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        f"pid_file = Path({str(pid_file)!r})\n"
+        "child = subprocess.Popen(\n"
+        f"    [sys.executable, '-c', {child_code!r}],\n"
+        "    stdin=subprocess.DEVNULL,\n"
+        "    stdout=subprocess.DEVNULL,\n"
+        "    stderr=subprocess.DEVNULL,\n"
+        ")\n"
+        f"deadline = time.monotonic() + {_POSIX_PROCESS_TEST_TIMEOUT!r}\n"
+        "while not pid_file.exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.02)\n"
+        "if not pid_file.exists():\n"
+        "    child.kill()\n"
+        "    child.wait()\n"
+        "    raise SystemExit(8)\n"
+        "raise SystemExit(7)\n"
+    )
+
+
+def _posix_process_is_running(pid: int) -> bool:
+    """Return whether a POSIX test process is live rather than a zombie."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+    stat_path = Path("/proc") / str(pid) / "stat"
+    try:
+        return stat_path.read_text(encoding="utf-8").split()[2] != "Z"
+    except (IndexError, OSError):
+        return True
+
+
+def _wait_for_posix_process_exit(pid: int) -> bool:
+    """Wait for a real POSIX process to exit or become a zombie."""
+    deadline = time.monotonic() + _POSIX_PROCESS_TEST_TIMEOUT
+    while time.monotonic() < deadline:
+        if not _posix_process_is_running(pid):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _force_stop_posix_test_process(pid: int | None) -> None:
+    """Best-effort cleanup for a POSIX child if an assertion aborts a test."""
+    if pid is None or not _posix_process_is_running(pid):
+        return
+    with contextlib.suppress(OSError, ProcessLookupError):
+        os.kill(pid, _SIGKILL)
+    _wait_for_posix_process_exit(pid)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX process groups")
+@pytest.mark.usefixtures("_real_posix_server_lifecycle")
+class TestPosixServerProcessTree:
+    """Real POSIX coverage for server roots that exit before descendants."""
+
+    @staticmethod
+    def _make_server(tmp_path: Path) -> ServerProcess:
+        config_dir = tmp_path / "runtime"
+        config_dir.mkdir()
+        (config_dir / "langgraph.json").write_text("{}", encoding="utf-8")
+        return ServerProcess(config_dir=config_dir, port=43210)
+
+    @staticmethod
+    def _patch_server_command(
+        monkeypatch: pytest.MonkeyPatch,
+        script: str,
+    ) -> None:
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server._build_server_cmd",
+            lambda *_args, **_kwargs: [sys.executable, "-c", script],
+        )
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server._port_in_use",
+            lambda *_args: False,
+        )
+
+    async def test_stop_cleans_child_after_root_exit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Explicit stop terminates descendants after the root is reaped."""
+        pid_file = tmp_path / "posix-child.pid"
+        terminated_file = tmp_path / "posix-child.terminated"
+        server = self._make_server(tmp_path)
+        self._patch_server_command(
+            monkeypatch,
+            _posix_root_exits_with_child_script(pid_file, terminated_file),
+        )
+        child_pid: int | None = None
+
+        async def observe_root_exit(
+            *_args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal child_pid
+            process = kwargs["process"]
+            assert isinstance(process, subprocess.Popen)
+            child_pid = await asyncio.to_thread(_wait_for_pid_file, pid_file)
+            await asyncio.to_thread(
+                process.wait,
+                timeout=_POSIX_PROCESS_TEST_TIMEOUT,
+            )
+            assert process.returncode == 7
+            assert _posix_process_is_running(child_pid)
+
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.wait_for_server_healthy",
+            observe_root_exit,
+        )
+
+        try:
+            await server.start()
+            assert child_pid is not None
+            assert server._posix_owner is not None
+
+            server.stop()
+
+            assert _wait_for_posix_process_exit(child_pid)
+            assert terminated_file.read_text(encoding="utf-8") == "terminated"
+            assert server._process is None
+            assert server._posix_owner is None
+        finally:
+            server.stop()
+            _force_stop_posix_test_process(child_pid)
+
+    async def test_repeated_stop_consumes_real_owner_once(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repeated stop is idempotent after a real root exits early."""
+        pid_file = tmp_path / "repeated-posix-child.pid"
+        terminated_file = tmp_path / "repeated-posix-child.terminated"
+        server = self._make_server(tmp_path)
+        self._patch_server_command(
+            monkeypatch,
+            _posix_root_exits_with_child_script(pid_file, terminated_file),
+        )
+        child_pid: int | None = None
+
+        async def observe_root_exit(
+            *_args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal child_pid
+            process = kwargs["process"]
+            assert isinstance(process, subprocess.Popen)
+            child_pid = await asyncio.to_thread(_wait_for_pid_file, pid_file)
+            await asyncio.to_thread(
+                process.wait,
+                timeout=_POSIX_PROCESS_TEST_TIMEOUT,
+            )
+
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.wait_for_server_healthy",
+            observe_root_exit,
+        )
+
+        try:
+            await server.start()
+            assert child_pid is not None
+            owner = server._posix_owner
+            assert owner is not None
+
+            with patch.object(
+                owner,
+                "terminate",
+                wraps=owner.terminate,
+            ) as terminate:
+                server.stop()
+                server.stop()
+
+            terminate.assert_called_once()
+            assert _wait_for_posix_process_exit(child_pid)
+            assert terminated_file.read_text(encoding="utf-8") == "terminated"
+        finally:
+            server.stop()
+            _force_stop_posix_test_process(child_pid)
+
+    async def test_startup_failure_cleans_child_after_root_exit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Startup failure tears down descendants after the root exits."""
+        pid_file = tmp_path / "failed-posix-child.pid"
+        terminated_file = tmp_path / "failed-posix-child.terminated"
+        server = self._make_server(tmp_path)
+        self._patch_server_command(
+            monkeypatch,
+            _posix_root_exits_with_child_script(pid_file, terminated_file),
+        )
+        child_pid: int | None = None
+
+        async def fail_after_root_exit(
+            *_args: object,
+            **kwargs: object,
+        ) -> None:
+            nonlocal child_pid
+            process = kwargs["process"]
+            assert isinstance(process, subprocess.Popen)
+            child_pid = await asyncio.to_thread(_wait_for_pid_file, pid_file)
+            await asyncio.to_thread(
+                process.wait,
+                timeout=_POSIX_PROCESS_TEST_TIMEOUT,
+            )
+            msg = "root exited before readiness"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.wait_for_server_healthy",
+            fail_after_root_exit,
+        )
+
+        try:
+            with pytest.raises(RuntimeError, match="root exited before readiness"):
+                await server.start()
+
+            assert child_pid is not None
+            assert _wait_for_posix_process_exit(child_pid)
+            assert terminated_file.read_text(encoding="utf-8") == "terminated"
+            assert server._process is None
+            assert server._posix_owner is None
+        finally:
+            server.stop()
+            _force_stop_posix_test_process(child_pid)
+
+
+def _open_windows_process_handle(pid: int) -> int:
+    """Open a synchronization handle for a real Windows process."""
+    import ctypes
+    from ctypes import wintypes
+
+    synchronize = 0x00100000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    )
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel32.OpenProcess(synchronize, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        msg = f"OpenProcess failed for pid={pid}"
+        raise OSError(error, msg)
+    return int(handle)
+
+
+def _windows_process_handle_is_running(handle: int) -> bool:
+    """Return whether a process handle is still unsignaled."""
+    import ctypes
+    from ctypes import wintypes
+
+    wait_timeout = 0x00000102
+    wait_failed = 0xFFFFFFFF
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    result = int(kernel32.WaitForSingleObject(handle, 0))
+    if result == wait_failed:
+        error = ctypes.get_last_error()
+        msg = "WaitForSingleObject failed"
+        raise OSError(error, msg)
+    return result == wait_timeout
+
+
+def _wait_for_windows_process_handle_exit(handle: int) -> bool:
+    """Wait for a real Windows process handle to become signaled."""
+    import ctypes
+    from ctypes import wintypes
+
+    wait_object_0 = 0
+    wait_failed = 0xFFFFFFFF
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    result = int(
+        kernel32.WaitForSingleObject(
+            handle,
+            int(_WINDOWS_PROCESS_TEST_TIMEOUT * 1000),
+        )
+    )
+    if result == wait_failed:
+        error = ctypes.get_last_error()
+        msg = "WaitForSingleObject failed"
+        raise OSError(error, msg)
+    return result == wait_object_0
+
+
+def _close_windows_process_handle(handle: int) -> None:
+    """Close a native process handle opened by a Windows lifecycle test."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    assert kernel32.CloseHandle(handle)
+
+
+def _child_process_script(pid_file: Path, *, exit_root: bool = False) -> str:
+    """Build a Python script that publishes and then outlives a child process."""
+    child_code = "import time; time.sleep(300)"
+    root_tail = "raise SystemExit(7)" if exit_root else "time.sleep(300)"
+    return (
+        "import subprocess, sys, time\n"
+        "from pathlib import Path\n"
+        "child = subprocess.Popen(\n"
+        f"    [sys.executable, '-c', {child_code!r}],\n"
+        "    stdin=subprocess.DEVNULL,\n"
+        "    stdout=subprocess.DEVNULL,\n"
+        "    stderr=subprocess.DEVNULL,\n"
+        ")\n"
+        f"Path({str(pid_file)!r}).write_text(str(child.pid), encoding='utf-8')\n"
+        f"{root_tail}\n"
+    )
+
+
+def _root_process_script(ready_file: Path) -> str:
+    """Build a Python script that reports readiness and remains alive."""
+    return (
+        "import os, time\n"
+        "from pathlib import Path\n"
+        f"Path({str(ready_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\n"
+        "time.sleep(300)\n"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows Job Objects")
+@pytest.mark.usefixtures("_real_windows_server_lifecycle")
+class TestWindowsServerProcessTree:
+    """Real Windows coverage for the owned `langgraph dev` process tree."""
+
+    @staticmethod
+    def _make_server(tmp_path: Path) -> ServerProcess:
+        config_dir = tmp_path / "runtime"
+        config_dir.mkdir()
+        (config_dir / "langgraph.json").write_text("{}", encoding="utf-8")
+        return ServerProcess(config_dir=config_dir, port=43210)
+
+    @staticmethod
+    def _patch_server_command(
+        monkeypatch: pytest.MonkeyPatch,
+        script: str,
+    ) -> None:
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server._build_server_cmd",
+            lambda *_args, **_kwargs: [sys.executable, "-c", script],
+        )
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server._port_in_use",
+            lambda *_args: False,
+        )
+
+    @staticmethod
+    def _assert_no_cleanup_warning(caplog: pytest.LogCaptureFixture) -> None:
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+            and (
+                "server process" in record.getMessage().lower()
+                or "server job" in record.getMessage().lower()
+                or "orphan" in record.getMessage().lower()
+            )
+        ]
+        assert warnings == []
+
+    async def test_child_descendant_cleanup(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Stopping the server terminates a real child descendant."""
+        child_pid_file = tmp_path / "child.pid"
+        server = self._make_server(tmp_path)
+        self._patch_server_command(
+            monkeypatch,
+            _child_process_script(child_pid_file),
+        )
+
+        async def wait_until_child_starts(
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            await asyncio.to_thread(_wait_for_pid_file, child_pid_file)
+
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.wait_for_server_healthy",
+            wait_until_child_starts,
+        )
+
+        child_handle: int | None = None
+        try:
+            await server.start()
+            process = server._process
+            assert process is not None
+            child_pid = _wait_for_pid_file(child_pid_file)
+            child_handle = _open_windows_process_handle(child_pid)
+            assert _windows_process_handle_is_running(child_handle)
+
+            with caplog.at_level(logging.WARNING):
+                server.stop()
+
+            assert process.poll() is not None
+            assert _wait_for_windows_process_handle_exit(child_handle)
+            assert server._windows_job is None
+            self._assert_no_cleanup_warning(caplog)
+        finally:
+            server.stop()
+            if child_handle is not None:
+                _close_windows_process_handle(child_handle)
+
+    async def test_root_exits_early_but_child_is_cleaned_up(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Startup cleanup terminates the Job after its root already exited."""
+        child_pid_file = tmp_path / "early-child.pid"
+        server = self._make_server(tmp_path)
+        self._patch_server_command(
+            monkeypatch,
+            _child_process_script(child_pid_file, exit_root=True),
+        )
+        child_handles: list[int] = []
+
+        async def observe_root_exit(
+            *_args: object,
+            **kwargs: object,
+        ) -> None:
+            process = kwargs["process"]
+            assert isinstance(process, subprocess.Popen)
+            child_pid = await asyncio.to_thread(_wait_for_pid_file, child_pid_file)
+            child_handle = _open_windows_process_handle(child_pid)
+            child_handles.append(child_handle)
+            await asyncio.to_thread(
+                process.wait,
+                timeout=_WINDOWS_PROCESS_TEST_TIMEOUT,
+            )
+            assert process.returncode == 7
+            assert _windows_process_handle_is_running(child_handle)
+            msg = "root exited before readiness"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.wait_for_server_healthy",
+            observe_root_exit,
+        )
+
+        try:
+            with (
+                caplog.at_level(logging.WARNING),
+                pytest.raises(RuntimeError, match="root exited before readiness"),
+            ):
+                await server.start()
+
+            assert len(child_handles) == 1
+            assert _wait_for_windows_process_handle_exit(child_handles[0])
+            assert server._process is None
+            assert server._windows_job is None
+            self._assert_no_cleanup_warning(caplog)
+        finally:
+            server.stop()
+            for handle in child_handles:
+                _close_windows_process_handle(handle)
+
+    async def test_job_assignment_failure_reaps_suspended_root(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Assignment failure kills the real suspended root before it can run."""
+        from deepagents_code.update_check import _WindowsJobObject
+
+        sentinel = tmp_path / "unowned-process-ran"
+        server = self._make_server(tmp_path)
+        script = (
+            "import time\n"
+            "from pathlib import Path\n"
+            f"Path({str(sentinel)!r}).write_text('ran', encoding='utf-8')\n"
+            "time.sleep(300)\n"
+        )
+        self._patch_server_command(monkeypatch, script)
+
+        real_popen = subprocess.Popen
+        processes: list[subprocess.Popen[Any]] = []
+
+        def capture_process(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.subprocess.Popen",
+            capture_process,
+        )
+        healthy = AsyncMock()
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.wait_for_server_healthy",
+            healthy,
+        )
+
+        def fail_assignment(_process_handle: int) -> None:
+            time.sleep(0.2)
+            assert not sentinel.exists()
+            msg = "Job assignment unavailable"
+            raise OSError(msg)
+
+        try:
+            with (
+                patch.object(
+                    _WindowsJobObject,
+                    "create_for_process_handle",
+                    side_effect=fail_assignment,
+                ),
+                caplog.at_level(logging.WARNING),
+                pytest.raises(OSError, match="Job assignment unavailable"),
+            ):
+                await server.start()
+
+            assert len(processes) == 1
+            assert processes[0].poll() is not None
+            assert not sentinel.exists()
+            healthy.assert_not_awaited()
+            assert server._process is None
+            assert server._windows_job is None
+            self._assert_no_cleanup_warning(caplog)
+        finally:
+            server.stop()
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=_WINDOWS_PROCESS_TEST_TIMEOUT)
+
+    async def test_normal_shutdown(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A normally running real server root is terminated and reaped."""
+        ready_file = tmp_path / "ready"
+        server = self._make_server(tmp_path)
+        self._patch_server_command(monkeypatch, _root_process_script(ready_file))
+
+        async def wait_until_ready(
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            await asyncio.to_thread(_wait_for_pid_file, ready_file)
+
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.wait_for_server_healthy",
+            wait_until_ready,
+        )
+
+        try:
+            await server.start()
+            process = server._process
+            assert process is not None
+
+            with caplog.at_level(logging.WARNING):
+                server.stop()
+
+            assert process.poll() is not None
+            assert server._process is None
+            assert server._windows_job is None
+            self._assert_no_cleanup_warning(caplog)
+        finally:
+            server.stop()
+
+    async def test_repeated_stop_is_idempotent(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Repeated stop closes the real Job once without cleanup warnings."""
+        ready_file = tmp_path / "repeated-ready"
+        server = self._make_server(tmp_path)
+        self._patch_server_command(monkeypatch, _root_process_script(ready_file))
+
+        async def wait_until_ready(
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            await asyncio.to_thread(_wait_for_pid_file, ready_file)
+
+        monkeypatch.setattr(
+            "deepagents_code.client.launch.server.wait_for_server_healthy",
+            wait_until_ready,
+        )
+
+        try:
+            await server.start()
+            process = server._process
+            job = server._windows_job
+            assert process is not None
+            assert job is not None
+
+            with (
+                patch.object(job, "terminate", wraps=job.terminate) as terminate,
+                caplog.at_level(logging.WARNING),
+            ):
+                server.stop()
+                server.stop()
+
+            terminate.assert_called_once_with()
+            assert process.poll() is not None
+            assert server._process is None
+            assert server._windows_job is None
+            self._assert_no_cleanup_warning(caplog)
+        finally:
+            server.stop()

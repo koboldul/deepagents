@@ -9,6 +9,7 @@ import pytest
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Container, Vertical, VerticalScroll
+from textual.pilot import Pilot
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
@@ -241,6 +242,31 @@ class TestModelSelectorEscapeKey:
 class TestModelSelectorChrome:
     """Tests for model selector title and description chrome."""
 
+    async def _wait_for_help_text_layout(
+        self,
+        app: ModelSelectorTestApp,
+        pilot: Pilot,
+        screen: ModelSelectorScreen,
+    ) -> Static:
+        """Wait for deferred layout passes to settle the help footer."""
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+
+        for _ in range(10):
+            help_widgets = list(screen.query(".model-selector-help").results(Static))
+            if help_widgets:
+                help_text = help_widgets[0]
+                if (
+                    help_text.display
+                    and help_text.region.y >= 0
+                    and help_text.region.bottom <= app.size.height
+                ):
+                    return help_text
+            await pilot.pause()
+
+        msg = "model selector help text never settled into bounds"
+        raise AssertionError(msg)
+
     async def test_optional_title_and_description_render(self) -> None:
         """A custom title and description should render above the filter."""
         app = ModelSelectorTestApp()
@@ -333,9 +359,7 @@ class TestModelSelectorChrome:
         async with app.run_test(size=(80, 24)) as pilot:
             screen = ModelSelectorScreen()
             app.push_screen(screen)
-            await pilot.pause()
-
-            help_text = screen.query_one(".model-selector-help", Static)
+            help_text = await self._wait_for_help_text_layout(app, pilot, screen)
 
             assert "Ctrl+R recommended" in str(help_text.content)
             # `content` holds the full string even when a one-row clamp clips it

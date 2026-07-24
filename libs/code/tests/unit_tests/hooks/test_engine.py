@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from typing import TYPE_CHECKING
@@ -532,14 +533,18 @@ async def test_runner_accepts_json_and_uses_invocation_cwd(tmp_path: Path) -> No
 
 async def test_runner_executes_shell_syntax(tmp_path: Path) -> None:
     out = tmp_path / "shell.txt"
-    command = f"printf '%s' '{{\"systemMessage\":\"ok\"}}' > {out} && cat {out}"
+    payload = '{"systemMessage":"ok"}'
+    if os.name == "nt":
+        command = f'echo {payload} > "{out}" && type "{out}"'
+    else:
+        command = f"printf '%s' '{payload}' > {out} && cat {out}"
     handler = _handler(tmp_path, command)
 
     result = await run_command_handler(handler, b"{}", cwd=tmp_path)
 
     assert result.output is not None
     assert result.output.system_message == "ok"
-    assert out.read_text() == '{"systemMessage":"ok"}'
+    assert json.loads(out.read_text()) == {"systemMessage": "ok"}
 
 
 @pytest.mark.parametrize(
