@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 from deepagents_code._cli_context import CLIContext, CLIContextSchema
 from deepagents_code._repository_bounds import REPOSITORY_TOOL_CALL_LIMIT
 from deepagents_code.agent import (
+    _AGENT_DIR_MARKER,
     _MEMORY_READONLY_SYSTEM_PROMPT,
     DEFAULT_AGENT_NAME,
     AsyncApprovalHITLMiddleware,
@@ -2141,10 +2142,14 @@ class TestListAgentsJson:
 
         default_dir = agents_dir / DEFAULT_AGENT_NAME
         default_dir.mkdir()
-        (default_dir / "AGENTS.md").touch()
+        (default_dir / _AGENT_DIR_MARKER).touch()
 
         other_dir = agents_dir / "researcher"
         other_dir.mkdir()
+        (other_dir / _AGENT_DIR_MARKER).touch()
+
+        # Bare directory without the marker is not an agent.
+        (agents_dir / "not-an-agent").mkdir()
 
         mock_settings = Mock()
         mock_settings.user_deepagents_dir = agents_dir
@@ -2168,7 +2173,7 @@ class TestListAgentsJson:
 
         researcher = next(a for a in agents if a["name"] == "researcher")
         assert researcher["is_default"] is False
-        assert researcher["has_agents_md"] is False
+        assert researcher["has_agents_md"] is True
 
     def test_json_output_empty(self, tmp_path: Path) -> None:
         """JSON output returns empty array when no agents exist."""
@@ -3144,6 +3149,11 @@ class TestMiddlewareStackConformance:
         """
         from langchain.agents.middleware.types import AgentMiddleware
 
+        from deepagents_code.cost_tracking import CostTrackingMiddleware
+        from deepagents_code.goal_tools import GoalToolsMiddleware
+        from deepagents_code.reliable_rubric import ReliableRubricMiddleware
+        from deepagents_code.resume_state import ResumeStateMiddleware
+
         agent_dir = tmp_path / "agent"
         agent_dir.mkdir()
         skills_dir = tmp_path / "skills"
@@ -3202,6 +3212,28 @@ class TestMiddlewareStackConformance:
             assert isinstance(mw, AgentMiddleware), (
                 f"{type(mw).__name__} does not inherit from AgentMiddleware"
             )
+
+        middleware_types = [type(middleware) for middleware in middleware_list]
+        assert middleware_types.count(CostTrackingMiddleware) == 1
+        assert (
+            middleware_types.index(ResumeStateMiddleware)
+            < middleware_types.index(CostTrackingMiddleware)
+            < middleware_types.index(GoalToolsMiddleware)
+        )
+        # `after_agent` hooks run in reverse list order, so cost tracking must
+        # stay *before* the rubric middleware. Reversed, the grading agent's
+        # spend lands in the next turn's checkpoint or is lost outright on a
+        # session's final turn. The two are registered ~460 lines apart in
+        # different functions, so nothing but this assertion pins the order.
+        assert middleware_types.index(CostTrackingMiddleware) < middleware_types.index(
+            ReliableRubricMiddleware
+        )
+        # The main agent owns the thread's cumulative cost; only nested
+        # instances opt out of writing it.
+        cost_middleware = next(
+            mw for mw in middleware_list if isinstance(mw, CostTrackingMiddleware)
+        )
+        assert cost_middleware._nested is False
 
 
 class TestEnableAskUser:
@@ -3866,17 +3898,19 @@ class TestCreateCliAgentShellMiddlewareWiring:
                 isinstance(mw, ShellAllowListMiddleware) for mw in middleware
             ), f"Unexpected shell middleware on subagent {name!r}"
 
-    def test_subagent_middleware_combines_shell_and_configurable_model(
+    def test_subagent_middleware_combines_shell_configurable_model_and_cost(
         self, tmp_path: Path
     ) -> None:
-        """Restrictive shell + implicit model should yield both middlewares.
+        """Restrictive shell + implicit model should yield shell, model, and cost.
 
-        Explicitly pinned subagents keep shell restriction but must not gain
-        `ConfigurableModelMiddleware`, which would let a runtime `/model` switch
-        clobber the pinned model.
+        Explicitly pinned subagents keep shell restriction and cost tracking but
+        must not gain `ConfigurableModelMiddleware`, which would let a runtime
+        `/model` switch clobber the pinned model.
         """
         from deepagents_code.agent import ShellAllowListMiddleware
         from deepagents_code.configurable_model import ConfigurableModelMiddleware
+        from deepagents_code.cost_tracking import CostTrackingMiddleware
+        from deepagents_code.hooks.server_middleware import ServerHooksMiddleware
 
         mock_settings = self._build_mock_settings(tmp_path)
         mock_agent = Mock()
@@ -3935,8 +3969,18 @@ class TestCreateCliAgentShellMiddlewareWiring:
             ]
             assert middleware_types == [
                 ConfigurableModelMiddleware,
+                CostTrackingMiddleware,
                 ShellAllowListMiddleware,
+                ServerHooksMiddleware,
             ], f"Unexpected middleware on subagent {name!r}: {middleware_types}"
+            assert subagents_by_name[name]["middleware"][-1]._emit_stop is False
+            # Nested spend is priced once by the main agent, so a subagent's
+            # instance must not also write the shared cost channel.
+            assert all(
+                mw._nested
+                for mw in subagents_by_name[name]["middleware"]
+                if isinstance(mw, CostTrackingMiddleware)
+            ), f"Subagent {name!r} must install cost tracking in nested mode"
 
         pinned = subagents_by_name["pinned"]
         assert pinned["model"] == "anthropic:claude-haiku-4-5"
@@ -3944,9 +3988,20 @@ class TestCreateCliAgentShellMiddlewareWiring:
         assert any(
             isinstance(mw, ShellAllowListMiddleware) for mw in pinned_middleware
         ), "Pinned subagent should retain shell middleware"
+        assert any(
+            isinstance(mw, CostTrackingMiddleware) and mw._nested
+            for mw in pinned_middleware
+        ), "Pinned subagent should retain nested cost tracking"
         assert not any(
             isinstance(mw, ConfigurableModelMiddleware) for mw in pinned_middleware
         ), "Pinned subagent must not gain configurable model middleware"
+        assert any(isinstance(mw, ServerHooksMiddleware) for mw in pinned_middleware), (
+            "Pinned subagent should wrap tools with server hooks"
+        )
+        hooks_mw = next(
+            mw for mw in pinned_middleware if isinstance(mw, ServerHooksMiddleware)
+        )
+        assert hooks_mw._emit_stop is False
 
     def test_subagents_get_managed_memory_guard_when_memory_enabled(
         self, tmp_path: Path
@@ -4929,8 +4984,16 @@ def _mock_agents_dir(agents_dir: Path) -> Mock:
     return mock_settings
 
 
+def _seed_agent(agents_dir: Path, name: str) -> Path:
+    """Create an agent profile directory with the `AGENTS.md` marker."""
+    agent_dir = agents_dir / name
+    agent_dir.mkdir()
+    (agent_dir / _AGENT_DIR_MARKER).touch()
+    return agent_dir
+
+
 class TestGetAvailableAgentNames:
-    """Tests for `get_available_agent_names`."""
+    """Tests for fail-closed `get_available_agent_names` discovery."""
 
     def test_returns_empty_when_dir_missing(self, tmp_path: Path) -> None:
         """No ~/.deepagents directory → empty list, no error."""
@@ -4939,20 +5002,32 @@ class TestGetAvailableAgentNames:
             assert get_available_agent_names() == []
 
     def test_returns_sorted_agent_names(self, tmp_path: Path) -> None:
-        """Subdirectories are returned sorted."""
+        """Marker-bearing subdirectories are returned sorted."""
         agents_dir = tmp_path / "agents"
         agents_dir.mkdir()
         for name in ("zebra", "alpha", "mango"):
-            (agents_dir / name).mkdir()
+            _seed_agent(agents_dir, name)
 
         with patch("deepagents_code.agent.settings", _mock_agents_dir(agents_dir)):
             assert get_available_agent_names() == ["alpha", "mango", "zebra"]
+
+    def test_requires_agents_md_marker(self, tmp_path: Path) -> None:
+        """Bare directories without `AGENTS.md` are not agents (fail-closed)."""
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        _seed_agent(agents_dir, "agent")
+        (agents_dir / "empty-dir").mkdir()
+        (agents_dir / "skills-only").mkdir()
+        (agents_dir / "skills-only" / "skills").mkdir()
+
+        with patch("deepagents_code.agent.settings", _mock_agents_dir(agents_dir)):
+            assert get_available_agent_names() == ["agent"]
 
     def test_ignores_files_and_non_dirs(self, tmp_path: Path) -> None:
         """Files sitting next to agent directories are excluded."""
         agents_dir = tmp_path / "agents"
         agents_dir.mkdir()
-        (agents_dir / "agent").mkdir()
+        _seed_agent(agents_dir, "agent")
         (agents_dir / "config.toml").write_text("")
         (agents_dir / ".DS_Store").write_text("")
 
@@ -4963,11 +5038,11 @@ class TestGetAvailableAgentNames:
         """Symlinked directories are excluded — a dangling link must not show up."""
         agents_dir = tmp_path / "agents"
         agents_dir.mkdir()
-        (agents_dir / "real").mkdir()
-        # Symlink to a real dir — still excluded because we only want files
-        # that live inside `~/.deepagents/` directly.
+        _seed_agent(agents_dir, "real")
+        # Symlink to a real agent dir — still excluded because discovery only
+        # accepts directories that live inside `~/.deepagents/` directly.
         real_target = tmp_path / "outside"
-        real_target.mkdir()
+        _seed_agent(tmp_path, "outside")
         (agents_dir / "linked").symlink_to(real_target, target_is_directory=True)
         # Dangling symlink (target doesn't exist).
         (agents_dir / "broken").symlink_to(tmp_path / "ghost")
@@ -4975,44 +5050,64 @@ class TestGetAvailableAgentNames:
         with patch("deepagents_code.agent.settings", _mock_agents_dir(agents_dir)):
             assert get_available_agent_names() == ["real"]
 
-    def test_ignores_dot_prefixed_dirs(self, tmp_path: Path) -> None:
-        """`.state/` and other hidden dirs are excluded from the agent list."""
+    def test_ignores_symlink_marker_file(self, tmp_path: Path) -> None:
+        """A symlink named `AGENTS.md` does not count as the agent marker."""
         agents_dir = tmp_path / "agents"
         agents_dir.mkdir()
-        (agents_dir / "agent").mkdir()
-        (agents_dir / ".state").mkdir()
+        _seed_agent(agents_dir, "agent")
+        fake = agents_dir / "linked-marker"
+        fake.mkdir()
+        target = tmp_path / "external-AGENTS.md"
+        target.write_text("external")
+        (fake / _AGENT_DIR_MARKER).symlink_to(target)
+
+        with patch("deepagents_code.agent.settings", _mock_agents_dir(agents_dir)):
+            assert get_available_agent_names() == ["agent"]
+
+    def test_ignores_dot_prefixed_dirs(self, tmp_path: Path) -> None:
+        """`.state/` and other hidden dirs are excluded even with a marker."""
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        _seed_agent(agents_dir, "agent")
+        state = agents_dir / ".state"
+        state.mkdir()
+        (state / _AGENT_DIR_MARKER).touch()
         (agents_dir / ".cache").mkdir()
 
         with patch("deepagents_code.agent.settings", _mock_agents_dir(agents_dir)):
             assert get_available_agent_names() == ["agent"]
 
-    def test_ignores_reserved_bin_dir(self, tmp_path: Path) -> None:
-        """The managed-binary install dir is excluded from the agent list.
+    def test_ignores_app_owned_dirs_without_marker(self, tmp_path: Path) -> None:
+        """App-owned dirs under `~/.deepagents/` are not agents without a marker.
 
-        The reserved dir name is derived from `BIN_DIR.name` rather than the
-        literal `bin` so a future rename of `BIN_DIR` keeps this test exercising
-        the actual reserved name instead of a stale string.
+        Names are taken from the owning modules so renames stay covered.
         """
         agents_dir = tmp_path / "agents"
         agents_dir.mkdir()
-        (agents_dir / "agent").mkdir()
-        (agents_dir / BIN_DIR.name).mkdir()
+        _seed_agent(agents_dir, "agent")
+        for name in (
+            BIN_DIR.name,
+            DEFAULT_PLUGIN_DIRNAME,
+            CONVERSATION_HISTORY_DIRNAME,
+        ):
+            (agents_dir / name).mkdir()
 
         with patch("deepagents_code.agent.settings", _mock_agents_dir(agents_dir)):
             assert get_available_agent_names() == ["agent"]
 
-    def test_ignores_reserved_app_dirs(self, tmp_path: Path) -> None:
-        """App-owned `plugins/` and `conversation_history/` are not agents.
+    def test_ignores_app_owned_dirs_even_with_marker(self, tmp_path: Path) -> None:
+        """Reserved app dirs stay out of the picker even if stamped with `AGENTS.md`.
 
-        These directories are created by the app under `~/.deepagents/` for
-        plugin state and offloaded conversation archives, so they must never
-        surface in the `/agent` picker alongside real agents.
+        A invocation like `dcode -a plugins` creates the memory marker inside
+        the app-owned directory. The reserved-name denylist must still exclude
+        it so the picker never offers app state as a switchable agent
+        (which would also invite destructive `agents reset`).
         """
         agents_dir = tmp_path / "agents"
         agents_dir.mkdir()
-        (agents_dir / "agent").mkdir()
-        for reserved in _reserved_agent_dir_names():
-            (agents_dir / reserved).mkdir()
+        _seed_agent(agents_dir, "agent")
+        for name in _reserved_agent_dir_names():
+            _seed_agent(agents_dir, name)
 
         with patch("deepagents_code.agent.settings", _mock_agents_dir(agents_dir)):
             assert get_available_agent_names() == ["agent"]
@@ -5141,6 +5236,184 @@ class TestCreateCliAgentInterpreterWiring:
         assert middleware.index(auto_middleware) < middleware.index(
             compaction_middleware
         )
+
+    def test_auto_classifier_model_argument_reaches_middleware(
+        self, tmp_path: Path
+    ) -> None:
+        """An explicit classifier model is handed to the Auto middleware."""
+        from deepagents_code.auto_mode import AutoModeHITLMiddleware
+
+        middleware = self._capture_middleware(
+            tmp_path,
+            auto_mode_enabled=True,
+            auto_classifier_model="openai:gpt-5.5-mini",
+        )
+
+        auto_middleware = next(
+            item for item in middleware if isinstance(item, AutoModeHITLMiddleware)
+        )
+        assert auto_middleware._configured_classifier_model == "openai:gpt-5.5-mini"
+
+    def test_auto_classifier_model_falls_back_to_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without an argument, env / `config.toml` decide the classifier."""
+        from deepagents_code._env_vars import AUTO_CLASSIFIER_MODEL
+        from deepagents_code.auto_mode import AutoModeHITLMiddleware
+
+        monkeypatch.setenv(AUTO_CLASSIFIER_MODEL, "anthropic:claude-haiku-4-5")
+        middleware = self._capture_middleware(tmp_path, auto_mode_enabled=True)
+
+        auto_middleware = next(
+            item for item in middleware if isinstance(item, AutoModeHITLMiddleware)
+        )
+        assert (
+            auto_middleware._configured_classifier_model == "anthropic:claude-haiku-4-5"
+        )
+
+    def test_auto_classifier_model_argument_beats_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The explicit argument outranks env / `config.toml`.
+
+        The tiers are only ever exercised separately elsewhere, so an inverted
+        precedence would let a stale exported env var quietly authorize actions
+        with a model the caller did not choose.
+        """
+        from deepagents_code._env_vars import AUTO_CLASSIFIER_MODEL
+        from deepagents_code.auto_mode import AutoModeHITLMiddleware
+
+        monkeypatch.setenv(AUTO_CLASSIFIER_MODEL, "anthropic:stale-from-env")
+        middleware = self._capture_middleware(
+            tmp_path,
+            auto_mode_enabled=True,
+            auto_classifier_model="openai:gpt-5.5-mini",
+        )
+
+        auto_middleware = next(
+            item for item in middleware if isinstance(item, AutoModeHITLMiddleware)
+        )
+        assert auto_middleware._configured_classifier_model == "openai:gpt-5.5-mini"
+
+    def test_auto_classifier_model_defaults_to_inheriting(self, tmp_path: Path) -> None:
+        """Nothing configured leaves the classifier on the main agent model."""
+        from deepagents_code.auto_mode import AutoModeHITLMiddleware
+
+        middleware = self._capture_middleware(tmp_path, auto_mode_enabled=True)
+
+        auto_middleware = next(
+            item for item in middleware if isinstance(item, AutoModeHITLMiddleware)
+        )
+        assert auto_middleware._configured_classifier_model is None
+
+    def test_auto_classifier_timeout_comes_from_the_resolver(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The middleware deadline is whatever the bounded resolver returned.
+
+        Asserting the manifest default here would be a tautology — the
+        middleware's own parameter default *is* that constant, so the assertion
+        would hold even if `create_cli_agent` stopped passing the keyword. A
+        sentinel that differs from the default pins the wiring itself.
+        """
+        from deepagents_code import config_manifest
+        from deepagents_code.auto_mode import AutoModeHITLMiddleware
+        from deepagents_code.config_manifest import (
+            AUTO_CLASSIFIER_TIMEOUT_SECONDS_DEFAULT,
+        )
+
+        sentinel = 7.5
+        assert sentinel != AUTO_CLASSIFIER_TIMEOUT_SECONDS_DEFAULT
+        monkeypatch.setattr(
+            config_manifest,
+            "resolve_auto_classifier_timeout",
+            lambda **_kwargs: sentinel,
+        )
+
+        middleware = self._capture_middleware(tmp_path, auto_mode_enabled=True)
+
+        auto_middleware = next(
+            item for item in middleware if isinstance(item, AutoModeHITLMiddleware)
+        )
+        assert auto_middleware._classifier_timeout_seconds == pytest.approx(sentinel)
+
+    def test_auto_classifier_timeout_defaults_to_manifest_default(
+        self, tmp_path: Path
+    ) -> None:
+        """Nothing configured leaves the classifier on the default deadline."""
+        from deepagents_code.auto_mode import AutoModeHITLMiddleware
+        from deepagents_code.config_manifest import (
+            AUTO_CLASSIFIER_TIMEOUT_SECONDS_DEFAULT,
+        )
+
+        middleware = self._capture_middleware(tmp_path, auto_mode_enabled=True)
+
+        auto_middleware = next(
+            item for item in middleware if isinstance(item, AutoModeHITLMiddleware)
+        )
+        assert (
+            auto_middleware._classifier_timeout_seconds
+            == AUTO_CLASSIFIER_TIMEOUT_SECONDS_DEFAULT
+        )
+
+    def test_auto_classifier_timeout_reads_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A configured deadline reaches the Auto middleware."""
+        from deepagents_code._env_vars import AUTO_CLASSIFIER_TIMEOUT
+        from deepagents_code.auto_mode import AutoModeHITLMiddleware
+
+        monkeypatch.setenv(AUTO_CLASSIFIER_TIMEOUT, "45")
+        middleware = self._capture_middleware(tmp_path, auto_mode_enabled=True)
+
+        auto_middleware = next(
+            item for item in middleware if isinstance(item, AutoModeHITLMiddleware)
+        )
+        assert auto_middleware._classifier_timeout_seconds == pytest.approx(45.0)
+
+    @pytest.mark.parametrize("auto_mode_enabled", [True, False])
+    def test_single_hitl_slot_precedes_server_hooks(
+        self,
+        tmp_path: Path,
+        *,
+        auto_mode_enabled: bool,
+    ) -> None:
+        """One HITL middleware is installed, ahead of the server hook middleware.
+
+        `AutoModeHITLMiddleware` reports the stock `HumanInTheLoopMiddleware`
+        name, so pairing it with the standalone approval middleware would trip
+        `create_agent`'s duplicate-name assertion. `ServerHooksMiddleware` must
+        stay behind whichever one is installed so its `after_model` `PreToolUse`
+        pass resolves before approval routing.
+        """
+        from deepagents_code.hooks.server_middleware import ServerHooksMiddleware
+
+        middleware = self._capture_middleware(
+            tmp_path, auto_mode_enabled=auto_mode_enabled
+        )
+
+        hitl = [item for item in middleware if item.name == "HumanInTheLoopMiddleware"]
+        hooks = next(
+            item for item in middleware if isinstance(item, ServerHooksMiddleware)
+        )
+
+        assert len(hitl) == 1
+        assert middleware.index(hitl[0]) < middleware.index(hooks)
+
+    def test_auto_mode_agent_builds(self, tmp_path: Path) -> None:
+        """Auto mode compiles a real graph rather than aborting on duplicates."""
+        agent, _backend = create_cli_agent(
+            model=_make_fake_chat_model(),
+            assistant_id="test-agent",
+            enable_memory=False,
+            enable_skills=False,
+            enable_shell=False,
+            system_prompt="test prompt",
+            cwd=tmp_path,
+            auto_mode_enabled=True,
+        )
+
+        assert agent is not None
 
     def test_auto_mode_omitted_outside_interactive(self, tmp_path: Path) -> None:
         """Auto is refused (no middleware) in a non-interactive session."""

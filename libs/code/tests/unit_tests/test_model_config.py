@@ -3,6 +3,7 @@
 import io
 import json
 import logging
+import sys
 import threading
 import tomllib
 from collections.abc import Iterator
@@ -44,6 +45,7 @@ from deepagents_code.model_config import (
     clear_default_agent,
     clear_default_model,
     clear_effort_for_model,
+    default_cache_dir,
     fingerprint_mcp_server_config,
     get_available_models,
     get_model_profiles,
@@ -77,6 +79,80 @@ def _create_git_common_dir(common_dir: Path) -> Path:
     (common_dir / "HEAD").write_text("ref: refs/heads/main\n")
     (common_dir / "config").write_text("[core]\n\tbare = false\n")
     return common_dir
+
+
+class TestDefaultCacheDir:
+    """`default_cache_dir` resolves the OS-appropriate cache root."""
+
+    def test_xdg_cache_home_set(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A set `XDG_CACHE_HOME` wins on Linux."""
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg-cache"))
+        assert default_cache_dir() == tmp_path / "xdg-cache"
+
+    def test_xdg_cache_home_unset_falls_back_to_dot_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without `XDG_CACHE_HOME`, Linux falls back to `~/.cache`."""
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        assert default_cache_dir() == tmp_path / ".cache"
+
+    def test_xdg_cache_home_empty_falls_back_to_dot_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An empty `XDG_CACHE_HOME` is treated as unset."""
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setenv("XDG_CACHE_HOME", "")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        assert default_cache_dir() == tmp_path / ".cache"
+
+    def test_macos_uses_library_caches(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MacOS resolves to `~/Library/Caches`, ignoring `XDG_CACHE_HOME`."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg-cache"))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        assert default_cache_dir() == tmp_path / "Library" / "Caches"
+
+    def test_macos_without_xdg_cache_home_uses_library_caches(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """MacOS resolves to `~/Library/Caches` when `XDG_CACHE_HOME` is unset."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        assert default_cache_dir() == tmp_path / "Library" / "Caches"
+
+    def test_xdg_cache_home_relative_falls_back_to_dot_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A relative `XDG_CACHE_HOME` is invalid per the XDG spec and ignored."""
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setenv("XDG_CACHE_HOME", "cache")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        assert default_cache_dir() == tmp_path / ".cache"
+
+    def test_windows_uses_local_app_data(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows uses its native local application-data directory."""
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local-app-data"))
+        assert default_cache_dir() == tmp_path / "local-app-data"
+
+    def test_windows_without_local_app_data_uses_home_fallback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows retains a predictable fallback when `LOCALAPPDATA` is unavailable."""
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        assert default_cache_dir() == tmp_path / "AppData" / "Local"
 
 
 def _create_git_repository(root: Path) -> Path:
@@ -217,6 +293,101 @@ class TestHasProviderCredentials:
             clear=True,
         ):
             assert has_provider_credentials("anthropic") is True
+
+    @pytest.mark.parametrize(
+        "provider", ["anthropic", "baseten", "fireworks", "google_genai", "openai"]
+    )
+    def test_returns_true_with_langsmith_gateway(self, provider: str) -> None:
+        """Returns True for providers supported by LangSmith Gateway."""
+        with patch.dict(
+            "os.environ",
+            {
+                "LANGSMITH_GATEWAY": "true",
+                "LANGSMITH_GATEWAY_API_KEY": "gateway-key",
+            },
+            clear=True,
+        ):
+            assert has_provider_credentials(provider) is True
+
+    def test_returns_true_with_custom_langsmith_gateway_url(self) -> None:
+        """Returns True when the gateway setting is a custom URL."""
+        with patch.dict(
+            "os.environ",
+            {
+                "LANGSMITH_GATEWAY": "https://gateway.example.com",
+                "LANGSMITH_GATEWAY_API_KEY": "gateway-key",
+            },
+            clear=True,
+        ):
+            status = get_provider_auth_status("openai")
+
+        assert status.state is ProviderAuthState.CONFIGURED
+        assert status.source is ProviderAuthSource.ENV
+        assert status.env_var == "LANGSMITH_GATEWAY_API_KEY"
+
+    @pytest.mark.parametrize("gateway", ["false", "0", "no", ""])
+    def test_returns_false_when_langsmith_gateway_disabled(self, gateway: str) -> None:
+        """Returns False when the gateway setting is disabled."""
+        with patch.dict(
+            "os.environ",
+            {
+                "LANGSMITH_GATEWAY": gateway,
+                "LANGSMITH_GATEWAY_API_KEY": "gateway-key",
+            },
+            clear=True,
+        ):
+            assert has_provider_credentials("anthropic") is False
+
+    def test_returns_false_when_langsmith_gateway_key_missing(self) -> None:
+        """Returns False when the enabled gateway has no API key."""
+        with patch.dict("os.environ", {"LANGSMITH_GATEWAY": "true"}, clear=True):
+            assert has_provider_credentials("openai") is False
+
+    def test_returns_false_for_unsupported_gateway_provider(self) -> None:
+        """Returns False when the provider integration lacks gateway support."""
+        with patch.dict(
+            "os.environ",
+            {
+                "LANGSMITH_GATEWAY": "true",
+                "LANGSMITH_GATEWAY_API_KEY": "gateway-key",
+            },
+            clear=True,
+        ):
+            assert has_provider_credentials("groq") is False
+
+    def test_class_path_override_does_not_borrow_gateway(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `class_path` override must not report gateway auth.
+
+        Overriding a built-in gateway provider name with a custom `class_path`
+        builds an arbitrary class (via `_create_model_from_class`) that need not
+        consume the gateway variables, so its own `api_key_env` preflight must
+        stand rather than reporting CONFIGURED off the gateway.
+        """
+        state_dir = tmp_path / ".state"
+        monkeypatch.setattr("deepagents_code.model_config.DEFAULT_STATE_DIR", state_dir)
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            "[models.providers.openai]\n"
+            'class_path = "my_package:CustomChat"\n'
+            'api_key_env = "CUSTOM_KEY"\n'
+        )
+        monkeypatch.setattr(
+            "deepagents_code.model_config.DEFAULT_CONFIG_PATH", config_path
+        )
+        with patch.dict(
+            "os.environ",
+            {
+                "LANGSMITH_GATEWAY": "true",
+                "LANGSMITH_GATEWAY_API_KEY": "gateway-key",
+            },
+            clear=True,
+        ):
+            status = get_provider_auth_status("openai")
+
+        assert status.state is ProviderAuthState.MISSING
+        assert status.env_var == "CUSTOM_KEY"
 
 
 @pytest.fixture
@@ -5656,7 +5827,7 @@ recent = "openai:gpt-5.2"
         ):
             result = _get_default_model_spec()
 
-        assert result == "anthropic:claude-opus-4-7"
+        assert result == "anthropic:claude-opus-5"
 
     def test_stored_key_used_when_neither_model_set(self, tmp_path):
         """Falls back to stored TUI credentials when no env vars are set."""
@@ -5675,7 +5846,7 @@ recent = "openai:gpt-5.2"
         ):
             result = _get_default_model_spec()
 
-        assert result == "anthropic:claude-opus-4-7"
+        assert result == "anthropic:claude-opus-5"
 
     def test_vertex_project_does_not_drive_env_default(self, tmp_path):
         """Vertex project alone should not select an automatic default model."""
@@ -5754,6 +5925,29 @@ class TestIsWarningSuppressed:
         """Returns False when config has no [warnings] section."""
         config_path = tmp_path / "config.toml"
         config_path.write_text('[models]\ndefault = "some:model"\n')
+
+        assert is_warning_suppressed("ripgrep", config_path) is False
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            'warnings = "ripgrep"',
+            'warnings = ["ripgrep"]',
+            "warnings = 3",
+        ],
+    )
+    def test_returns_false_when_warnings_is_not_a_table(
+        self, tmp_path, body: str
+    ) -> None:
+        """Fails open when `warnings` is hand-edited into a non-table.
+
+        `warnings = ["ripgrep"]` is a plausible typo given the key is
+        documented as `warnings.suppress`. It must not raise: callers treat
+        an exception here as fatal, and one of them warns that YOLO is
+        active.
+        """
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(f"{body}\n")
 
         assert is_warning_suppressed("ripgrep", config_path) is False
 

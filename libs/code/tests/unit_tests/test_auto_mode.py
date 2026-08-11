@@ -38,6 +38,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable, RunnableLambda
 from langchain_core.tools import StructuredTool, tool
 from langgraph.channels import BinaryOperatorAggregate
+from langgraph.errors import GraphInterrupt
 from langgraph.graph import StateGraph
 from langgraph.runtime import ExecutionInfo
 from langgraph.types import Command
@@ -48,7 +49,7 @@ from deepagents_code._ask_user_types import (
     ASK_USER_AUTHORIZATION_METADATA_KEY,
     MAX_ASK_USER_AUTHORIZATION_ANSWER_CHARS,
 )
-from deepagents_code._cli_context import CLIContextSchema
+from deepagents_code._cli_context import INHERIT_CLASSIFIER_MODEL, CLIContextSchema
 from deepagents_code._fake_models import _ToolBindingFakeModel
 from deepagents_code.approval_mode import (
     APPROVAL_MODE_NAMESPACE,
@@ -56,6 +57,9 @@ from deepagents_code.approval_mode import (
     approval_mode_key,
 )
 from deepagents_code.auto_mode import (
+    _MAX_CLASSIFIER_MODEL_CACHE,
+    _MAX_EMITTED_EVENT_SCOPES,
+    _MAX_PENDING_EVENT_SCOPES,
     AUTO_MODE_COUNTERS_NAMESPACE,
     USER_PROMPT_METADATA_KEY,
     AutoDecision,
@@ -66,7 +70,9 @@ from deepagents_code.auto_mode import (
     HeadlessMCPGuardMiddleware,
     _active_user_directives,
     _batch_id,
+    _ClassifierConstructionDeadlineExceededError,
     _ClassifierDeadlineExceededError,
+    _ClassifierModelUnavailableError,
     _default_counters,
     _fixed_repo_command_allowed,
     _git_environment_variable_is_dangerous,
@@ -175,12 +181,20 @@ class _UnavailableAsyncStore(_Store):
 
 
 class _StructuredModel:
-    def __init__(self, result: object = None, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        result: object = None,
+        error: Exception | None = None,
+        model_name: str | None = None,
+    ) -> None:
         self.result = result
         self.error = error
         self.calls: list[list[object]] = []
         self.call_kwargs: list[dict[str, object]] = []
         self.schema: object = None
+        # `_extract_model_name` reads `model_name` first and ignores a non-str,
+        # so the default keeps existing tests labelled by class name.
+        self.model_name = model_name
 
     def with_structured_output(self, schema: object) -> _StructuredModel:
         self.schema = schema
@@ -348,6 +362,9 @@ def _tool(name: str, *, metadata: dict[str, object] | None = None) -> Structured
 def _middleware(
     tmp_path: Path,
     *,
+    classifier_model: str | BaseChatModel | None = None,
+    classifier_timeout_seconds: float = 1,
+    classifier_construction_timeout_seconds: float = 1,
     trusted_ask_user_tool: BaseTool | None = None,
     trusted_compaction_tool: BaseTool | None = None,
 ) -> AutoModeHITLMiddleware:
@@ -364,7 +381,11 @@ def _middleware(
             "mcp_read": config,
         },
         worktree_root=tmp_path,
-        classifier_timeout_seconds=1,
+        classifier_timeout_seconds=classifier_timeout_seconds,
+        classifier_construction_timeout_seconds=(
+            classifier_construction_timeout_seconds
+        ),
+        classifier_model=classifier_model,
         trusted_ask_user_tool=trusted_ask_user_tool,
         trusted_compaction_tool=trusted_compaction_tool,
     )
@@ -442,6 +463,7 @@ def _request(
     store: _Store | None = None,
     raw_user_text: str = "perform the requested task",
     expanded_text: str = "expanded file content must not authorize anything",
+    classifier_model: str | None = None,
 ) -> tuple[ModelRequest[Any], _Store, str]:
     _ = args
     thread_id = "thread-1"
@@ -454,6 +476,7 @@ def _request(
             "turn_id": "turn-1",
             "approval_mode_key": key,
             "approval_mode": "auto",
+            "classifier_model": classifier_model,
         },
         execution_info=SimpleNamespace(thread_id=thread_id),
         store=active_store,
@@ -4473,29 +4496,128 @@ async def test_malformed_classifier_batch_blocks_call_and_increments_unavailable
 
 
 def test_classifier_unavailable_reason_specializes_timeouts() -> None:
-    assert classifier_unavailable_reason(
-        _ClassifierDeadlineExceededError(20.0), timeout_seconds=20.0
-    ) == (
-        "dcode cancelled the authorization classifier after its local "
-        "20s timeout (app-imposed, not a provider timeout)."
+    assert (
+        classifier_unavailable_reason(
+            _ClassifierDeadlineExceededError(20.0), timeout_seconds=20.0
+        )
+        == "classifier did not respond within 20s"
     )
-    assert classifier_unavailable_reason(
-        _ClassifierDeadlineExceededError(1.5), timeout_seconds=1.5
-    ) == (
-        "dcode cancelled the authorization classifier after its local "
-        "1.5s timeout (app-imposed, not a provider timeout)."
+    assert (
+        classifier_unavailable_reason(
+            _ClassifierDeadlineExceededError(1.5), timeout_seconds=1.5
+        )
+        == "classifier did not respond within 1.5s"
     )
-    # Provider exception type alone must not claim dcode cancelled the call.
+    # Provider exception type alone must not claim dcode's deadline fired.
     assert (
         classifier_unavailable_reason(TimeoutError(), timeout_seconds=20.0)
-        == "The authorization classifier was unavailable (TimeoutError)."
+        == "failed (TimeoutError)"
     )
     assert (
         classifier_unavailable_reason(
             RuntimeError("provider overloaded"), timeout_seconds=20.0
         )
-        == "The authorization classifier was unavailable (RuntimeError)."
+        == "failed (RuntimeError)"
     )
+    # A construction deadline must not read as "the model did not respond": the
+    # model was never built, so that would point at a nonexistent outage.
+    assert classifier_unavailable_reason(
+        _ClassifierConstructionDeadlineExceededError("openai:slow", 30.0),
+        timeout_seconds=20.0,
+    ) == ("configured classifier model openai:slow could not be built within 30s")
+    # A distinct classifier that fails at *invoke* time names the spec, so the
+    # user changes the setting instead of chasing the main model.
+    assert classifier_unavailable_reason(
+        RuntimeError("401"), timeout_seconds=20.0, spec="openai:gpt-5.5-mini"
+    ) == ("configured classifier model openai:gpt-5.5-mini failed (RuntimeError)")
+    # Construction failures name the spec from the exception itself, so they do
+    # not depend on the caller passing one.
+    assert classifier_unavailable_reason(
+        _ClassifierModelUnavailableError("openai:missing"), timeout_seconds=20.0
+    ) == ("configured classifier model openai:missing is unavailable")
+
+
+async def test_invoke_failure_names_distinct_classifier_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An invoke-time failure names the configured spec, not just the type.
+
+    Construction succeeds and the model is cached, so this — not a build error —
+    is the likeliest classifier failure in a long session (a rotated credential,
+    a rate limit, a provider outage). Without the spec the reason reads
+    `failed (RuntimeError)` and points nowhere.
+    """
+    classifier = _StructuredModel(error=RuntimeError("401 unauthorized"))
+    factory = _RecordingModelFactory(classifier)
+    _install_model_factory(monkeypatch, factory)
+    middleware = _middleware(tmp_path, classifier_model="openai:gpt-5.5-mini")
+    request, store, key = _request(
+        tmp_path,
+        model=_FailIfClassifiedModel(),
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    plan = await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    decision = plan["decisions"][0]
+    assert decision["disposition"] == "classifier_unavailable"
+    assert decision["reason"] == (
+        "configured classifier model openai:gpt-5.5-mini failed (RuntimeError)"
+    )
+    counters = cast("dict[str, Any]", store.items[AUTO_MODE_COUNTERS_NAMESPACE, key])
+    # An invoke failure is transient, so it feeds the counter rather than the
+    # permanent-configuration latch.
+    assert counters["consecutive_unavailable"] == 1
+    assert counters["classifier_config_failed_spec"] is None
+
+
+async def test_invoke_failure_evicts_cached_classifier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing cached classifier is rebuilt, so a fixed credential recovers.
+
+    `/auth` runs in the client and cannot reach this cache, so without eviction a
+    model built against a since-revoked credential fails identically every batch
+    until the process restarts.
+    """
+    failing = _StructuredModel(error=RuntimeError("401 unauthorized"))
+    working = _StructuredModel(_allow_result("call-2"))
+    factory = _RecordingModelFactory(failing, working)
+    _install_model_factory(monkeypatch, factory)
+    middleware = _middleware(tmp_path, classifier_model="openai:gpt-5.5-mini")
+    request, _store, _key = _request(
+        tmp_path,
+        model=_FailIfClassifiedModel(),
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    first = await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+    assert first["decisions"][0]["disposition"] == "classifier_unavailable"
+    assert "openai:gpt-5.5-mini" not in middleware._classifier_model_cache
+
+    second = await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "older.py"},
+        call_id="call-2",
+    )
+
+    # Rebuilt rather than reusing the poisoned model, so the retry can succeed.
+    assert factory.specs == ["openai:gpt-5.5-mini", "openai:gpt-5.5-mini"]
+    assert second["decisions"][0]["disposition"] == "classifier_allow"
 
 
 async def test_classifier_timeout_reports_configured_limit(tmp_path: Path) -> None:
@@ -4530,10 +4652,23 @@ async def test_classifier_timeout_reports_configured_limit(tmp_path: Path) -> No
     )
 
     assert plan["decisions"][0]["disposition"] == "classifier_unavailable"
-    assert plan["decisions"][0]["reason"] == (
-        "dcode cancelled the authorization classifier after its local "
-        "0.05s timeout (app-imposed, not a provider timeout)."
-    )
+    assert plan["decisions"][0]["reason"] == "classifier did not respond within 0.05s"
+
+
+@pytest.mark.parametrize("budget", [0, -1.0, float("nan"), float("inf")])
+def test_unusable_classifier_budget_is_rejected_at_construction(
+    tmp_path: Path, budget: float
+) -> None:
+    """A nonsensical deadline must raise, not silently deny every gated batch.
+
+    User config goes through the bounded resolver, but a programmatic zero,
+    negative, or non-finite budget would expire `asyncio.timeout` immediately and
+    turn Auto into blanket denials with no indication why.
+    """
+    with pytest.raises(ValueError, match="positive finite number"):
+        _middleware(tmp_path, classifier_timeout_seconds=budget)
+    with pytest.raises(ValueError, match="positive finite number"):
+        _middleware(tmp_path, classifier_construction_timeout_seconds=budget)
 
 
 async def test_classifier_provider_timeout_stays_type_only(tmp_path: Path) -> None:
@@ -4554,9 +4689,7 @@ async def test_classifier_provider_timeout_stays_type_only(tmp_path: Path) -> No
     )
 
     assert plan["decisions"][0]["disposition"] == "classifier_unavailable"
-    assert plan["decisions"][0]["reason"] == (
-        "The authorization classifier was unavailable (TimeoutError)."
-    )
+    assert plan["decisions"][0]["reason"] == "failed (TimeoutError)"
 
 
 async def test_classifier_unavailable_logs_underlying_error(
@@ -4582,9 +4715,7 @@ async def test_classifier_unavailable_logs_underlying_error(
 
     assert plan["decisions"][0]["disposition"] == "classifier_unavailable"
     # Provider exception text stays out of agent/UI; logs keep the detail.
-    assert plan["decisions"][0]["reason"] == (
-        "The authorization classifier was unavailable (RuntimeError)."
-    )
+    assert plan["decisions"][0]["reason"] == "failed (RuntimeError)"
     assert "provider overloaded" not in plan["decisions"][0]["reason"]
     records = [
         record
@@ -4596,6 +4727,564 @@ async def test_classifier_unavailable_logs_underlying_error(
     assert "error=RuntimeError: provider overloaded" in records[0].getMessage()
     assert records[0].exc_info is not None
     assert records[0].exc_info[0] is RuntimeError
+
+
+class _RecordingModelFactory:
+    """Stand-in for `config.create_model` that hands back canned classifiers."""
+
+    def __init__(self, *models: _StructuredModel, error: Exception | None = None):
+        self.models = list(models)
+        self.error = error
+        self.specs: list[str] = []
+
+    def __call__(self, spec: str) -> SimpleNamespace:
+        self.specs.append(spec)
+        if self.error is not None:
+            raise self.error
+        if len(self.models) == 1:
+            # One model means "any classifier will do" — the cache tests build
+            # many specs and assert on eviction, not on model identity.
+            model = self.models[0]
+        else:
+            # With several models each spec maps to its own, and running past
+            # the end raises: a test that has lost track of which model it is
+            # asserting on should fail loudly, not silently reuse the last one.
+            model = self.models[len(self.specs) - 1]
+        return SimpleNamespace(model=model)
+
+
+def _install_model_factory(
+    monkeypatch: pytest.MonkeyPatch, factory: _RecordingModelFactory
+) -> None:
+    import deepagents_code.config as config_module
+
+    monkeypatch.setattr(config_module, "create_model", factory)
+
+
+async def test_configured_classifier_model_replaces_primary(tmp_path: Path) -> None:
+    """A configured classifier reviews the batch; the primary model is untouched."""
+    classifier = _StructuredModel(_allow_result())
+    middleware = _middleware(tmp_path, classifier_model=cast("Any", classifier))
+    request, _store, _key = _request(
+        tmp_path,
+        # `_FailIfClassifiedModel` raises if the primary model is asked to review.
+        model=_FailIfClassifiedModel(),
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    plan = await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    assert plan["decisions"][0]["disposition"] == "classifier_allow"
+    assert classifier.schema is AutoDecisionBatch
+    assert len(classifier.calls) == 1
+
+
+async def test_classifier_model_spec_is_resolved_once_and_cached(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec is built through `create_model` once and reused across batches."""
+    classifier = _StructuredModel(_allow_result())
+    factory = _RecordingModelFactory(classifier)
+    _install_model_factory(monkeypatch, factory)
+    middleware = _middleware(tmp_path, classifier_model="openai:gpt-5.5-mini")
+
+    # Distinct ids so the second batch is a genuinely new one, rather than one
+    # that batch-replay detection could short-circuit before reaching the cache.
+    for call_id in ("call-1", "call-2"):
+        request, _store, _key = _request(
+            tmp_path,
+            model=_FailIfClassifiedModel(),
+            tool_name="delete",
+            args={"file_path": "old.py"},
+        )
+        classifier.result = _allow_result(call_id=call_id)
+        plan = await _plan(
+            middleware,
+            request,
+            tool_name="delete",
+            args={"file_path": "old.py"},
+            call_id=call_id,
+        )
+        assert plan["decisions"][0]["disposition"] == "classifier_allow"
+
+    assert factory.specs == ["openai:gpt-5.5-mini"]
+    assert len(classifier.calls) == 2
+
+
+async def test_classifier_model_construction_respects_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timed-out constructor stays shared for its spec while batches fail closed."""
+    started = threading.Event()
+    release = threading.Event()
+    specs: list[str] = []
+
+    def create_model(spec: str) -> SimpleNamespace:
+        specs.append(spec)
+        started.set()
+        release.wait()
+        return SimpleNamespace(model=_StructuredModel(_allow_result()))
+
+    import deepagents_code.config as config_module
+
+    monkeypatch.setattr(config_module, "create_model", create_model)
+    middleware = _middleware(
+        tmp_path,
+        classifier_model="openai:gpt-5.5-mini",
+        classifier_construction_timeout_seconds=0.01,
+    )
+    request, _store, _key = _request(
+        tmp_path,
+        model=_FailIfClassifiedModel(),
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    try:
+        plan = await _plan(
+            middleware,
+            request,
+            tool_name="delete",
+            args={"file_path": "old.py"},
+        )
+        construction = middleware._classifier_model_constructions.get(
+            "openai:gpt-5.5-mini"
+        )
+        assert construction is not None
+
+        # Cancelling another waiter must not cancel the constructor or start a
+        # replacement thread while the first one is still running.
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.01):
+                await middleware._classifier_model(request)
+        assert specs == ["openai:gpt-5.5-mini"]
+    finally:
+        release.set()
+
+    assert started.is_set()
+    assert middleware._classifier_model_lock.locked() is False
+    assert plan["decisions"][0]["disposition"] == "classifier_unavailable"
+    # Names construction, not response: the model was never built, so "did not
+    # respond" would send the user looking for a provider outage.
+    assert plan["decisions"][0]["reason"] == (
+        "configured classifier model openai:gpt-5.5-mini could not be built "
+        "within 0.01s"
+    )
+    model = await construction
+    assert middleware._classifier_model_constructions == {}
+    resolved, spec = await middleware._classifier_model(request)
+    assert resolved is model
+    assert spec == "openai:gpt-5.5-mini"
+
+
+async def test_classifier_model_switch_bypasses_timed_out_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new spec can resolve while the previous constructor remains blocked."""
+    blocked_spec = "openai:blocked"
+    replacement_spec = "openai:replacement"
+    blocked_started = threading.Event()
+    release_blocked = threading.Event()
+    replacement = _StructuredModel(_allow_result())
+    specs: list[str] = []
+
+    def create_model(spec: str) -> SimpleNamespace:
+        specs.append(spec)
+        if spec == blocked_spec:
+            blocked_started.set()
+            release_blocked.wait()
+            return SimpleNamespace(model=_StructuredModel(_allow_result()))
+        return SimpleNamespace(model=replacement)
+
+    import deepagents_code.config as config_module
+
+    monkeypatch.setattr(config_module, "create_model", create_model)
+    middleware = _middleware(tmp_path, classifier_timeout_seconds=0.1)
+    blocked_request, _store, _key = _request(
+        tmp_path,
+        model=_FailIfClassifiedModel(),
+        tool_name="delete",
+        args={"file_path": "old.py"},
+        classifier_model=blocked_spec,
+    )
+    replacement_request, _store, _key = _request(
+        tmp_path,
+        model=_FailIfClassifiedModel(),
+        tool_name="delete",
+        args={"file_path": "old.py"},
+        classifier_model=replacement_spec,
+    )
+
+    try:
+        blocked_plan_task = asyncio.create_task(
+            _plan(
+                middleware,
+                blocked_request,
+                tool_name="delete",
+                args={"file_path": "old.py"},
+            )
+        )
+        assert await asyncio.to_thread(blocked_started.wait, 1)
+        blocked_plan = await blocked_plan_task
+        blocked_task = middleware._classifier_model_constructions.get(blocked_spec)
+        assert blocked_task is not None
+
+        replacement_plan = await _plan(
+            middleware,
+            replacement_request,
+            tool_name="delete",
+            args={"file_path": "old.py"},
+        )
+    finally:
+        release_blocked.set()
+
+    assert blocked_started.is_set()
+    assert blocked_plan["decisions"][0]["disposition"] == "classifier_unavailable"
+    assert replacement_plan["decisions"][0]["disposition"] == "classifier_allow"
+    assert specs == [blocked_spec, replacement_spec]
+    assert len(replacement.calls) == 1
+    await blocked_task
+    assert middleware._classifier_model_constructions == {}
+
+
+async def test_context_classifier_model_overrides_construction_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`/auto model` (per-run context) wins over the startup-resolved value."""
+    construction_classifier = _StructuredModel(_allow_result())
+    run_classifier = _StructuredModel(_allow_result())
+    factory = _RecordingModelFactory(run_classifier)
+    _install_model_factory(monkeypatch, factory)
+    middleware = _middleware(
+        tmp_path, classifier_model=cast("Any", construction_classifier)
+    )
+    request, _store, _key = _request(
+        tmp_path,
+        model=_FailIfClassifiedModel(),
+        tool_name="delete",
+        args={"file_path": "old.py"},
+        classifier_model="anthropic:claude-haiku-4-5",
+    )
+
+    plan = await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    assert plan["decisions"][0]["disposition"] == "classifier_allow"
+    assert factory.specs == ["anthropic:claude-haiku-4-5"]
+    assert len(run_classifier.calls) == 1
+    assert construction_classifier.calls == []
+
+
+async def test_inherit_context_marker_overrides_construction_classifier(
+    tmp_path: Path,
+) -> None:
+    """`/auto model clear` returns reviews to the primary model mid-session.
+
+    A session started with a separate classifier must stop authorizing with it
+    once the user clears the setting, so the inherit marker has to beat the
+    construction-time value the way any other per-run spec does.
+    """
+    construction_classifier = _StructuredModel(_allow_result())
+    primary = _StructuredModel(_allow_result())
+    middleware = _middleware(
+        tmp_path, classifier_model=cast("Any", construction_classifier)
+    )
+    request, _store, _key = _request(
+        tmp_path,
+        model=primary,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+        classifier_model=INHERIT_CLASSIFIER_MODEL,
+    )
+
+    plan = await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    assert plan["decisions"][0]["disposition"] == "classifier_allow"
+    assert len(primary.calls) == 1
+    assert construction_classifier.calls == []
+    metadata = cast("dict[str, Any]", primary.call_kwargs[0]["config"])["metadata"]
+    assert metadata["classifier_model"] == "inherited"
+
+
+async def test_inherit_sentinel_at_construction_means_inherit(
+    tmp_path: Path,
+) -> None:
+    """A construction-time inherit marker must not read as a real spec.
+
+    `--auto-classifier-model ""` resolves to `INHERIT_CLASSIFIER_MODEL` in the
+    launch path so an explicit blank flag overrides an env / `config.toml`
+    classifier; the middleware must map that marker to "inherit the main model"
+    rather than try to build a model named `__dcode_inherit_classifier__`.
+    """
+    primary = _StructuredModel(_allow_result())
+    middleware = _middleware(
+        tmp_path, classifier_model=cast("Any", INHERIT_CLASSIFIER_MODEL)
+    )
+    request, _store, _key = _request(
+        tmp_path,
+        model=primary,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    plan = await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    assert plan["decisions"][0]["disposition"] == "classifier_allow"
+    assert len(primary.calls) == 1
+    metadata = cast("dict[str, Any]", primary.call_kwargs[0]["config"])["metadata"]
+    assert metadata["classifier_model"] == "inherited"
+
+
+async def test_absent_context_classifier_keeps_construction_classifier(
+    tmp_path: Path,
+) -> None:
+    """A run with no classifier preference leaves the startup choice alone."""
+    construction_classifier = _StructuredModel(_allow_result())
+    middleware = _middleware(
+        tmp_path, classifier_model=cast("Any", construction_classifier)
+    )
+    request, _store, _key = _request(
+        tmp_path,
+        model=_FailIfClassifiedModel(),
+        tool_name="delete",
+        args={"file_path": "old.py"},
+        classifier_model=None,
+    )
+
+    plan = await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    assert plan["decisions"][0]["disposition"] == "classifier_allow"
+    assert len(construction_classifier.calls) == 1
+
+
+async def test_classifier_model_cache_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Switching specs repeatedly evicts the oldest resolved classifier."""
+    classifier = _StructuredModel(_allow_result())
+    factory = _RecordingModelFactory(classifier)
+    _install_model_factory(monkeypatch, factory)
+    middleware = _middleware(tmp_path)
+
+    for index in range(_MAX_CLASSIFIER_MODEL_CACHE + 2):
+        request, _store, _key = _request(
+            tmp_path,
+            model=_FailIfClassifiedModel(),
+            tool_name="delete",
+            args={"file_path": "old.py"},
+            classifier_model=f"openai:model-{index}",
+        )
+        await _plan(
+            middleware,
+            request,
+            tool_name="delete",
+            args={"file_path": "old.py"},
+        )
+
+    assert len(middleware._classifier_model_cache) == _MAX_CLASSIFIER_MODEL_CACHE
+    assert "openai:model-0" not in middleware._classifier_model_cache
+
+
+async def test_inherited_classifier_forwards_primary_model_settings(
+    tmp_path: Path,
+) -> None:
+    """Inheriting the primary model keeps its per-call settings."""
+    model = _StructuredModel(_allow_result())
+    middleware = _middleware(tmp_path)
+    request, _store, _key = _request(
+        tmp_path,
+        model=model,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+    request.model_settings["cache_control"] = {"type": "ephemeral"}
+
+    await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    assert model.call_kwargs[0]["cache_control"] == {"type": "ephemeral"}
+    metadata = cast("dict[str, Any]", model.call_kwargs[0]["config"])["metadata"]
+    assert metadata["lc_source"] == "auto_mode_classifier"
+    assert metadata["classifier_model"] == "inherited"
+
+
+async def test_distinct_classifier_drops_primary_model_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Primary settings are provider-specific, so a distinct classifier skips them."""
+    classifier = _StructuredModel(_allow_result())
+    _install_model_factory(monkeypatch, _RecordingModelFactory(classifier))
+    middleware = _middleware(tmp_path, classifier_model="openai:gpt-5.5-mini")
+    request, _store, _key = _request(
+        tmp_path,
+        model=_FailIfClassifiedModel(),
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+    request.model_settings["cache_control"] = {"type": "ephemeral"}
+
+    await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    assert "cache_control" not in classifier.call_kwargs[0]
+    metadata = cast("dict[str, Any]", classifier.call_kwargs[0]["config"])["metadata"]
+    assert metadata["lc_source"] == "auto_mode_classifier"
+    assert metadata["classifier_model"] == "openai:gpt-5.5-mini"
+
+
+async def test_unresolvable_classifier_model_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A classifier model that cannot be built blocks the action, never inherits."""
+    primary = _FailIfClassifiedModel()
+    factory = _RecordingModelFactory(error=RuntimeError("no credentials"))
+    _install_model_factory(monkeypatch, factory)
+    middleware = _middleware(tmp_path, classifier_model="openai:missing-model")
+    request, store, key = _request(
+        tmp_path,
+        model=primary,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    plan = await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    assert plan["decisions"][0]["disposition"] == "classifier_unavailable"
+    assert plan["decisions"][0]["reason"] == (
+        "configured classifier model openai:missing-model is unavailable"
+    )
+    counters = cast("dict[str, Any]", store.items[AUTO_MODE_COUNTERS_NAMESPACE, key])
+    # A construction fault latches the spec instead of feeding the transient
+    # counter, which an approved fallback resets. See
+    # `test_repeated_classifier_config_failure_escalates_to_human`.
+    assert counters["classifier_config_failed_spec"] == "openai:missing-model"
+    assert counters["consecutive_unavailable"] == 0
+
+
+async def test_repeated_classifier_config_failure_escalates_to_human(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A latched construction fault asks the user instead of denying forever.
+
+    Regression test: `consecutive_unavailable` is reset whenever the user
+    approves a human fallback, so counting construction failures made an
+    unbuildable spec deny two batches for every one it asked about, forever.
+    """
+    primary = _FailIfClassifiedModel()
+    factory = _RecordingModelFactory(error=RuntimeError("no credentials"))
+    _install_model_factory(monkeypatch, factory)
+    middleware = _middleware(tmp_path, classifier_model="openai:missing-model")
+    request, store, key = _request(
+        tmp_path,
+        model=primary,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    first = await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+    assert first["decisions"][0]["disposition"] == "classifier_unavailable"
+
+    # Simulate the user approving the fallback, which clears the transient
+    # counters but must not clear the configuration latch.
+    counters = cast("dict[str, Any]", store.items[AUTO_MODE_COUNTERS_NAMESPACE, key])
+    counters["consecutive_denials"] = 0
+    counters["consecutive_unavailable"] = 0
+
+    # A distinct call id makes this a new action batch, so replay detection does
+    # not pre-empt the latch we are asserting on.
+    second = await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "older.py"},
+        call_id="call-2",
+    )
+
+    decision = second["decisions"][0]
+    assert decision["disposition"] == "require_human"
+    assert "openai:missing-model" in decision["reason"]
+    # Actionable, not just diagnostic: the prompt has to say how to switch.
+    assert "/auto model <provider:model>" in decision["reason"]
+    # The approval prompt renders the batch-level reason, so the diagnostic has
+    # to be there too or the user sees only "human approval threshold reached".
+    assert second["fallback_reason"] == decision["reason"]
+
+
+async def test_classifier_model_logged_alongside_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Decision logs name the reviewing model, not just the primary one."""
+    classifier = _StructuredModel(_allow_result())
+    _install_model_factory(monkeypatch, _RecordingModelFactory(classifier))
+    middleware = _middleware(tmp_path, classifier_model="openai:gpt-5.5-mini")
+    request, _store, _key = _request(
+        tmp_path,
+        model=_FailIfClassifiedModel(),
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    with caplog.at_level("INFO", logger="deepagents_code.auto_mode"):
+        await _plan(
+            middleware,
+            request,
+            tool_name="delete",
+            args={"file_path": "old.py"},
+        )
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "deepagents_code.auto_mode"
+        and "decision=valid" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "classifier_model=openai:gpt-5.5-mini" in messages[0]
 
 
 async def test_classifier_failure_with_counter_store_failure_routes_human(
@@ -4625,6 +5314,185 @@ async def test_classifier_failure_with_counter_store_failure_routes_human(
 
     assert plan["fallback_reason"] == "control_state_unavailable"
     assert plan["decisions"][0]["disposition"] == "require_human"
+
+
+async def test_blank_configured_classifier_inherits_main_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blank spec means "inherit", never "build `[models].default`".
+
+    `create_model("")` silently resolves the default model spec, so letting a
+    blank value through would review with a model nobody chose for
+    authorization — and label it `inherited` in traces while doing so.
+    """
+    primary = _StructuredModel(_allow_result())
+    factory = _RecordingModelFactory(_StructuredModel(_allow_result()))
+    _install_model_factory(monkeypatch, factory)
+    middleware = _middleware(tmp_path, classifier_model="   ")
+    request, _store, _key = _request(
+        tmp_path,
+        model=primary,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    plan = await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    assert plan["decisions"][0]["disposition"] == "classifier_allow"
+    # The primary model reviewed, and no model was ever constructed from "   ".
+    assert len(primary.calls) == 1
+    assert factory.specs == []
+    metadata = cast("dict[str, Any]", primary.call_kwargs[0]["config"])["metadata"]
+    assert metadata["classifier_model"] == "inherited"
+
+
+async def test_classifier_instance_is_labelled_by_model_name(
+    tmp_path: Path,
+) -> None:
+    """A chat model instance has no spec, so traces name it by model name.
+
+    Pins that the instance branch is not silently labelled `inherited`, which
+    would hide a distinct reviewer in traces and decision logs.
+    """
+    classifier = _StructuredModel(_allow_result(), model_name="sentinel-classifier")
+    middleware = _middleware(tmp_path, classifier_model=cast("Any", classifier))
+    request, _store, _key = _request(
+        tmp_path,
+        model=_FailIfClassifiedModel(),
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    metadata = cast("dict[str, Any]", classifier.call_kwargs[0]["config"])["metadata"]
+    assert metadata["classifier_model"] == "sentinel-classifier"
+
+
+async def test_classifier_cache_keeps_recently_used_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Eviction is least-recently-*used*, so a re-hit spec outlives an older one.
+
+    Without `move_to_end` on a cache hit the policy silently degrades to FIFO
+    and the spec in active use is the one thrown away.
+    """
+    factory = _RecordingModelFactory(_StructuredModel(_allow_result()))
+    _install_model_factory(monkeypatch, factory)
+    middleware = _middleware(tmp_path)
+    specs = [f"openai:model-{index}" for index in range(4)]
+
+    async def _review(spec: str) -> None:
+        request, _store, _key = _request(
+            tmp_path,
+            model=_FailIfClassifiedModel(),
+            tool_name="delete",
+            args={"file_path": "old.py"},
+            classifier_model=spec,
+        )
+        await _plan(
+            middleware,
+            request,
+            tool_name="delete",
+            args={"file_path": "old.py"},
+        )
+
+    for spec in specs:
+        await _review(spec)
+    # Re-touch the oldest entry, then overflow the bound by one.
+    await _review(specs[0])
+    await _review("openai:model-4")
+
+    cached = list(middleware._classifier_model_cache)
+    assert specs[0] in cached
+    assert specs[1] not in cached
+
+
+async def test_counter_write_failure_keeps_classifier_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two independent faults must not collapse into the one that self-heals.
+
+    Control state tends to recover; a misconfigured classifier spec never does.
+    Reporting only the former sends the user back for another round after they
+    fix the disk.
+    """
+    store = _FailingCounterStore()
+    _install_model_factory(
+        monkeypatch, _RecordingModelFactory(error=RuntimeError("no credentials"))
+    )
+    middleware = _middleware(tmp_path, classifier_model="openai:missing-model")
+    request, _active_store, key = _request(
+        tmp_path,
+        model=_FailIfClassifiedModel(),
+        tool_name="delete",
+        args={"file_path": "old.py"},
+        store=store,
+    )
+    counters = _default_counters(ApprovalMode.AUTO)
+    counters["last_turn_id"] = "turn-1"
+    store.put(AUTO_MODE_COUNTERS_NAMESPACE, key, counters)
+    store.fail_counter_writes = True
+
+    plan = await _plan(
+        middleware,
+        request,
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    assert plan["decisions"][0]["disposition"] == "require_human"
+    reason = plan["decisions"][0]["reason"]
+    assert "control state was unavailable" in reason
+    assert "openai:missing-model" in reason
+
+
+async def test_unavailable_decision_log_names_classifier_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The unavailable log names the misconfigured model, not just the primary.
+
+    This is the line an operator reads when Auto suddenly denies everything.
+    """
+    _install_model_factory(
+        monkeypatch, _RecordingModelFactory(error=RuntimeError("no credentials"))
+    )
+    middleware = _middleware(tmp_path, classifier_model="openai:missing-model")
+    request, _store, _key = _request(
+        tmp_path,
+        model=_FailIfClassifiedModel(),
+        tool_name="delete",
+        args={"file_path": "old.py"},
+    )
+
+    with caplog.at_level("INFO", logger="deepagents_code.auto_mode"):
+        await _plan(
+            middleware,
+            request,
+            tool_name="delete",
+            args={"file_path": "old.py"},
+        )
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "deepagents_code.auto_mode"
+        and "decision=unavailable" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "classifier_model=openai:missing-model" in messages[0]
 
 
 async def test_three_denials_route_next_review_to_human_without_classifier(
@@ -4924,6 +5792,157 @@ async def test_human_fallback_resets_counters_only_when_approved(
     assert store.items[APPROVAL_MODE_NAMESPACE, key] == {"mode": "auto"}
 
 
+async def test_latched_classifier_fault_reaches_the_approval_prompt(
+    tmp_path: Path,
+) -> None:
+    """The approval event must carry the fix, not a generic threshold message.
+
+    `_human_review` renders the batch-level `fallback_reason`, not each
+    decision's own reason, so a diagnostic stored only on the decision is
+    invisible to the user being asked to approve.
+    """
+    middleware = _middleware(tmp_path)
+    call = {
+        "name": "delete",
+        "args": {"file_path": "old.py"},
+        "id": "call-1",
+        "type": "tool_call",
+    }
+    ai_message = AIMessage(content="", tool_calls=[call])
+    key = approval_mode_key("thread-1")
+    store = _Store()
+    store.put(APPROVAL_MODE_NAMESPACE, key, {"mode": "auto"})
+    store.put(AUTO_MODE_COUNTERS_NAMESPACE, key, _default_counters(ApprovalMode.AUTO))
+    events: list[dict[str, object]] = []
+    runtime = SimpleNamespace(
+        context={"approval_mode_key": key, "thread_id": "thread-1"},
+        store=store,
+        stream_writer=events.append,
+    )
+    latched = (
+        "configured classifier model openai:missing-model is unavailable; Auto "
+        "asks for approval until it is fixed. Switch it with `/auto model "
+        "<provider:model>`."
+    )
+    plan = {
+        "batch_id": _batch_id(ai_message.tool_calls),
+        "thread_key": key,
+        "mode_at_proposal": "auto",
+        "phase": "planned",
+        "manual_gated_ids": ["call-1"],
+        "decisions": [
+            {
+                "tool_call_id": "call-1",
+                "disposition": "require_human",
+                "category": "other_policy",
+                "reason": latched,
+                "path": "fallback",
+            }
+        ],
+        "pending_result_ids": [],
+        "processed_result_ids": [],
+        "counters_applied": True,
+        "fallback_reason": latched,
+    }
+
+    with patch(
+        "deepagents_code.auto_mode.interrupt",
+        return_value={"decisions": [{"type": "approve"}]},
+    ):
+        await middleware.aafter_model(
+            cast(
+                "AgentState[Any]",
+                {"messages": [ai_message], "_auto_decision_plan": plan},
+            ),
+            cast("Runtime[Any]", runtime),
+        )
+
+    fallback_events = [
+        event
+        for event in events
+        if isinstance(event, dict) and event.get("event") == "fallback"
+    ]
+    assert fallback_events, events
+    reason = fallback_events[0]["reason"]
+    assert reason == latched
+    assert "human approval threshold reached" not in str(reason)
+
+
+async def test_fallback_approval_keeps_classifier_config_latch(
+    tmp_path: Path,
+) -> None:
+    """Approving a fallback must not clear a latched classifier config fault.
+
+    Regression test for the deny/deny/ask oscillation: the approval path resets
+    the transient counters, and clearing the latch here too would let an
+    unbuildable spec resume silently denying two batches for every one it asks
+    about. Only a review that actually succeeds proves the spec works.
+    """
+    middleware = _middleware(tmp_path)
+    call = {
+        "name": "delete",
+        "args": {"file_path": "old.py"},
+        "id": "call-1",
+        "type": "tool_call",
+    }
+    ai_message = AIMessage(content="", tool_calls=[call])
+    key = approval_mode_key("thread-1")
+    store = _Store()
+    store.put(APPROVAL_MODE_NAMESPACE, key, {"mode": "auto"})
+    counters = _default_counters(ApprovalMode.AUTO)
+    counters["consecutive_denials"] = 3
+    counters["consecutive_unavailable"] = 2
+    counters["classifier_config_failed_spec"] = "openai:missing-model"
+    store.put(AUTO_MODE_COUNTERS_NAMESPACE, key, counters)
+    runtime = SimpleNamespace(
+        context={"approval_mode_key": key, "thread_id": "thread-1"},
+        store=store,
+        stream_writer=lambda _event: None,
+    )
+    plan = {
+        "batch_id": _batch_id(ai_message.tool_calls),
+        "thread_key": key,
+        "mode_at_proposal": "auto",
+        "phase": "planned",
+        "manual_gated_ids": ["call-1"],
+        "decisions": [
+            {
+                "tool_call_id": "call-1",
+                "disposition": "require_human",
+                "category": "other_policy",
+                "reason": (
+                    "configured classifier model openai:missing-model is "
+                    "unavailable; human approval is required until it is fixed."
+                ),
+                "path": "fallback",
+            }
+        ],
+        "pending_result_ids": [],
+        "processed_result_ids": [],
+        "counters_applied": True,
+        "fallback_reason": None,
+    }
+
+    with patch(
+        "deepagents_code.auto_mode.interrupt",
+        return_value={"decisions": [{"type": "approve"}]},
+    ):
+        await middleware.aafter_model(
+            cast(
+                "AgentState[Any]",
+                {"messages": [ai_message], "_auto_decision_plan": plan},
+            ),
+            cast("Runtime[Any]", runtime),
+        )
+
+    saved = cast("dict[str, Any]", store.items[AUTO_MODE_COUNTERS_NAMESPACE, key])
+    # Transient counters reset, as before.
+    assert saved["consecutive_denials"] == 0
+    assert saved["consecutive_unavailable"] == 0
+    # The permanent fault does not.
+    assert saved["classifier_config_failed_spec"] == "openai:missing-model"
+
+
 async def test_fallback_switch_to_manual_requests_a_second_decision(
     tmp_path: Path,
 ) -> None:
@@ -5072,10 +6091,7 @@ async def test_classifier_unavailable_emits_single_event_for_batch(
         store=store,
         stream_writer=events.append,
     )
-    reason = (
-        "dcode cancelled the authorization classifier after its local "
-        "1s timeout (app-imposed, not a provider timeout)."
-    )
+    reason = "classifier did not respond within 1s"
     plan = {
         "batch_id": _batch_id(ai_message.tool_calls),
         "thread_key": key,
@@ -5114,6 +6130,529 @@ async def test_classifier_unavailable_emits_single_event_for_batch(
     ]
     assert len(unavailable_events) == 1
     assert unavailable_events[0]["reason"] == reason
+
+
+def _mixed_fallback_plan(key: str, ai_message: AIMessage) -> dict[str, Any]:
+    """Build a plan that blocks one call as unavailable and escalates the other."""
+    assert len(ai_message.tool_calls) == 2, "plan assumes a two-call batch"
+    unavailable_id, human_id = (call["id"] for call in ai_message.tool_calls)
+    return {
+        "batch_id": _batch_id(ai_message.tool_calls),
+        "thread_key": key,
+        "mode_at_proposal": "auto",
+        "phase": "planned",
+        "manual_gated_ids": [unavailable_id, human_id],
+        "decisions": [
+            {
+                "tool_call_id": unavailable_id,
+                "disposition": "classifier_unavailable",
+                "category": "other_policy",
+                "reason": "classifier did not respond within 1s",
+                "path": "classifier",
+            },
+            {
+                "tool_call_id": human_id,
+                "disposition": "require_human",
+                "category": "other_policy",
+                "reason": "Auto reached its human-fallback threshold.",
+                "path": "fallback",
+            },
+        ],
+        "pending_result_ids": [],
+        "processed_result_ids": [],
+        "counters_applied": True,
+        "fallback_reason": "classifier_unavailable",
+    }
+
+
+def _mixed_fallback_batch(suffix: str) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "delete",
+                "args": {"file_path": "old.py"},
+                "id": f"call-{suffix}-1",
+                "type": "tool_call",
+            },
+            {
+                "name": "delete",
+                "args": {"file_path": "older.py"},
+                "id": f"call-{suffix}-2",
+                "type": "tool_call",
+            },
+        ],
+    )
+
+
+async def test_interrupt_replay_does_not_repeat_auto_events(tmp_path: Path) -> None:
+    middleware = _middleware(tmp_path)
+    ai_message = _mixed_fallback_batch("a")
+    key = approval_mode_key("thread-1")
+    store = _Store()
+    store.put(APPROVAL_MODE_NAMESPACE, key, {"mode": "auto"})
+    counters = _default_counters(ApprovalMode.AUTO)
+    counters["consecutive_unavailable"] = 2
+    store.put(AUTO_MODE_COUNTERS_NAMESPACE, key, counters)
+    events: list[dict[str, Any]] = []
+    runtime = SimpleNamespace(
+        context={"approval_mode_key": key, "thread_id": "thread-1"},
+        store=store,
+        stream_writer=events.append,
+    )
+    state = cast(
+        "AgentState[Any]",
+        {
+            "messages": [ai_message],
+            "_auto_decision_plan": _mixed_fallback_plan(key, ai_message),
+        },
+    )
+
+    # Simulate the resume: answering the approval restarts the whole
+    # `aafter_model` node, so the second call replays every emission that
+    # precedes `interrupt()`. Patching `interrupt` to return rather than raise
+    # lets the first pass run past it, which real LangGraph would abandon; the
+    # emissions under test all happen before that point either way.
+    with patch(
+        "deepagents_code.auto_mode.interrupt",
+        return_value={"decisions": [{"type": "approve"}]},
+    ):
+        await middleware.aafter_model(state, cast("Runtime[Any]", runtime))
+        await middleware.aafter_model(state, cast("Runtime[Any]", runtime))
+
+    assert [event["event"] for event in events] == ["unavailable", "fallback"]
+    # The surviving pair is the first pass's payload, not a later re-render.
+    assert events[0]["reason"] == "classifier did not respond within 1s"
+    assert events[1]["consecutive_unavailable"] == 2
+
+
+@pytest.mark.parametrize("writer_failure", ["missing", "raises"])
+def test_failed_auto_event_emission_is_retried(
+    tmp_path: Path, writer_failure: str
+) -> None:
+    middleware = _middleware(tmp_path)
+    runtime = SimpleNamespace()
+    if writer_failure == "raises":
+
+        def fail(_event: object) -> None:
+            msg = "stream unavailable"
+            raise RuntimeError(msg)
+
+        runtime.stream_writer = fail
+    payload = {"event": "fallback", "reason": "control state unavailable"}
+
+    middleware._emit_event_once(
+        runtime,
+        scope="thread-1:batch-1",
+        key=("fallback", "call-1"),
+        payload=payload,
+    )
+    events: list[dict[str, Any]] = []
+    runtime.stream_writer = events.append
+    middleware._emit_event_once(
+        runtime,
+        scope="thread-1:batch-1",
+        key=("fallback", "call-1"),
+        payload=payload,
+    )
+    middleware._emit_event_once(
+        runtime,
+        scope="thread-1:batch-1",
+        key=("fallback", "call-1"),
+        payload=payload,
+    )
+
+    assert events == [{"type": "auto_mode", **payload}]
+
+
+async def test_pending_interrupt_scope_survives_completed_scope_eviction(
+    tmp_path: Path,
+) -> None:
+    middleware = _middleware(tmp_path)
+    ai_message = _mixed_fallback_batch("pending")
+    key = approval_mode_key("thread-1")
+    store = _Store()
+    store.put(APPROVAL_MODE_NAMESPACE, key, {"mode": "auto"})
+    counters = _default_counters(ApprovalMode.AUTO)
+    counters["consecutive_unavailable"] = 2
+    store.put(AUTO_MODE_COUNTERS_NAMESPACE, key, counters)
+    events: list[dict[str, Any]] = []
+    runtime = SimpleNamespace(
+        context={"approval_mode_key": key, "thread_id": "thread-1"},
+        store=store,
+        stream_writer=events.append,
+    )
+    state = cast(
+        "AgentState[Any]",
+        {
+            "messages": [ai_message],
+            "_auto_decision_plan": _mixed_fallback_plan(key, ai_message),
+        },
+    )
+
+    with (
+        patch(
+            "deepagents_code.auto_mode.interrupt",
+            side_effect=GraphInterrupt(()),
+        ),
+        pytest.raises(GraphInterrupt),
+    ):
+        await middleware.aafter_model(state, cast("Runtime[Any]", runtime))
+
+    for index in range(9):
+        middleware._emit_event_once(
+            runtime,
+            scope=f"other-thread:batch-{index}",
+            key=("denial", str(index)),
+            payload={"event": "denial", "reason": str(index)},
+        )
+
+    with patch(
+        "deepagents_code.auto_mode.interrupt",
+        return_value={"decisions": [{"type": "approve"}]},
+    ):
+        await middleware.aafter_model(state, cast("Runtime[Any]", runtime))
+
+    original_events = [
+        event for event in events if event["event"] in {"unavailable", "fallback"}
+    ]
+    assert [event["event"] for event in original_events] == [
+        "unavailable",
+        "fallback",
+    ]
+
+
+async def test_auto_events_repeat_for_a_later_action_batch(tmp_path: Path) -> None:
+    middleware = _middleware(tmp_path)
+    key = approval_mode_key("thread-1")
+    store = _Store()
+    store.put(APPROVAL_MODE_NAMESPACE, key, {"mode": "auto"})
+    counters = _default_counters(ApprovalMode.AUTO)
+    counters["consecutive_unavailable"] = 2
+    store.put(AUTO_MODE_COUNTERS_NAMESPACE, key, counters)
+    events: list[dict[str, Any]] = []
+    runtime = SimpleNamespace(
+        context={"approval_mode_key": key, "thread_id": "thread-1"},
+        store=store,
+        stream_writer=events.append,
+    )
+
+    with patch(
+        "deepagents_code.auto_mode.interrupt",
+        return_value={"decisions": [{"type": "approve"}]},
+    ):
+        for suffix in ("a", "b"):
+            ai_message = _mixed_fallback_batch(suffix)
+            await middleware.aafter_model(
+                cast(
+                    "AgentState[Any]",
+                    {
+                        "messages": [ai_message],
+                        "_auto_decision_plan": _mixed_fallback_plan(key, ai_message),
+                    },
+                ),
+                cast("Runtime[Any]", runtime),
+            )
+
+    assert [event["event"] for event in events] == [
+        "unavailable",
+        "fallback",
+        "unavailable",
+        "fallback",
+    ]
+
+
+def _all_human_plan(key: str, ai_message: AIMessage) -> dict[str, Any]:
+    """Build a plan that escalates every call in the batch to a human."""
+    return {
+        "batch_id": _batch_id(ai_message.tool_calls),
+        "thread_key": key,
+        "mode_at_proposal": "auto",
+        "phase": "planned",
+        "manual_gated_ids": [call["id"] for call in ai_message.tool_calls],
+        "decisions": [
+            {
+                "tool_call_id": call["id"],
+                "disposition": "require_human",
+                "category": "other_policy",
+                "reason": "Auto reached its human-fallback threshold.",
+                "path": "fallback",
+            }
+            for call in ai_message.tool_calls
+        ],
+        "pending_result_ids": [],
+        "processed_result_ids": [],
+        "counters_applied": True,
+        "fallback_reason": None,
+    }
+
+
+def _auto_runtime(
+    thread_id: str, events: list[dict[str, Any]], *, unavailable: int = 0
+) -> tuple[SimpleNamespace, _Store, str]:
+    """Build a runtime whose thread is in Auto with a readable control record."""
+    key = approval_mode_key(thread_id)
+    store = _Store()
+    store.put(APPROVAL_MODE_NAMESPACE, key, {"mode": "auto"})
+    counters = _default_counters(ApprovalMode.AUTO)
+    counters["consecutive_unavailable"] = unavailable
+    store.put(AUTO_MODE_COUNTERS_NAMESPACE, key, counters)
+    runtime = SimpleNamespace(
+        context={"approval_mode_key": key, "thread_id": thread_id},
+        store=store,
+        stream_writer=events.append,
+    )
+    return runtime, store, key
+
+
+async def test_manual_fallback_event_survives_an_earlier_threshold_notice(
+    tmp_path: Path,
+) -> None:
+    """A `mode: manual` fallback must not be dropped as a duplicate.
+
+    The client switches its own approval mode on that event, so suppressing it
+    leaves the UI showing Auto while the server has fallen back to Manual.
+    """
+    middleware = _middleware(tmp_path)
+    ai_message = _mixed_fallback_batch("mode")
+    events: list[dict[str, Any]] = []
+    runtime, store, key = _auto_runtime("thread-1", events)
+    state = cast(
+        "AgentState[Any]",
+        {
+            "messages": [ai_message],
+            "_auto_decision_plan": _all_human_plan(key, ai_message),
+        },
+    )
+
+    with patch(
+        "deepagents_code.auto_mode.interrupt",
+        return_value={"decisions": [{"type": "approve"}, {"type": "approve"}]},
+    ):
+        await middleware.aafter_model(state, cast("Runtime[Any]", runtime))
+        # The control record becomes unreadable while the human deliberates, so
+        # the replay of this same batch has to escalate to Manual.
+        store.items.pop((APPROVAL_MODE_NAMESPACE, key))
+        await middleware.aafter_model(state, cast("Runtime[Any]", runtime))
+
+    assert [event.get("mode") for event in events] == [None, "manual"]
+
+
+async def test_auto_events_are_scoped_per_thread(tmp_path: Path) -> None:
+    """Two threads proposing identical tool-call IDs must both be notified."""
+    middleware = _middleware(tmp_path)
+    emitted: dict[str, list[str]] = {}
+    for thread_id in ("thread-1", "thread-2"):
+        ai_message = _mixed_fallback_batch("same")
+        events: list[dict[str, Any]] = []
+        runtime, _store, key = _auto_runtime(thread_id, events, unavailable=2)
+        with patch(
+            "deepagents_code.auto_mode.interrupt",
+            return_value={"decisions": [{"type": "approve"}]},
+        ):
+            await middleware.aafter_model(
+                cast(
+                    "AgentState[Any]",
+                    {
+                        "messages": [ai_message],
+                        "_auto_decision_plan": _mixed_fallback_plan(key, ai_message),
+                    },
+                ),
+                cast("Runtime[Any]", runtime),
+            )
+        emitted[thread_id] = [event["event"] for event in events]
+
+    assert emitted == {
+        "thread-1": ["unavailable", "fallback"],
+        "thread-2": ["unavailable", "fallback"],
+    }
+
+
+async def test_untrusted_thread_key_does_not_cross_suppress(tmp_path: Path) -> None:
+    """Runtimes with a degraded thread key must not silence each other.
+
+    Losing this event is worse than repeating it: it is the line that explains
+    why approval is suddenly required.
+    """
+    middleware = _middleware(tmp_path)
+    emitted: list[list[str]] = []
+    for thread_id in ("thread-1", "thread-2"):
+        ai_message = _mixed_fallback_batch("same")
+        events: list[dict[str, Any]] = []
+        runtime = SimpleNamespace(
+            # The key belongs to another thread, so `_thread_key` refuses it.
+            context={
+                "approval_mode_key": approval_mode_key("other-thread"),
+                "thread_id": thread_id,
+                "approval_mode": "auto",
+            },
+            store=_Store(),
+            stream_writer=events.append,
+        )
+        with patch(
+            "deepagents_code.auto_mode.interrupt",
+            return_value={"decisions": [{"type": "approve"}, {"type": "approve"}]},
+        ):
+            await middleware.aafter_model(
+                cast(
+                    "AgentState[Any]",
+                    {"messages": [ai_message], "_auto_decision_plan": None},
+                ),
+                cast("Runtime[Any]", runtime),
+            )
+        emitted.append([event["event"] for event in events])
+
+    assert emitted == [["fallback"], ["fallback"]]
+
+
+async def test_abandoned_approval_scopes_stay_bounded(tmp_path: Path) -> None:
+    """Approvals the user never answers must not pin the ledger forever."""
+    middleware = _middleware(tmp_path)
+    events: list[dict[str, Any]] = []
+    runtime, _store, key = _auto_runtime("thread-1", events, unavailable=2)
+
+    with patch("deepagents_code.auto_mode.interrupt", side_effect=GraphInterrupt(())):
+        for index in range(_MAX_PENDING_EVENT_SCOPES + 5):
+            ai_message = _mixed_fallback_batch(f"abandoned-{index}")
+            with pytest.raises(GraphInterrupt):
+                await middleware.aafter_model(
+                    cast(
+                        "AgentState[Any]",
+                        {
+                            "messages": [ai_message],
+                            "_auto_decision_plan": _mixed_fallback_plan(
+                                key, ai_message
+                            ),
+                        },
+                    ),
+                    cast("Runtime[Any]", runtime),
+                )
+
+    assert len(middleware._pending_event_scopes) == _MAX_PENDING_EVENT_SCOPES
+    assert (
+        len(middleware._emitted_events)
+        <= _MAX_PENDING_EVENT_SCOPES + _MAX_EMITTED_EVENT_SCOPES
+    )
+
+
+async def test_malformed_human_response_unpins_its_scope(tmp_path: Path) -> None:
+    """A rejected approval response must release its pin, not leak it."""
+    middleware = _middleware(tmp_path)
+    ai_message = _mixed_fallback_batch("malformed")
+    events: list[dict[str, Any]] = []
+    runtime, _store, key = _auto_runtime("thread-1", events, unavailable=2)
+
+    with (
+        patch(
+            "deepagents_code.auto_mode.interrupt",
+            return_value={"decisions": []},
+        ),
+        pytest.raises(ValueError, match="decision count"),
+    ):
+        await middleware.aafter_model(
+            cast(
+                "AgentState[Any]",
+                {
+                    "messages": [ai_message],
+                    "_auto_decision_plan": _mixed_fallback_plan(key, ai_message),
+                },
+            ),
+            cast("Runtime[Any]", runtime),
+        )
+
+    assert not middleware._pending_event_scopes
+
+
+def _two_reason_denial_plan(key: str, ai_message: AIMessage) -> dict[str, Any]:
+    """Build a plan denying both calls of a batch for different reasons."""
+    assert len(ai_message.tool_calls) == 2, "plan assumes a two-call batch"
+    first_id, second_id = (call["id"] for call in ai_message.tool_calls)
+    return {
+        "batch_id": _batch_id(ai_message.tool_calls),
+        "thread_key": key,
+        "mode_at_proposal": "auto",
+        "phase": "planned",
+        # Every gated call must appear here; the denials below mean none of them
+        # reaches a human, so the batch never interrupts.
+        "manual_gated_ids": [first_id, second_id],
+        "decisions": [
+            {
+                "tool_call_id": first_id,
+                "disposition": "policy_deny",
+                "category": "other_policy",
+                "reason": "deletes tracked history",
+                "path": "classifier",
+            },
+            {
+                "tool_call_id": second_id,
+                "disposition": "policy_deny",
+                "category": "other_policy",
+                "reason": "escapes the worktree",
+                "path": "classifier",
+            },
+        ],
+        "pending_result_ids": [],
+        "processed_result_ids": [],
+        "counters_applied": True,
+        "fallback_reason": None,
+    }
+
+
+async def test_distinct_denial_reasons_each_emit_an_event(tmp_path: Path) -> None:
+    """Coalescing is per reason, so two distinct denials stay two events."""
+    middleware = _middleware(tmp_path)
+    ai_message = _mixed_fallback_batch("reasons")
+    events: list[dict[str, Any]] = []
+    runtime, _store, key = _auto_runtime("thread-1", events)
+
+    await middleware.aafter_model(
+        cast(
+            "AgentState[Any]",
+            {
+                "messages": [ai_message],
+                "_auto_decision_plan": _two_reason_denial_plan(key, ai_message),
+            },
+        ),
+        cast("Runtime[Any]", runtime),
+    )
+
+    assert [event["reason"] for event in events] == [
+        "deletes tracked history",
+        "escapes the worktree",
+    ]
+    # The event stands for the whole batch, so it names no single tool.
+    assert all("tool_name" not in event for event in events)
+
+
+def test_resolved_scopes_evict_least_recently_used(tmp_path: Path) -> None:
+    """Recency, not insertion order, decides which resolved scope is dropped."""
+    middleware = _middleware(tmp_path)
+    events: list[dict[str, Any]] = []
+    runtime = SimpleNamespace(stream_writer=events.append)
+    for index in range(_MAX_EMITTED_EVENT_SCOPES):
+        middleware._emit_event_once(
+            runtime,
+            scope=f"scope-{index}",
+            key=("denial", "first"),
+            payload={"event": "denial", "reason": "first"},
+        )
+    # Touch the oldest scope so it is no longer the eviction candidate.
+    middleware._emit_event_once(
+        runtime,
+        scope="scope-0",
+        key=("denial", "second"),
+        payload={"event": "denial", "reason": "second"},
+    )
+    middleware._emit_event_once(
+        runtime,
+        scope="scope-new",
+        key=("denial", "first"),
+        payload={"event": "denial", "reason": "first"},
+    )
+
+    assert len(middleware._emitted_events) == _MAX_EMITTED_EVENT_SCOPES
+    assert "scope-0" in middleware._emitted_events
+    assert "scope-1" not in middleware._emitted_events
 
 
 async def test_headless_guard_rejects_gated_mcp_without_execution() -> None:

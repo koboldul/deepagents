@@ -2,20 +2,49 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import ipaddress
 import os
 import socket
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import pytest
 from pytest_socket import SocketBlockedError
 from typing_extensions import Buffer
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterable
+    from collections.abc import Callable, Coroutine, Generator, Iterable
     from contextlib import AbstractContextManager
     from pathlib import Path
+
+    from textual.pilot import Pilot
+    from textual.screen import Screen
+
+    from deepagents_code.app import DeepAgentsApp
+
+
+class DrainModalCommands(Protocol):
+    """Await the detached slash-command continuations on an app."""
+
+    def __call__(self, app: DeepAgentsApp) -> Coroutine[Any, Any, None]:
+        """Await every in-flight continuation, re-raising the first failure."""
+        ...
+
+
+class WaitForModal(Protocol):
+    """Pump an app until a modal screen appears or goes away."""
+
+    def __call__(
+        self,
+        pilot: Pilot[None],
+        screen_type: type[Screen[Any]],
+        *,
+        present: bool,
+        wait_seconds: float = ...,
+    ) -> Coroutine[Any, Any, None]:
+        """Wait for `screen_type` to match `present`, asserting on timeout."""
+        ...
 
 
 _UPDATE_CHECK_SELF_MANAGED_MARK = "self_managed_update_check"
@@ -544,8 +573,94 @@ def _clear_provider_base_url_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _clear_onboarding_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Prevent local debug onboarding env vars from affecting tests."""
-    monkeypatch.delenv("DEEPAGENTS_CODE_DEBUG_ONBOARDING", raising=False)
+    """Prevent local onboarding env overrides from affecting tests."""
+    monkeypatch.delenv("DEEPAGENTS_CODE_ONBOARDING", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _clear_splash_tips_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep startup-tip assertions honest.
+
+    A developer with this set locally would make every `not app.query(
+    StartupTip)` assertion pass vacuously.
+    """
+    monkeypatch.delenv("DEEPAGENTS_CODE_HIDE_SPLASH_TIPS", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _pin_invoked_name(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+    """Pin the launch command name echoed by resume hints.
+
+    `invoked_name()` derives from `sys.argv[0]`, which under test is the runner
+    (`pytest`, `__main__.py`, a tox shim, ...) and therefore varies with how the
+    suite was started. Pin it to the default console script so hint assertions
+    are deterministic, and drop the process-lifetime cache around every test so
+    a test that varies the launch name cannot leak it into another.
+    """
+    from deepagents_code._env_vars import INVOKED_AS
+    from deepagents_code._invocation import (
+        DEFAULT_INVOKED_NAME,
+        invoked_name,
+        log_nonstandard_invoked_name,
+    )
+
+    monkeypatch.setenv(INVOKED_AS, DEFAULT_INVOKED_NAME)
+    invoked_name.cache_clear()
+    log_nonstandard_invoked_name.cache_clear()
+    yield
+    invoked_name.cache_clear()
+    log_nonstandard_invoked_name.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _disable_prices_auto_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep cost-pricing tests from starting the genai-prices updater thread.
+
+    The first `estimate_cost` call of a process starts the `UpdatePrices`
+    daemon thread, whose hourly catalog fetch hits the network — pytest-socket
+    reports it under `--disable-socket` (which `make test` passes), and the
+    thread would otherwise linger for the whole test session. Set the
+    production opt-out env var by default so subprocess tests inherit the same
+    no-network behavior. Tests that cover the updater stand `UpdatePrices` in
+    with an autospec and override this env var themselves, so the real thread
+    never starts anywhere in the suite.
+    """
+    from deepagents_code._env_vars import PRICES_AUTO_UPDATE
+
+    monkeypatch.setenv(PRICES_AUTO_UPDATE, "0")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_price_overrides(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Isolate the process-wide pricing-override state and redirect the user file.
+
+    Suite-wide for the same reason `_disable_prices_auto_update` is: every test
+    that prices a model the genai-prices catalog does not cover now reaches the
+    local override loader, which reads `prices.json` from the user config
+    directory. `test_session_stats.py` prices deliberately uncatalogued models
+    through the real `estimate_cost`, so without this those tests read the
+    developer's own `~/.deepagents/prices.json` — passing in CI and failing on
+    the machine of anyone who has written one.
+
+    The redirect goes through the `DEFAULT_CONFIG_DIR` constant the loader
+    imports, with `monkeypatch`'s default `raising=True`: if that name moves, the
+    production import fails and `_override_price` swallows it, so the tests must
+    fail loudly here rather than patch an attribute into existence and keep
+    passing. `tmp_path` starts empty, so the default state is "user has no
+    override file".
+    """
+    import deepagents_code.model_config
+    from deepagents_code import cost_tracking
+
+    monkeypatch.setattr(deepagents_code.model_config, "DEFAULT_CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(cost_tracking, "_PRICE_OVERRIDES", None)
+    monkeypatch.setattr(cost_tracking, "_USER_OVERRIDE_ENTRIES", 0)
+    monkeypatch.setattr(
+        cost_tracking,
+        "_USER_OVERRIDE_LABEL",
+        f"override file {cost_tracking._USER_OVERRIDES_FILENAME!r}",
+    )
+    monkeypatch.setattr(cost_tracking, "_OVERRIDE_REPORTED", set())
 
 
 @pytest.fixture(autouse=True)
@@ -573,6 +688,7 @@ def _clear_update_env(
     monkeypatch.delenv("DEEPAGENTS_CODE_DEBUG_UPDATE", raising=False)
     monkeypatch.delenv("DEEPAGENTS_CODE_RESTARTED_AFTER_UPDATE", raising=False)
     monkeypatch.delenv("DEEPAGENTS_CODE_AUTO_UPDATE", raising=False)
+    monkeypatch.setenv("DEEPAGENTS_CODE_PLUGIN_AUTO_UPDATE", "0")
 
     if _self_manages_update_check(request):
         monkeypatch.delenv("DEEPAGENTS_CODE_NO_UPDATE_CHECK", raising=False)
@@ -596,6 +712,26 @@ def _disable_app_startup_update_checks(
         "deepagents_code.update_check.is_update_check_enabled",
         lambda: False,
     )
+
+
+@pytest.fixture(autouse=True)
+def _skip_managed_tool_downloads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep app startup from downloading the managed `rg` binary.
+
+    `_ensure_managed_ripgrep` runs on app mount and fetches a ripgrep release
+    from GitHub whenever no current binary is on `PATH` -- the norm on CI and
+    in containers. The download happens in a worker thread and its failure is
+    swallowed, but pytest-socket still warns for every blocked `getaddrinfo`
+    (hundreds per run), and the "auto-install failed" toast it posts perturbs
+    tests that assert on toast layout or the notification registry.
+
+    Set the production opt-out env var so the install short-circuits before
+    touching the network, and so subprocess tests inherit the same no-network
+    behavior. Tests that cover the installer clear it themselves.
+    """
+    from deepagents_code._env_vars import OFFLINE
+
+    monkeypatch.setenv(OFFLINE, "1")
 
 
 @pytest.fixture(autouse=True)
@@ -734,6 +870,14 @@ def _isolate_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         tmp_path / "config.toml",
     )
     monkeypatch.setattr("deepagents_code.onboarding.DEFAULT_STATE_DIR", state_dir)
+    # Resolved from `DEFAULT_STATE_DIR` at import time, so patching the module
+    # constant above doesn't move it. Left unpatched, any test reaching the
+    # upgrade path would create a lock file in the developer's real home and
+    # contend with a genuinely running dcode.
+    monkeypatch.setattr(
+        "deepagents_code.update_check.UPDATE_LOCK_FILE",
+        state_dir / "update.lock",
+    )
     # Keep ordinary create/amend goal tests free of the one-time preference
     # modal without writing files into `tmp_path` (that would pollute git and
     # empty-tree assertions). Dedicated prompt coverage clears this env var.
@@ -774,3 +918,71 @@ def _clear_kitty_kbd_probe_cache() -> None:
     from deepagents_code.terminal_capabilities import supports_kitty_keyboard_protocol
 
     supports_kitty_keyboard_protocol.cache_clear()
+
+
+@pytest.fixture
+def drain_modal_commands() -> DrainModalCommands:
+    """Await the confirmation continuations that slash commands detach.
+
+    `/update` and `/install <pkg> --package` hand their confirmation modals to
+    `DeepAgentsApp._schedule_off_message_pump`, so the command handler returns
+    before the confirmed work runs. Tests await the detached tasks instead of
+    relying on pump scheduling order.
+
+    Unlike a bare `gather(..., return_exceptions=True)`, this re-raises the first
+    real failure: a continuation that crashes must fail its test loudly rather
+    than leave a downstream `assert_awaited_once` to report the symptom without
+    the traceback.
+
+    Returns:
+        An async callable taking the app whose continuations should be awaited.
+    """
+
+    async def _drain(app: DeepAgentsApp) -> None:
+        while pending := [
+            task for task in app._modal_command_tasks.values() if not task.done()
+        ]:
+            for result in await asyncio.gather(*pending, return_exceptions=True):
+                if isinstance(result, asyncio.CancelledError):
+                    continue
+                if isinstance(result, BaseException):
+                    raise result
+
+    return _drain
+
+
+@pytest.fixture
+def wait_for_modal() -> WaitForModal:
+    """Pump the app until a modal is (or is no longer) the active screen.
+
+    Raises `AssertionError` on timeout rather than returning silently, so a
+    modal that never resolves fails here with a readable message instead of
+    wedging the next `await` and surfacing as a bare pytest-timeout.
+
+    Returns:
+        An async callable taking the pilot, the modal class, and whether to wait
+            for the modal to appear (`present=True`) or go away.
+    """
+
+    async def _wait(
+        pilot: Pilot[None],
+        screen_type: type[Screen[Any]],
+        *,
+        present: bool,
+        wait_seconds: float = 3.0,
+    ) -> None:
+        deadline = wait_seconds
+        step = 0.05
+        while deadline > 0:
+            await pilot.pause(step)
+            if isinstance(pilot.app.screen, screen_type) is present:
+                return
+            deadline -= step
+        state = "appear" if present else "go away"
+        msg = (
+            f"{screen_type.__name__} did not {state} within {wait_seconds}s; "
+            f"active screen is {type(pilot.app.screen).__name__}"
+        )
+        raise AssertionError(msg)
+
+    return _wait

@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import logging
 import os
 import shlex
 import shutil
@@ -33,6 +34,7 @@ from deepagents_code._tool_stream import (
     UNRENDERABLE_TOOL_OUTPUT,
     ToolCallBuffer,
 )
+from deepagents_code.approval_mode import ApprovalMode
 from deepagents_code.client import non_interactive as non_interactive_module
 from deepagents_code.client.non_interactive import (
     _MAX_HITL_ITERATIONS,
@@ -42,19 +44,42 @@ from deepagents_code.client.non_interactive import (
     ThreadUrlLookupState,
     _build_non_interactive_header,
     _collect_action_request_warnings,
+    _compaction_result_id,
     _dispatch_orphaned_tool_result_hooks,
+    _end_headless_session,
     _make_hitl_decision,
     _make_stdio_encoding_safe,
     _process_ai_message,
+    _process_hitl_interrupts,
     _process_message_chunk,
+    _record_usage_from_message,
     _run_agent_loop,
     _run_startup_command,
     _start_langsmith_thread_url_lookup,
     _StartupProcessRegistry,
+    _summarization_stream_status,
     run_non_interactive,
 )
 from deepagents_code.config import SHELL_ALLOW_ALL, ModelResult
-from deepagents_code.file_ops import FileOpTracker
+from deepagents_code.file_ops import (
+    DiffOutcome,
+    FileOperationRecord,
+    FileOpTracker,
+)
+from deepagents_code.hooks.client_lifecycle import (
+    ClientHookService,
+    ClientHookStopError,
+)
+from deepagents_code.hooks.manager import HookSessionIdentity, HooksManager
+from deepagents_code.hooks.models.domain import (
+    HookEvent,
+    PermissionEffect,
+    PermissionRequestDecision,
+    SessionEndCause,
+    SessionEndDecision,
+    SessionStartDecision,
+    UserPromptSubmitDecision,
+)
 from deepagents_code.tool_display import format_tool_message_content
 
 
@@ -62,6 +87,47 @@ from deepagents_code.tool_display import format_tool_message_content
 def console() -> Console:
     """Console that captures output."""
     return Console(quiet=True)
+
+
+def test_subagent_summarization_does_not_signal_compaction() -> None:
+    chunk = (
+        ("subagent",),
+        "messages",
+        (AIMessage(content="summary"), {"lc_source": "summarization"}),
+    )
+
+    assert _summarization_stream_status(chunk) is None
+
+
+def test_compaction_result_id_requires_compact_tool_name() -> None:
+    """Ordinary tool output echoing the prefix must not signal compaction."""
+    ordinary = (
+        (),
+        "messages",
+        (
+            ToolMessage(
+                content="Conversation compacted. Summarized 2 messages.",
+                tool_call_id="tc-1",
+                name="execute",
+            ),
+            {},
+        ),
+    )
+    assert _compaction_result_id(ordinary) is None
+
+    compact = (
+        (),
+        "messages",
+        (
+            ToolMessage(
+                content="Conversation compacted. Summarized 2 messages.",
+                tool_call_id="tc-2",
+                name="compact_conversation",
+            ),
+            {},
+        ),
+    )
+    assert _compaction_result_id(compact) == "tc-2"
 
 
 @pytest.fixture(autouse=True)
@@ -332,6 +398,61 @@ class TestSandboxTypeForwarding:
         assert kwargs["profile_overrides"] == {"max_input_tokens": 32_000}
         assert kwargs["enable_interpreter"] is None
 
+    async def test_permission_hooks_override_headless_yolo_bypass(self) -> None:
+        """Permission hooks force client resolution while retaining YOLO context."""
+        runtime = MagicMock()
+        runtime.configured_events.return_value = frozenset(
+            {HookEvent.PERMISSION_REQUEST}
+        )
+        mock_agent = MagicMock()
+        mock_server_proc = MagicMock()
+
+        with (
+            patch(
+                "deepagents_code.client.non_interactive.create_model",
+                return_value=ModelResult(
+                    model=MagicMock(),
+                    model_name="test-model",
+                    provider="test",
+                ),
+            ),
+            patch(
+                "deepagents_code.client.non_interactive.generate_thread_id",
+                return_value="test-thread",
+            ),
+            patch("deepagents_code.client.non_interactive.settings") as mock_settings,
+            patch(
+                "deepagents_code.client.non_interactive.build_langsmith_thread_url",
+                return_value=None,
+            ),
+            patch(
+                "deepagents_code.hooks.runtime.HooksRuntime.create",
+                return_value=runtime,
+            ),
+            patch(
+                "deepagents_code.client.non_interactive._run_agent_loop",
+                new_callable=AsyncMock,
+            ) as mock_loop,
+            patch(
+                "deepagents_code.client.launch.server_manager.start_server_and_get_agent",
+                new_callable=AsyncMock,
+                return_value=(mock_agent, mock_server_proc, None),
+            ) as mock_start_server,
+        ):
+            mock_settings.shell_allow_list = SHELL_ALLOW_ALL
+            mock_settings.has_tavily = False
+            mock_settings.model_name = None
+
+            await run_non_interactive(message="test task")
+
+        _, server_kwargs = mock_start_server.call_args
+        assert server_kwargs["auto_approve"] is False
+        assert server_kwargs["interrupt_shell_only"] is False
+        _, loop_kwargs = mock_loop.call_args
+        assert loop_kwargs["hooks"].has_handlers(HookEvent.PERMISSION_REQUEST)
+        assert loop_kwargs["approval_mode"] is ApprovalMode.YOLO
+        assert loop_kwargs["prompt_id"] is not None
+
     async def test_sandbox_snapshot_name_passed_to_server(self) -> None:
         """`sandbox_snapshot_name` must reach `start_server_and_get_agent`."""
         mock_agent = MagicMock()
@@ -562,9 +683,31 @@ class TestQuietFileOpNotification:
     """The file-operation (📝) notification honors quiet mode."""
 
     @staticmethod
-    def _run(*, quiet: bool) -> str:
-        """Drive a file-op `ToolMessage` chunk and return captured stderr."""
-        record = SimpleNamespace(diff="--- a\n+++ b", display_path="src/foo.py")
+    def _run(
+        *,
+        quiet: bool,
+        diff_outcome: DiffOutcome = "shown",
+        after_read_error: str | None = None,
+        tool_succeeded: bool = True,
+    ) -> str:
+        """Drive a file-op `ToolMessage` chunk and return captured stderr.
+
+        Builds a real `FileOperationRecord` rather than a stand-in: the parity
+        this class asserts is between `-p` and the TUI reading the same type,
+        and a `SimpleNamespace` would keep passing after a field was renamed
+        out from under both.
+        """
+        record = FileOperationRecord(
+            tool_name="delete",
+            display_path="src/foo.py",
+            physical_path=None,
+            tool_call_id="tc1",
+            status="success",
+            tool_succeeded=tool_succeeded,
+            diff="--- a\n+++ b" if diff_outcome == "shown" else None,
+            diff_outcome=diff_outcome,
+            after_read_error=after_read_error,
+        )
         tracker = MagicMock()
         tracker.complete_with_message.return_value = record
 
@@ -585,6 +728,73 @@ class TestQuietFileOpNotification:
 
     def test_non_quiet_emits_file_op_notification(self) -> None:
         assert "foo.py" in self._run(quiet=False)
+
+    def test_a_lost_pre_image_is_reported_without_a_diff(self) -> None:
+        """Headless output must not stay silent about a change it cannot verify.
+
+        A `delete` whose pre-image was lost produces no diff, so gating the
+        notification on `record.diff` printed nothing at all — leaving `-p` and
+        CI users with no signal that the file's contents were never read.
+        """
+        output = self._run(quiet=False, diff_outcome="untrusted_before")
+
+        assert "foo.py" in output
+        assert "prior contents could not be read" in output
+
+    def test_quiet_keeps_the_caveat_but_drops_the_path_line(self) -> None:
+        """Quiet suppresses diagnostics; an unverifiable change is not one.
+
+        `--quiet` exists to keep stdout clean for `-p`, and it already routes
+        this console to stderr — so the caveat cannot pollute the result either
+        way. Dropping it here would leave a change that could not be verified
+        stated nowhere at all, which is the mode CI reads.
+        """
+        output = self._run(quiet=True, diff_outcome="untrusted_before")
+
+        assert "prior contents could not be read" in output
+        assert "foo.py" not in output
+
+    @pytest.mark.parametrize(
+        ("diff_outcome", "after_read_error", "expected"),
+        [
+            ("untrusted_before", None, "prior contents could not be read"),
+            ("unreadable_after", "permission_denied", "permission_denied"),
+            ("terminators_only", None, "confined to line terminators"),
+        ],
+    )
+    def test_every_unshowable_outcome_reaches_headless_output(
+        self,
+        diff_outcome: DiffOutcome,
+        after_read_error: str | None,
+        expected: str,
+    ) -> None:
+        """`-p` is the surface CI reads, so no outcome may go unstated there.
+
+        Only `untrusted_before` was covered, leaving the other two free to
+        print an unqualified path — a change reported as routine when it could
+        not be verified.
+        """
+        output = self._run(
+            quiet=False,
+            diff_outcome=diff_outcome,
+            after_read_error=after_read_error,
+        )
+
+        assert expected in output
+
+    def test_a_failed_tool_gets_no_success_caveat(self) -> None:
+        """A caveat describes what a *successful* call could not show.
+
+        With the pre-image lost and the tool then failing, the outcome survives
+        into the caveat, which would print "The `delete` call succeeded" beside
+        an operation that did not — and a CI consumer parsing `-p` would record
+        a successful write.
+        """
+        output = self._run(
+            quiet=False, diff_outcome="untrusted_before", tool_succeeded=False
+        )
+
+        assert "succeeded" not in output
 
 
 class TestNoStreamMode:
@@ -1295,6 +1505,125 @@ def _make_looping_agent() -> MagicMock:
     return mock_agent
 
 
+@pytest.fixture
+def lifecycle_runtime(tmp_path: Path) -> MagicMock:
+    """Minimal hook runtime shared by lifecycle loop tests."""
+    runtime = MagicMock()
+    runtime.cwd = tmp_path
+    runtime.snapshot_id = "snapshot"
+    runtime.configured_server_events.return_value = ()
+    return runtime
+
+
+def _manager(runtime: MagicMock) -> HooksManager:
+    """Wrap a stub runtime in a coordinator with fixed headless identity."""
+    return HooksManager.adopting(
+        runtime,
+        identity=lambda: HookSessionIdentity(
+            thread_id="t1",
+            approval_mode=ApprovalMode.MANUAL,
+        ),
+    )
+
+
+async def test_headless_session_end_timeout_is_bounded_and_at_most_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A slow Hooks v2 `SessionEnd` cannot stall or fire twice on exit."""
+    calls = 0
+    cancelled = asyncio.Event()
+
+    async def invoke(_invocation: object) -> SessionEndDecision:
+        nonlocal calls
+        calls += 1
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return SessionEndDecision(event=HookEvent.SESSION_END)
+
+    runtime = MagicMock()
+    runtime.cwd = Path.cwd()
+    runtime.configured_events.return_value = frozenset({HookEvent.SESSION_END})
+    runtime.invoke = invoke
+    state = StreamState(hooks=_manager(runtime))
+    loop = asyncio.get_running_loop()
+
+    with caplog.at_level(
+        logging.WARNING,
+        logger="deepagents_code.client.non_interactive",
+    ):
+        started = loop.time()
+        await _end_headless_session(
+            state,
+            SessionEndCause.PROMPT_INPUT_EXIT,
+            timeout_seconds=0.01,
+        )
+        elapsed = loop.time() - started
+        await _end_headless_session(
+            state,
+            SessionEndCause.PROMPT_INPUT_EXIT,
+            timeout_seconds=0.01,
+        )
+
+    assert elapsed < 0.5
+    assert cancelled.is_set()
+    assert calls == 1
+    assert state.session_end_fired
+    assert any(
+        record.levelno == logging.WARNING
+        and "SessionEnd hook drain did not finish" in record.message
+        for record in caplog.records
+    )
+
+
+async def test_headless_compact_permission_uses_live_context() -> None:
+    """`compact_conversation` is gated by `PermissionRequest`, not `PreCompact`.
+
+    The manager must project the session identity read at call time, so a mode
+    switch mid-run reaches the handler rather than a stale snapshot.
+    """
+    approval_mode = ApprovalMode.MANUAL
+    runtime = MagicMock()
+    runtime.configured_events.return_value = frozenset({HookEvent.PERMISSION_REQUEST})
+    hooks = HooksManager.adopting(
+        runtime,
+        identity=lambda: HookSessionIdentity(
+            thread_id="t1",
+            approval_mode=approval_mode,
+            prompt_id="00000000-0000-4000-8000-000000000001",
+        ),
+    )
+    state = StreamState(hooks=hooks)
+    state.pending_interrupts["interrupt-1"] = {
+        "action_requests": [{"name": "compact_conversation", "args": {}}],
+        "review_configs": [],
+    }
+    permission_request = AsyncMock(
+        return_value=PermissionRequestDecision(
+            event=HookEvent.PERMISSION_REQUEST,
+            permission=PermissionEffect(behavior="allow"),
+        )
+    )
+    pre_compact = AsyncMock()
+
+    # Switch modes after the manager is built: the handler must see AUTO.
+    approval_mode = ApprovalMode.AUTO
+    with (
+        patch.object(ClientHookService, "permission_request", permission_request),
+        patch.object(ClientHookService, "pre_compact", pre_compact),
+    ):
+        await _process_hitl_interrupts(state, Console(quiet=True))
+
+    awaited = permission_request.await_args
+    assert awaited is not None
+    assert awaited.args[0].approval_mode is ApprovalMode.AUTO
+    assert awaited.args[1].name == "compact_conversation"
+    pre_compact.assert_not_awaited()
+    assert state.hitl_response["interrupt-1"]["decisions"] == [{"type": "approve"}]
+
+
 class TestMaxTurns:
     """Tests for max_turns parameter in _run_agent_loop."""
 
@@ -1321,6 +1650,260 @@ class TestMaxTurns:
 
         _, kwargs = agent.astream.call_args
         assert kwargs["context"]["thread_id"] == "t1"
+
+    async def test_user_prompt_hook_suppresses_legacy_duplicate_and_prompt(
+        self,
+        lifecycle_runtime: MagicMock,
+    ) -> None:
+        runtime = lifecycle_runtime
+        runtime.configured_events.return_value = frozenset(
+            {HookEvent.USER_PROMPT_SUBMIT}
+        )
+        runtime.invoke = AsyncMock(
+            return_value=UserPromptSubmitDecision(
+                event=HookEvent.USER_PROMPT_SUBMIT,
+                context=["replacement"],
+                suppress_original_prompt=True,
+            )
+        )
+        agent = MagicMock()
+        agent.astream = MagicMock(return_value=_async_iter([]))
+        config: RunnableConfig = {"configurable": {"thread_id": "t1"}}
+
+        with patch(
+            "deepagents_code.client.non_interactive.dispatch_hook",
+            new_callable=AsyncMock,
+        ) as legacy:
+            await _run_agent_loop(
+                agent,
+                "secret",
+                config,
+                Console(quiet=True),
+                MagicMock(),
+                quiet=True,
+                hooks=_manager(runtime),
+            )
+
+        stream_input = agent.astream.call_args.args[0]
+        assert stream_input["messages"] == [
+            {"role": "system", "content": "replacement"}
+        ]
+        assert not any(
+            call.args and call.args[0] in {"session.start", "user.prompt"}
+            for call in legacy.await_args_list
+        )
+        runtime.append_messages.assert_called_once()
+
+    async def test_user_prompt_stop_ends_headless_session_once(
+        self,
+        lifecycle_runtime: MagicMock,
+    ) -> None:
+        runtime = lifecycle_runtime
+        runtime.configured_events.return_value = frozenset(
+            {
+                HookEvent.SESSION_START,
+                HookEvent.USER_PROMPT_SUBMIT,
+                HookEvent.SESSION_END,
+            }
+        )
+        runtime.invoke = AsyncMock(
+            side_effect=[
+                SessionStartDecision(event=HookEvent.SESSION_START),
+                UserPromptSubmitDecision(
+                    event=HookEvent.USER_PROMPT_SUBMIT,
+                    continue_processing=False,
+                    stop_reason="blocked",
+                ),
+                SessionEndDecision(event=HookEvent.SESSION_END),
+            ]
+        )
+        agent = MagicMock()
+
+        with pytest.raises(ClientHookStopError, match="blocked"):
+            await _run_agent_loop(
+                agent,
+                "secret",
+                {"configurable": {"thread_id": "t1"}},
+                Console(quiet=True),
+                MagicMock(),
+                quiet=True,
+                hooks=_manager(runtime),
+            )
+
+        events = [call.args[0].event.event for call in runtime.invoke.await_args_list]
+        assert events == [
+            HookEvent.SESSION_START,
+            HookEvent.USER_PROMPT_SUBMIT,
+            HookEvent.SESSION_END,
+        ]
+        agent.astream.assert_not_called()
+
+    async def test_compact_session_start_uses_active_model_before_continuation(
+        self,
+        lifecycle_runtime: MagicMock,
+    ) -> None:
+        runtime = lifecycle_runtime
+        runtime.configured_events.return_value = frozenset(
+            {HookEvent.SESSION_START, HookEvent.PRE_COMPACT}
+        )
+        runtime.invoke = AsyncMock(
+            side_effect=[
+                SessionStartDecision(event=HookEvent.SESSION_START),
+                SessionStartDecision(event=HookEvent.SESSION_START),
+            ]
+        )
+        chunks = [
+            (
+                (),
+                "messages",
+                (
+                    AIMessage(id="summary", content="summary"),
+                    {"lc_source": "summarization"},
+                ),
+            ),
+            (
+                (),
+                "messages",
+                (AIMessage(id="answer", content="continued"), {}),
+            ),
+        ]
+        agent = MagicMock()
+        agent.astream = MagicMock(return_value=_async_iter(chunks))
+
+        with (
+            patch(
+                "deepagents_code.client.non_interactive.dispatch_hook",
+                new_callable=AsyncMock,
+            ),
+            patch("deepagents_code.client.non_interactive.settings") as mock_settings,
+        ):
+            mock_settings.model_name = "test:model"
+            mock_settings.model_provider = "test"
+            await _run_agent_loop(
+                agent,
+                "question",
+                {"configurable": {"thread_id": "t1"}},
+                Console(quiet=True),
+                MagicMock(),
+                quiet=True,
+                hooks=_manager(runtime),
+            )
+
+        invocations = [call.args[0] for call in runtime.invoke.await_args_list]
+        assert [invocation.event.event for invocation in invocations] == [
+            HookEvent.SESSION_START,
+            HookEvent.SESSION_START,
+        ]
+        assert invocations[-1].event.model == "test:model"
+
+    async def test_run_agent_loop_defaults_project_hooks_untrusted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Headless mode does not load project hooks without explicit trust."""
+        monkeypatch.chdir(tmp_path)
+        project_hooks = tmp_path / ".deepagents"
+        project_hooks.mkdir()
+        (project_hooks / "hooks.json").write_text(
+            '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo x"}]}]}}',
+            encoding="utf-8",
+        )
+        agent = MagicMock()
+        agent.astream = MagicMock(return_value=_async_iter([]))
+        console = Console(quiet=True)
+        file_op_tracker = MagicMock()
+        config: RunnableConfig = {"configurable": {"thread_id": "t1"}}
+
+        with patch(
+            "deepagents_code.client.non_interactive.dispatch_hook",
+            new_callable=AsyncMock,
+        ):
+            await _run_agent_loop(
+                agent,
+                "task",
+                config,
+                console,
+                file_op_tracker,
+                quiet=True,
+            )
+
+        _, kwargs = agent.astream.call_args
+        # Untrusted workspaces omit project Stop handlers from the gate.
+        assert "Stop" not in (kwargs["context"].get("hooks_server_events") or [])
+
+    async def test_run_agent_loop_trusts_project_hooks_when_opted_in(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--trust-project-hooks` loads repository hook handlers."""
+        monkeypatch.chdir(tmp_path)
+        project_hooks = tmp_path / ".deepagents"
+        project_hooks.mkdir()
+        (project_hooks / "hooks.json").write_text(
+            '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo x"}]}]}}',
+            encoding="utf-8",
+        )
+        agent = MagicMock()
+        agent.astream = MagicMock(return_value=_async_iter([]))
+        console = Console(quiet=True)
+        file_op_tracker = MagicMock()
+        config: RunnableConfig = {"configurable": {"thread_id": "t1"}}
+
+        with patch(
+            "deepagents_code.client.non_interactive.dispatch_hook",
+            new_callable=AsyncMock,
+        ):
+            await _run_agent_loop(
+                agent,
+                "task",
+                config,
+                console,
+                file_op_tracker,
+                quiet=True,
+                trust_project_hooks=True,
+            )
+
+        _, kwargs = agent.astream.call_args
+        assert "Stop" in (kwargs["context"].get("hooks_server_events") or [])
+
+    async def test_run_agent_loop_ignores_persisted_project_hook_trust(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Trust remembered interactively must not opt a headless run in.
+
+        The operator of a `dcode -n` run may never have seen the interactive
+        prompt, so only the explicit flag may enable repository hooks.
+        """
+        from deepagents_code.hooks import trust as trust_module
+
+        monkeypatch.chdir(tmp_path)
+        project_hooks = tmp_path / ".deepagents"
+        project_hooks.mkdir()
+        (project_hooks / "hooks.json").write_text(
+            '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo x"}]}]}}',
+            encoding="utf-8",
+        )
+        store = tmp_path / "state" / "hooks_trust.json"
+        monkeypatch.setattr(trust_module, "_default_store_path", lambda: store)
+        assert trust_module.trust_project_hooks(tmp_path, store_path=store)
+
+        agent = MagicMock()
+        agent.astream = MagicMock(return_value=_async_iter([]))
+        config: RunnableConfig = {"configurable": {"thread_id": "t1"}}
+
+        with patch(
+            "deepagents_code.client.non_interactive.dispatch_hook",
+            new_callable=AsyncMock,
+        ):
+            await _run_agent_loop(
+                agent,
+                "task",
+                config,
+                Console(quiet=True),
+                MagicMock(),
+                quiet=True,
+            )
+
+        _, kwargs = agent.astream.call_args
+        assert "Stop" not in (kwargs["context"].get("hooks_server_events") or [])
 
     async def test_raises_after_user_limit(self) -> None:
         """HITLIterationLimitError is raised after max_turns HITL iterations."""
@@ -2575,8 +3158,8 @@ class TestRunStartupCommand:
         assert buf.getvalue() == ""
 
 
-class TestProcessAiMessageStats:
-    """`_process_ai_message` threads the active provider into usage stats.
+class TestRecordUsageFromMessageStats:
+    """`_record_usage_from_message` threads the active provider into usage stats.
 
     Guards the wiring between `settings.model_provider` and
     `SessionStats.record_request` — the per-model API is unit-tested in
@@ -2584,7 +3167,7 @@ class TestProcessAiMessageStats:
     configured provider.
     """
 
-    def test_records_provider_from_settings(self, console: Console) -> None:
+    def test_records_provider_from_settings(self) -> None:
         """Split input/output usage records the configured provider."""
         state = StreamState()
         message = AIMessage(
@@ -2595,15 +3178,21 @@ class TestProcessAiMessageStats:
                 "total_tokens": 150,
             },
         )
-        with patch("deepagents_code.client.non_interactive.settings") as mock_settings:
+        with (
+            patch("deepagents_code.client.non_interactive.settings") as mock_settings,
+            patch("deepagents_code.cost_tracking.estimate_cost", return_value=0.42),
+        ):
             mock_settings.model_name = "gpt-5.5"
             mock_settings.model_provider = "openai"
-            _process_ai_message(message, state, console)
+            _record_usage_from_message(message, state)
 
-        assert state.stats.per_model["openai", "gpt-5.5"].input_tokens == 100
-        assert state.stats.per_model["openai", "gpt-5.5"].output_tokens == 50
+        model_stats = state.stats.per_model["openai", "gpt-5.5"]
+        assert model_stats.input_tokens == 100
+        assert model_stats.output_tokens == 50
+        assert model_stats.cost_usd == pytest.approx(0.42)
+        assert state.stats.total_cost_usd == pytest.approx(0.42)
 
-    def test_records_provider_on_total_only_fallback(self, console: Console) -> None:
+    def test_records_provider_on_total_only_fallback(self) -> None:
         """Total-only usage (no split) still forwards the provider."""
         state = StreamState()
         message = AIMessage(
@@ -2617,9 +3206,73 @@ class TestProcessAiMessageStats:
         with patch("deepagents_code.client.non_interactive.settings") as mock_settings:
             mock_settings.model_name = "gpt-5.5"
             mock_settings.model_provider = "openai"
-            _process_ai_message(message, state, console)
+            _record_usage_from_message(message, state)
 
         assert state.stats.per_model["openai", "gpt-5.5"].input_tokens == 150
+
+    async def test_resume_replay_records_message_usage_once(self) -> None:
+        """A completed message replayed after HITL counts as one request."""
+        message = AIMessage(
+            content="",
+            id="request-1",
+            usage_metadata={
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "total_tokens": 150,
+            },
+            response_metadata={
+                "model_name": "gpt-5.5",
+                "model_provider": "openai",
+            },
+        )
+        calls = 0
+        captured_state: StreamState | None = None
+
+        async def staged_stream(  # noqa: RUF029  # replaces the async stream seam
+            _agent: object,
+            _stream_input: object,
+            _config: object,
+            state: StreamState,
+            console: Console,
+            file_op_tracker: FileOpTracker,
+            _context: object,
+        ) -> None:
+            nonlocal calls, captured_state
+            calls += 1
+            captured_state = state
+            _process_message_chunk((message, {}), state, console, file_op_tracker)
+            if calls == 1:
+                state.interrupt_occurred = True
+
+        with (
+            patch(
+                "deepagents_code.client.non_interactive._stream_agent",
+                new=staged_stream,
+            ),
+            patch(
+                "deepagents_code.client.non_interactive.dispatch_hook",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "deepagents_code.client.non_interactive.dispatch_hook_fire_and_forget"
+            ),
+            patch("deepagents_code.cost_tracking.estimate_cost", return_value=0.25),
+        ):
+            await _run_agent_loop(
+                MagicMock(),
+                "run a command",
+                {"configurable": {"thread_id": "t"}},
+                Console(quiet=True),
+                MagicMock(),
+                quiet=True,
+            )
+
+        assert calls == 2
+        assert captured_state is not None
+        assert captured_state.stats.request_count == 1
+        assert captured_state.stats.input_tokens == 100
+        assert captured_state.stats.output_tokens == 50
+        assert captured_state.stats.total_cost_usd == pytest.approx(0.25)
 
 
 async def _async_iter(items: Sequence[object]) -> AsyncIterator[object]:  # noqa: RUF029

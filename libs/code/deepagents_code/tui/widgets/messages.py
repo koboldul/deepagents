@@ -22,16 +22,32 @@ from textual.message import Message
 from textual.message_pump import NoActiveAppError
 from textual.reactive import var
 from textual.selection import Selection
+from textual.style import Style as TStyle
 from textual.widgets import Static
 
 from deepagents_code import theme
+from deepagents_code._ask_user_types import (
+    ASK_USER_ANSWERED_SUMMARY,
+    ASK_USER_FAILED_SUMMARY,
+    AskUserRowSummary,
+)
 from deepagents_code.config import (
     MODE_DISPLAY_GLYPHS,
     detect_mode_prefix,
     get_glyphs,
     is_ascii_mode,
 )
-from deepagents_code.file_ops import is_sensitive_file_path
+from deepagents_code.diff_utils import (
+    DiffStats,
+    count_diff_change_lines,
+    is_truncation_marker,
+    split_diff_lines,
+)
+from deepagents_code.file_ops import (
+    DiffOutcome,
+    display_caveat,
+    is_sensitive_file_path,
+)
 from deepagents_code.formatting import format_duration
 from deepagents_code.input import EMAIL_PREFIX_PATTERN, INPUT_HIGHLIGHT_PATTERN
 from deepagents_code.tool_display import (
@@ -51,10 +67,16 @@ from deepagents_code.tui.widgets._links import (
     open_checked_url_async,
     open_style_link,
 )
-from deepagents_code.tui.widgets.diff import compose_diff_lines
+from deepagents_code.tui.widgets.diff import (
+    compose_diff_lines,
+    format_diff_stats,
+    highlight_source_prefixes,
+)
 from deepagents_code.unicode_security import render_with_unicode_markers
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from rich.console import (
         Console as RichConsole,
         ConsoleOptions,
@@ -68,6 +90,7 @@ if TYPE_CHECKING:
     from textual.widgets._markdown import MarkdownStream
 
     from deepagents_code.input import MediaTracker
+    from deepagents_code.theme import ThemeColors
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +179,39 @@ _COLLAPSE_OUTPUT_BY_DEFAULT: set[str] = {
 }
 
 
+_TOOL_SUPERSEDED_BY_DIFF = "edit_file"
+"""The one tool whose successful row is replaced by the `DiffMessage` after it.
+
+The row self-hides via `mark_superseded_by_diff`, and only ever behind a diff
+that can actually stand in for it — the adapter requires a non-empty body and a
+`shown` outcome. `DiffOutcome` explains why the other outcomes cannot.
+
+Ask `ToolCallMessage.can_be_superseded` rather than comparing against this
+constant — the adapter checks a tool name from a different source, and the two
+must not drift.
+"""
+
+
+# Tools whose collapsed body is always the formatter's compact preview, no
+# matter how short the raw output is, and whose expandability is therefore
+# decided by the formatter rather than by the raw size thresholds. `write_todos`
+# renders a per-item summary; `ask_user` renders a one-line summary so a
+# two-line transcript still keeps its answers behind an expand click.
+_ALWAYS_PREVIEW_TOOLS: frozenset[str] = frozenset({"write_todos", "ask_user"})
+
+
+# An `ask_user` row whose recorded output is exactly one of these holds only a
+# fallback summary — no `ToolMessage` transcript ever arrived — so there is
+# nothing for an expand click to reveal. Recognized by value rather than by the
+# `_deferred_success_settled` flag so the suppression also holds for a row rebuilt
+# from the message store, where that flag is not persisted (a rehydrated row is
+# always already terminal). A real transcript always begins `Q: `, so it can never
+# collide with these.
+_ASK_USER_ROW_SUMMARIES: frozenset[str] = frozenset(
+    {ASK_USER_ANSWERED_SUMMARY, ASK_USER_FAILED_SUMMARY}
+)
+
+
 # Long-running tools whose completed status row reports how long they ran
 # ("Took <duration>") when a run was timed, instead of being hidden. `execute`
 # shells and `task` subagent dispatches can both run for a while, so the elapsed
@@ -164,6 +220,13 @@ _TIMED_SUCCESS_TOOLS: set[str] = {
     "execute",
     "task",
 }
+
+
+# CSS classes applied to a `ToolCallMessage` to tint the whole row by terminal
+# outcome (see its `DEFAULT_CSS`). Running/pending states carry none of these.
+_STATUS_CLASSES: frozenset[str] = frozenset(
+    {"-status-success", "-status-error", "-status-rejected", "-status-skipped"}
+)
 
 
 _SUCCESS_EXIT_RE = re.compile(r"\n?\[Command succeeded with exit code 0\]\s*$")
@@ -241,13 +304,108 @@ def _select_prompt_body(widget: Static) -> None:
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _UserMessageFull:
+    """A user message short enough to render verbatim."""
+
+    text: str
+    """The original body, unmodified."""
+
+
+@dataclass(frozen=True, slots=True)
+class _UserMessageCollapsed:
+    """A user message elided to head + tail for transcript display.
+
+    Each variant names only the fields that mean something for it, so states
+    like "not collapsed but 5 hidden lines" are unrepresentable and consumers
+    dispatch by `isinstance` rather than reading an overloaded flag.
+    """
+
+    head: str
+    """Leading slice kept verbatim, rendered above the elision marker."""
+
+    tail: str
+    """Trailing slice kept verbatim, rendered below the elision marker."""
+
+    hidden_lines: int
+    """Newlines in the elided middle."""
+
+    hidden_chars: int
+    """Characters in the elided middle.
+
+    Reported in place of `hidden_lines` for single-line bodies (base64 blobs,
+    minified JSON), where "+0 lines" would imply nothing was hidden.
+    """
+
+    @property
+    def text(self) -> str:
+        """Single-string collapsed form, for callers that cannot emit spans.
+
+        Returns:
+            Head and tail joined by an elision marker.
+        """
+        ellipsis = get_glyphs().ellipsis
+        return (
+            f"{self.head}\n{ellipsis} +{self.hidden_lines} lines {ellipsis}\n"
+            f"{self.tail}"
+        )
+
+
+_UserMessageDisplay = _UserMessageFull | _UserMessageCollapsed
+"""Either form a user-message body can take in the transcript."""
+
+
+def _will_collapse(text: str) -> bool:
+    """Return whether `text` exceeds the transcript display threshold.
+
+    Single source of truth for the threshold, shared by `_collapse_user_message`
+    and `UserMessage.will_truncate` so the render decision and the expand
+    affordance can never disagree.
+
+    Args:
+        text: Candidate body text.
+
+    Returns:
+        `True` when the body is long enough to collapse.
+    """
+    return len(text) > _USER_MSG_MAX_DISPLAY_CHARS
+
+
+def _collapse_user_message(text: str) -> _UserMessageDisplay:
+    """Collapse a very long user message for transcript display.
+
+    Keeps the first and last portions and elides the middle. This mirrors
+    Claude Code's `UserPromptMessage` head+tail truncation for rendering
+    performance.
+
+    Args:
+        text: Full message content.
+
+    Returns:
+        `_UserMessageCollapsed` when the body exceeds the display threshold,
+        otherwise `_UserMessageFull` carrying the original text.
+    """
+    if not _will_collapse(text):
+        return _UserMessageFull(text=text)
+    hidden_start = _USER_MSG_TRUNCATE_HEAD_CHARS
+    hidden_end = len(text) - _USER_MSG_TRUNCATE_TAIL_CHARS
+    return _UserMessageCollapsed(
+        head=text[:_USER_MSG_TRUNCATE_HEAD_CHARS],
+        tail=text[-_USER_MSG_TRUNCATE_TAIL_CHARS:],
+        # Counted over a range rather than a slice so a multi-megabyte paste
+        # does not allocate a copy of its own middle on every render.
+        hidden_lines=text.count("\n", hidden_start, hidden_end),
+        hidden_chars=hidden_end - hidden_start,
+    )
+
+
 def _truncate_for_display(text: str) -> str:
     """Truncate very long user message text for display in the conversation.
 
-    Keeps the first and last portions and replaces the middle with an elision
-    marker showing the number of newlines in the hidden region.  This mirrors
-    Claude Code's `UserPromptMessage` head+tail truncation for rendering
-    performance.
+    Thin string-returning wrapper around `_collapse_user_message` for
+    `QueuedUserMessage.render` and tests, which only need the joined text.
+    `UserMessage.render` consumes the head/tail fields directly so it can
+    interleave the clickable affordance between them.
 
     Args:
         text: Full message content.
@@ -256,17 +414,31 @@ def _truncate_for_display(text: str) -> str:
         Truncated text with an elision marker, or the original text when
         it does not exceed the display threshold.
     """
-    if len(text) <= _USER_MSG_MAX_DISPLAY_CHARS:
-        return text
-    head = text[:_USER_MSG_TRUNCATE_HEAD_CHARS]
-    tail = text[-_USER_MSG_TRUNCATE_TAIL_CHARS:]
-    hidden_text = text[_USER_MSG_TRUNCATE_HEAD_CHARS:-_USER_MSG_TRUNCATE_TAIL_CHARS]
-    hidden_lines = hidden_text.count("\n")
-    return f"{head}\n… +{hidden_lines} lines …\n{tail}"
+    return _collapse_user_message(text).text
 
 
 class UserMessage(Static):
-    """Widget displaying a user message."""
+    """Widget displaying a user message.
+
+    Very long messages are collapsed in the transcript by default (head+tail
+    elision) to protect scrollback performance. The full text remains on the
+    widget for copy/select, and the collapsed form is reversible via click or
+    Ctrl+O.
+    """
+
+    class ExpansionChanged(Message):
+        """Posted when the collapsed-body expansion state changes."""
+
+        def __init__(self, widget: UserMessage, expanded: bool) -> None:
+            """Initialize an expansion-state message.
+
+            Args:
+                widget: The user message whose expansion state changed.
+                expanded: Whether the full body is now shown.
+            """
+            super().__init__()
+            self.widget = widget
+            self.expanded = expanded
 
     DEFAULT_CSS = """
     UserMessage {
@@ -276,6 +448,16 @@ class UserMessage(Static):
         background: transparent;
         border-left: wide $primary;
         pointer: text;
+        /* The expand affordance carries `@click` meta, which Textual styles as
+           a link (underline, and bold on an accent block when hovered).
+           Neutralize both so the hint renders as plain inherited-colour dim
+           italic, matching every other "click or Ctrl+O" hint in this module.
+           Bold in particular has to go: it cancels dim in most terminals. */
+        link-color: $text;
+        link-style: not underline;
+        link-color-hover: $text;
+        link-background-hover: transparent;
+        link-style-hover: not bold not underline;
     }
 
     UserMessage.-cancelled {
@@ -283,6 +465,8 @@ class UserMessage(Static):
     }
     """
     """`-cancelled` dims a prompt whose turn was interrupted by the user."""
+
+    _expanded: var[bool] = var(False)
 
     def __init__(
         self,
@@ -309,6 +493,29 @@ class UserMessage(Static):
         self._content = content
         self._media_snapshot = media_snapshot
         self._detect_mode = detect_mode
+        self._deferred_expanded = False
+        # Last expansion value published to the message store. Deduping against
+        # it keeps the reactive's initialization watcher and the deferred
+        # restore from re-emitting a value the store already holds.
+        self._published_expanded = False
+
+    @staticmethod
+    def will_truncate(content: str) -> bool:
+        """Return whether `content` would collapse in the transcript.
+
+        Prefer the `has_expandable_body` property when a widget is in hand: it
+        applies the same mode-prefix stripping as `render()`, so it cannot
+        disagree with what is actually on screen. This static form is for
+        callers that only have the raw string and know no prefix applies.
+
+        Args:
+            content: Candidate user-message body (mode prefix already stripped
+                when applicable — matching what `render()` collapses).
+
+        Returns:
+            `True` when the body exceeds the display character threshold.
+        """
+        return _will_collapse(content)
 
     @property
     def raw_text(self) -> str:
@@ -325,9 +532,51 @@ class UserMessage(Static):
         """Media tracker state captured when the message was submitted."""
         return self._media_snapshot
 
+    def _body_for_display(self) -> str:
+        """Return the message body after stripping a detected mode trigger.
+
+        Unlike `_prefix_and_body`, this does not look up theme colors, so it is
+        safe to call before mount (e.g. `has_expandable_body` / Ctrl+O routing).
+
+        Returns:
+            Body text used for collapse decisions (`has_expandable_body`).
+        """
+        content = self._content
+        mode_match = detect_mode_prefix(content) if self._detect_mode else None
+        if mode_match:
+            prefix_text, _mode = mode_match
+            return content[len(prefix_text) :]
+        return content
+
+    @property
+    def has_expandable_body(self) -> bool:
+        """Whether this message is long enough to collapse/expand in display."""
+        return self.will_truncate(self._body_for_display())
+
     def set_cancelled(self) -> None:
         """Dim the message to mark its turn as interrupted by the user."""
         self.add_class("-cancelled")
+
+    def toggle_expanded(self) -> None:
+        """Toggle between collapsed and full-body transcript display."""
+        if not self.has_expandable_body:
+            return
+        self._expanded = not self._expanded
+
+    def action_toggle_expand(self) -> None:
+        """Textual `@click` target for the expand/collapse affordance."""
+        self.toggle_expanded()
+
+    def watch__expanded(self, expanded: bool) -> None:
+        """Relayout and publish user-driven expansion for virtualization."""
+        self.refresh(layout=True)
+        # Publish only genuine changes: dedupe against the store's known value
+        # to drop the reactive's initialization watcher and the deferred
+        # restore, and require `is_attached` so `_expanded` set in pre-mount
+        # test setup does not `post_message` on a detached widget.
+        if self.is_attached and expanded != self._published_expanded:
+            self._published_expanded = expanded
+            self.post_message(self.ExpansionChanged(self, expanded))
 
     def get_selection(self, selection: Selection) -> tuple[str, str] | None:
         """Return selected text, preferring the full content over the render.
@@ -371,6 +620,11 @@ class UserMessage(Static):
     def _build_full_render(self) -> Content:
         """Build a Content from the full content without display truncation.
 
+        Omits the expand/collapse hint spans in both the collapsed and expanded
+        states, so select-all yields only the original message body. Drag
+        selections do not route here (see `get_selection`) and can still pick up
+        hint text along with the body.
+
         Returns:
             Content with the mode prefix glyph and the full message body.
         """
@@ -382,33 +636,34 @@ class UserMessage(Static):
         _select_prompt_body(self)
 
     def on_mount(self) -> None:
-        """Add CSS classes for mode-specific border and ASCII border type."""
+        """Add mode/ASCII CSS classes and restore deferred expansion state."""
         mode_match = detect_mode_prefix(self._content) if self._detect_mode else None
         if mode_match:
             _prefix, mode = mode_match
             self.add_class(f"-mode-{mode.replace('_', '-')}")
         if is_ascii_mode():
             self.add_class("-ascii")
+        # The store already holds the restored state, so record it as published
+        # first; the assignment below then dedupes instead of re-emitting it.
+        self._published_expanded = self._deferred_expanded
+        if self._deferred_expanded:
+            self._expanded = True
+            self._deferred_expanded = False
 
-    def render(self) -> Content:
-        """Render the styled user message.
+    def _append_highlighted_body(
+        self,
+        parts: list[str | tuple[str, str] | Content],
+        content: str,
+        *,
+        colors: ThemeColors,
+    ) -> None:
+        """Append body text to `parts`, highlighting @mentions and /commands.
 
-        Returns:
-            Styled Content with mode prefix and highlighted mentions.
+        Args:
+            parts: Accumulator for `Content.assemble`.
+            content: Body text to highlight and append.
+            colors: Active theme colors.
         """
-        colors = theme.get_theme_colors(self)
-
-        # Use mode-specific prefix indicator when content starts with a
-        # mode trigger character (e.g. "!" for shell, "/" for commands).
-        # The display glyph may differ from the trigger (e.g. "$" for shell).
-        prefix, content = self._prefix_and_body()
-        parts: list[str | tuple[str, str]] = [prefix]
-
-        # Truncate very long content for display so large pastes don't flood
-        # the conversation.  The full text is still available for copy/select.
-        content = _truncate_for_display(content)
-
-        # Highlight @mentions and /commands in the content
         last_end = 0
         for match in INPUT_HIGHLIGHT_PATTERN.finditer(content):
             start, end = match.span()
@@ -442,6 +697,87 @@ class UserMessage(Static):
         if last_end < len(content):
             parts.append(content[last_end:])
 
+    @staticmethod
+    def _hint_style() -> TStyle:
+        """Style for the expand/collapse affordance.
+
+        Returns:
+            Dim italic style carrying the `@click` hit-target meta.
+        """
+        # `@click` meta is what Textual uses for Markdown links; body text stays
+        # free of meta so regular clicks select/copy without toggling. The
+        # link-* rules in `DEFAULT_CSS` keep Textual's automatic link styling
+        # from overriding the dim italic.
+        return TStyle(dim=True, italic=True) + TStyle.from_meta(
+            {"@click": "toggle_expand"}
+        )
+
+    @classmethod
+    def _collapse_hint_content(cls, collapsed: _UserMessageCollapsed) -> Content:
+        """Build the clickable "show full message" affordance.
+
+        Args:
+            collapsed: The collapse result describing the elided middle.
+
+        Returns:
+            Dim hit-target Content wired to `action_toggle_expand`.
+        """
+        ellipsis = get_glyphs().ellipsis
+        # A single-line paste (base64 blob, minified JSON) hides no newlines, so
+        # "+0 lines" would read as "nothing is hidden" exactly when the most is.
+        if collapsed.hidden_lines:
+            amount = f"+{collapsed.hidden_lines:,} lines"
+        else:
+            amount = f"+{collapsed.hidden_chars:,} characters"
+        return Content.styled(
+            f"{ellipsis} {amount} · click or Ctrl+O to show full message",
+            cls._hint_style(),
+        )
+
+    @classmethod
+    def _expand_hint_content(cls) -> Content:
+        """Build the clickable "collapse" affordance shown when expanded.
+
+        Returns:
+            Dim hit-target Content wired to `action_toggle_expand`.
+        """
+        return Content.styled("click or Ctrl+O to collapse", cls._hint_style())
+
+    def render(self) -> Content:
+        """Render the styled user message.
+
+        Returns:
+            Styled Content with mode prefix and highlighted mentions. Long
+            messages are collapsed by default with a clickable expand
+            affordance; when expanded they show the full body plus a collapse
+            hint. Select-all still uses `_build_full_render` (no hints).
+        """
+        colors = theme.get_theme_colors(self)
+
+        # Use mode-specific prefix indicator when content starts with a
+        # mode trigger character (e.g. "!" for shell, "/" for commands).
+        # The display glyph may differ from the trigger (e.g. "$" for shell).
+        prefix, body = self._prefix_and_body()
+        parts: list[str | tuple[str, str] | Content] = [prefix]
+        collapse = _collapse_user_message(body)
+
+        if isinstance(collapse, _UserMessageFull):
+            self._append_highlighted_body(parts, body, colors=colors)
+            return Content.assemble(*parts)
+
+        if self._expanded:
+            self._append_highlighted_body(parts, body, colors=colors)
+            parts.extend(("\n", self._expand_hint_content()))
+            return Content.assemble(*parts)
+
+        # Collapsed: head + clickable elision line + tail. The middle marker is
+        # the affordance (not a second trailing line) so the collapse stays
+        # one glanceable region instead of an invisible middle ellipsis. Head
+        # and tail come from the collapse result rather than being re-sliced
+        # here, so the reported amount always describes the gap on screen.
+        self._append_highlighted_body(parts, collapse.head, colors=colors)
+        parts.extend(("\n", self._collapse_hint_content(collapse), "\n"))
+        self._append_highlighted_body(parts, collapse.tail, colors=colors)
         return Content.assemble(*parts)
 
 
@@ -741,7 +1077,7 @@ class SkillMessage(Vertical):
                     Content.styled(
                         f"{ellipsis} {remaining} more lines"
                         " — click or Ctrl+O to expand",
-                        "dim",
+                        "dim italic",
                     )
                 )
         else:
@@ -808,7 +1144,7 @@ class SkillMessage(Vertical):
             self._hint_widget.update(
                 Content.styled(
                     f"{ellipsis} {remaining} more lines — click or Ctrl+O to expand",
-                    "dim",
+                    "dim italic",
                 )
             )
 
@@ -1036,6 +1372,31 @@ the grouping predicates (`is_success`/`is_failed`/`is_pending`) partition a
 known universe.
 """
 
+_TOOL_AWAITING_APPROVAL_ACCESSORY_CLASS = "-tool-awaiting-approval-accessory"
+"""Marker class hiding a tool's accessories while an approval prompt replaces it.
+
+Deliberately distinct from `_TOOL_GROUP_COLLAPSED_ACCESSORY_CLASS`: a footer can
+be hidden for more than one reason at once, and releasing one reason must not
+un-hide a footer still hidden by another. Merging reasons into a single class
+would make
+`ToolGroupSummary._release_collapsible` reveal a footer whose tool is still
+hidden behind an approval prompt.
+
+Applied with `set_class` rather than by assigning `display`. An inline `display`
+permanently outranks the CSS cascade, so assigning it here would strand the
+footer against the user's `/timestamps` preference forever. Styled in
+`app.tcss`, which relies on rule order to win the specificity tie against that
+preference's own class.
+"""
+
+_TOOL_SUPERSEDED_ACCESSORY_CLASS = "-tool-superseded-accessory"
+"""Hides a row's decorations when its diff has taken the row's place.
+
+A third, independent hide reason. See `_TOOL_AWAITING_APPROVAL_ACCESSORY_CLASS`
+for why each reason gets its own class (they must release independently) and
+why it is applied with `set_class` rather than `display`.
+"""
+
 
 class ToolCallMessage(Vertical):
     """Widget displaying a tool call with collapsible output.
@@ -1131,6 +1492,25 @@ class ToolCallMessage(Vertical):
         color: $text-muted;
     }
 
+    /* Terminal outcome tints the row: green success, red error, amber
+       rejected/skipped. A faint background keeps text readable across
+       light/dark/ansi themes while the border carries the primary signal. */
+    ToolCallMessage.-status-success {
+        border-left: wide $success;
+        background: $success 8%;
+    }
+
+    ToolCallMessage.-status-error {
+        border-left: wide $error;
+        background: $error 10%;
+    }
+
+    ToolCallMessage.-status-rejected,
+    ToolCallMessage.-status-skipped {
+        border-left: wide $warning;
+        background: $warning 8%;
+    }
+
     ToolCallMessage:hover {
         border-left: wide $tool-hover;
     }
@@ -1206,6 +1586,14 @@ class ToolCallMessage(Vertical):
         self._start_time: float | None = None
         self._duration: float | None = None
         self._animation_timer: Timer | None = None
+        # Terminal success this row earned but has not rendered. See
+        # `defer_success`; `_deferred_success_settled` separates "still awaiting
+        # the richer result" from "already fell back to the summary".
+        self._deferred_success_output: str | None = None
+        self._deferred_success_settled: bool = False
+        # One-shot guard so `_format_ask_user_output` reports unusable `questions`
+        # args once per widget rather than on every re-render.
+        self._ask_user_args_warned: bool = False
         # Deferred state for hydration (set by MessageData.to_widget)
         self._deferred_status: str | None = None
         self._deferred_output: str | None = None
@@ -1215,6 +1603,12 @@ class ToolCallMessage(Vertical):
         # Whether the widget is currently hidden because an approval prompt
         # is rendering the same content (see `set_awaiting_approval`).
         self._awaiting_approval: bool = False
+        # Transcript decorations that must follow approval visibility without
+        # losing their independent user-controlled visibility state.
+        self._visibility_accessories: list[Widget] = []
+        self._diff_superseded: bool = False
+        self._self_hidden: bool = False
+        self._has_display_caveat: bool = False
 
     def compose(self) -> ComposeResult:
         """Compose the tool call message layout.
@@ -1308,6 +1702,10 @@ class ToolCallMessage(Vertical):
 
         # Restore deferred state if this widget was hydrated from data
         self._restore_deferred_state()
+        # `to_widget` sets `_diff_superseded` before mount, but not every
+        # `_restore_deferred_state` branch applies visibility. Applied here so
+        # hiding does not depend on which branch a tool takes.
+        self._apply_own_visibility()
 
     def _restore_deferred_state(self) -> None:
         """Restore state from deferred values (used when hydrating from data)."""
@@ -1335,6 +1733,7 @@ class ToolCallMessage(Vertical):
                 self._status = "success"
                 self._output = output
                 self._duration = duration
+                self._apply_status_class("success")
                 if self._tool_name in _TIMED_SUCCESS_TOOLS and duration is not None:
                     self._show_timed_success_status(duration)
                 else:
@@ -1343,6 +1742,7 @@ class ToolCallMessage(Vertical):
             case "error":
                 self._status = "error"
                 self._output = output
+                self._apply_status_class("error")
                 if self._status_widget:
                     self._status_widget.add_class("error")
                     error_icon = get_glyphs().error
@@ -1353,6 +1753,7 @@ class ToolCallMessage(Vertical):
                 self._update_output_display()
             case "rejected":
                 self._status = "rejected"
+                self._apply_status_class("rejected")
                 if self._status_widget:
                     self._status_widget.add_class("rejected")
                     error_icon = get_glyphs().error
@@ -1363,6 +1764,7 @@ class ToolCallMessage(Vertical):
                 self._update_reject_reason_display()
             case "skipped":
                 self._status = "skipped"
+                self._apply_status_class("skipped")
                 if self._status_widget:
                     self._status_widget.add_class("rejected")
                     self._status_widget.update(Content.styled("- Skipped", "dim"))
@@ -1442,6 +1844,109 @@ class ToolCallMessage(Vertical):
             self._animation_timer.stop()
             self._animation_timer = None
 
+    def _apply_status_class(self, status: str) -> None:
+        """Tint the whole row to match a terminal outcome.
+
+        Swaps the `-status-*` CSS class so the row border and background
+        reflect success/error/rejected/skipped. Running and pending states keep
+        the default `$tool` accent, so they clear any prior status class.
+
+        Args:
+            status: Terminal status name (`success`, `error`, `rejected`,
+                `skipped`); any other value clears the tint.
+        """
+        for name in _STATUS_CLASSES:
+            self.remove_class(name)
+        class_name = f"-status-{status}"
+        if class_name in _STATUS_CLASSES:
+            self.add_class(class_name)
+
+    def defer_success(self, output: AskUserRowSummary) -> None:
+        """Record a terminal success this row earned but has not yet rendered.
+
+        An answered `ask_user` deliberately stays in `_current_tool_messages` so
+        the streamed `ToolMessage` can settle it with the full Q&A transcript.
+        That leaves the row non-terminal in the meantime, and every teardown
+        sweep treats a still-tracked row as a failure — so without this the row
+        renders as rejected or as an agent error, and its `tool.result` reports
+        `tool_status="error"`, for a question the user answered normally.
+
+        Args:
+            output: Summary to settle with if the `ToolMessage` never arrives.
+                Narrowed to `AskUserRowSummary` because `_format_ask_user_output`
+                recognizes exactly those values as "no transcript behind this row"
+                and suppresses the expand affordance for them. Passing the
+                transcript here would strand it unreadable on the row.
+        """
+        self._deferred_success_output = output
+        self._deferred_success_settled = False
+
+    @property
+    def deferred_success_output(self) -> str | None:
+        """Terminal output for a row that earned a success it did not render.
+
+        Set while the row awaits its richer result and deliberately kept after a
+        fallback settle, because a settled row can still be tracked in
+        `_current_tool_messages` and swept again later (`textual_adapter`'s
+        `finally` backstop). `_dispatch_terminal_tool_result_hooks` reads this as
+        the "this row already succeeded" flag, so clearing it on settle would make
+        that later sweep report a fabricated failure.
+        """
+        return self._deferred_success_output
+
+    @property
+    def is_awaiting_deferred_result(self) -> bool:
+        """Whether this row still expects a richer result to replace its summary.
+
+        Distinct from `deferred_success_output`, which stays set after a fallback
+        settle. Callers that must not act on an already-settled row — recovering
+        an interrupted turn's `tool_calls`, or imposing a terminal failure — ask
+        this instead.
+        """
+        return self._deferred_success_output is not None and (
+            not self._deferred_success_settled
+        )
+
+    def clear_deferred_success(self) -> None:
+        """Drop the deferred outcome once an authoritative result supersedes it.
+
+        Called when the streamed `ToolMessage` settles the row, so its real
+        status wins — including an error, which `set_error` would otherwise
+        redirect back to the deferred success.
+        """
+        self._deferred_success_output = None
+        self._deferred_success_settled = False
+
+    def settle_deferred_success(self) -> bool:
+        """Settle this row with its deferred success, if it is awaiting one.
+
+        Idempotent: a row that already fell back returns False rather than
+        re-rendering, so callers need no `is_awaiting_deferred_result` guard of
+        their own. Records that the fallback fired but keeps the output — see
+        `deferred_success_output` for why a later sweep still needs to read it.
+
+        Returns:
+            True if the row was settled. False if it had no deferred outcome, has
+                already settled, or is rejected/skipped so `set_success` would
+                ignore it — in each case the caller should record its own terminal
+                state.
+        """
+        output = self._deferred_success_output
+        if output is None or self._deferred_success_settled:
+            # Mirrors `is_awaiting_deferred_result`, spelled out so the type
+            # checker can narrow `output` to `str`.
+            return False
+        if self._status in {"rejected", "skipped"}:
+            return False
+        # Before `set_success`, which re-renders synchronously. Nothing in that
+        # render path reads this flag today (`_format_ask_user_output` derives
+        # "no transcript" from the output value instead, so the suppression also
+        # survives rehydration), but ordering the flag first keeps the object
+        # consistent for anything the render does reach.
+        self._deferred_success_settled = True
+        self.set_success(output)
+        return True
+
     def set_success(self, result: str = "") -> None:
         """Mark the tool call as successful.
 
@@ -1463,13 +1968,25 @@ class ToolCallMessage(Vertical):
         elapsed = time() - self._start_time if self._start_time is not None else None
         self._stop_animation()
         self._status = "success"
+        # This call owns `_output`, so any caveat a previous completion put
+        # there is gone. Clearing here keeps the flag from outliving the
+        # sentence it describes and leaving the row unfoldable for no visible
+        # reason; `set_success_with_caveat` re-sets it after delegating here.
+        self._has_display_caveat = False
         self._duration = (
             elapsed
             if self._tool_name in _TIMED_SUCCESS_TOOLS and elapsed is not None
             else None
         )
-        # Strip redundant success trailer — the UI already conveys success
-        self._output = _strip_success_exit_line(result)
+        # Strip redundant command success trailers — the UI already conveys
+        # success. `ask_user` output is a user-authored Q&A transcript, though,
+        # so text that resembles a command trailer must remain verbatim.
+        self._output = (
+            result
+            if self._tool_name == "ask_user"
+            else _strip_success_exit_line(result)
+        )
+        self._apply_status_class("success")
         if self._duration is not None:
             self._show_timed_success_status(self._duration)
         else:
@@ -1495,17 +2012,16 @@ class ToolCallMessage(Vertical):
 
         When the call produces visible output it speaks for itself and the
         status stays hidden; otherwise show a "Success!" marker so a completed
-        call (e.g. `edit_file`) isn't left without any outcome indicator.
+        call isn't left without any outcome indicator. A row already marked as
+        replaced by a mounted diff hides entirely.
         """
         if self._status_widget is None:
             return
         self._status_widget.remove_class("pending")
-        if (
-            self._tool_name != "edit_file"
-            and self._format_output(
-                self._output, is_preview=False
-            ).content.plain.strip()
-        ):
+        if self._superseded_by_diff:
+            self._apply_own_visibility()
+            return
+        if self._format_output(self._output, is_preview=False).content.plain.strip():
             self._status_widget.remove_class("success")
             self._status_widget.display = False
             return
@@ -1514,6 +2030,47 @@ class ToolCallMessage(Vertical):
         self._status_widget.add_class("success")
         self._status_widget.update(Content.styled(f"{glyph} Success!", colors.success))
         self._status_widget.display = True
+
+    @staticmethod
+    def can_be_superseded(tool_name: str | None) -> bool:
+        """Return whether a diff may stand in for this tool's row.
+
+        The public form of the `_TOOL_SUPERSEDED_BY_DIFF` check, so the adapter
+        does not reach for a private constant to ask the same question from a
+        different name source. `mark_superseded_by_diff` still enforces it — this
+        only lets a caller avoid tripping the warning.
+
+        Args:
+            tool_name: Raw name of the tool that produced the row.
+
+        Returns:
+            Whether a mounted `DiffMessage` may hide the row.
+        """
+        return tool_name == _TOOL_SUPERSEDED_BY_DIFF
+
+    def mark_superseded_by_diff(self) -> None:
+        """Hide a successful file-tool row after its diff has mounted.
+
+        Rejects any tool other than `_TOOL_SUPERSEDED_BY_DIFF`, leaving the row
+        visible and logging at warning — so this is not safe to call
+        speculatively. That guard is load-bearing rather than defensive:
+        `MessageStore.to_widget` routes a stored flag through this method
+        precisely to inherit it, so rehydration cannot hide a row the live path
+        would have left visible.
+        """
+        if self._tool_name != _TOOL_SUPERSEDED_BY_DIFF:
+            # A broken invariant, not a routine skip: the caller decided this row
+            # was superseded from a *different* name source (the adapter gates on
+            # `record.tool_name`), so a divergence leaves an empty-bodied diff
+            # rendering "no changes" beside a row that stayed visible.
+            logger.warning(
+                "mark_superseded_by_diff called on %r; only %r may be superseded",
+                self._tool_name,
+                _TOOL_SUPERSEDED_BY_DIFF,
+            )
+            return
+        self._diff_superseded = True
+        self._apply_own_visibility()
 
     def set_error(self, error: str) -> None:
         """Mark the tool call as failed.
@@ -1528,8 +2085,27 @@ class ToolCallMessage(Vertical):
             # state rather than flipping to "Error" (which also left the stale
             # `rejected` CSS class alongside `error`).
             return
+        if self.settle_deferred_success():
+            # A teardown sweep imposing a generic failure on a row that already
+            # succeeded (an answered `ask_user` awaiting its transcript). The
+            # authoritative `ToolMessage` calls `clear_deferred_success` first, so
+            # a *real* tool error still lands below. `settle_deferred_success` is
+            # idempotent, so the redirect fires once: a row that already fell back
+            # keeps no immunity against a later genuine error.
+            #
+            # INFO, not DEBUG: turning a failure into a success is the single
+            # highest-stakes decision on this path, and the always-on debug ring
+            # buffer that backs the in-app console only captures INFO and above.
+            logger.info(
+                "Suppressed error on tool row with a deferred success: %s", error
+            )
+            return
         self._stop_animation()
         self._status = "error"
+        self._apply_status_class("error")
+        # Not a no-op: `_superseded_by_diff` is gated on success, so this is what
+        # reveals a row that was hidden behind a diff before its status flipped.
+        self._apply_own_visibility()
         # For shell commands, prepend the full command so users can see what failed
         command = self._args.get("command") if self._tool_name == "execute" else None
         if command and isinstance(command, str) and command.strip():
@@ -1556,8 +2132,19 @@ class ToolCallMessage(Vertical):
             reason: Optional free-text reason supplied via the HITL reject
                 widget; rendered as a dim line beneath the status.
         """
+        if self.settle_deferred_success():
+            # A turn-cancel sweep rejecting every tracked row; an answered
+            # `ask_user` among them still succeeded, so it keeps its own outcome.
+            # (Interrupt rejections leave these rows tracked instead — see
+            # `_pop_rows_not_awaiting_deferred_result`.) INFO for the same reason
+            # as the redirect in `set_error`.
+            logger.info(
+                "Suppressed rejection on tool row with a deferred success: %s", reason
+            )
+            return
         self._stop_animation()
         self._status = "rejected"
+        self._apply_status_class("rejected")
         if reason and reason.strip():
             self._reject_reason = reason.strip()
         if self._status_widget:
@@ -1589,6 +2176,7 @@ class ToolCallMessage(Vertical):
         """Mark the tool call as skipped (due to another rejection)."""
         self._stop_animation()
         self._status = "skipped"
+        self._apply_status_class("skipped")
         if self._status_widget:
             self._status_widget.remove_class("pending")
             self._status_widget.add_class("rejected")  # Use same styling as rejected
@@ -1603,7 +2191,7 @@ class ToolCallMessage(Vertical):
         is restored via `clear_awaiting_approval` once the user decides.
         """
         self._awaiting_approval = True
-        self.display = False
+        self._apply_own_visibility()
 
     def clear_awaiting_approval(self) -> None:
         """Restore the tool call after `set_awaiting_approval`.
@@ -1614,7 +2202,71 @@ class ToolCallMessage(Vertical):
         if not self._awaiting_approval:
             return
         self._awaiting_approval = False
-        self.display = True
+        self._apply_own_visibility()
+
+    def _register_visibility_accessories(self, *accessories: Widget) -> None:
+        """Link transcript decorations whose visibility follows this tool.
+
+        Idempotent: `Widget` uses identity equality, so re-registering the same
+        accessory (a regroup folding an already-folded tool) cannot double-add.
+        """
+        for accessory in accessories:
+            if accessory not in self._visibility_accessories:
+                self._visibility_accessories.append(accessory)
+        self._sync_own_hide_accessories()
+
+    @property
+    def has_own_hide_reason(self) -> bool:
+        """Whether this row hides itself, regardless of any group collapse.
+
+        Group code must consult this before revealing a row: the two mechanisms
+        are independent, so an unconditional `display = True` would reveal a row
+        that is hiding for its own reasons.
+        """
+        return self._awaiting_approval or self._superseded_by_diff
+
+    def _apply_own_visibility(self) -> None:
+        """Apply self-hide reasons without disturbing group visibility.
+
+        Only touches `display` when a self-hide reason applies or is being
+        released — a row with no self-hide history is left exactly as the group
+        set it. Releasing is the narrower guarantee: it restores `display` to
+        `True` unconditionally, so a row that was *both* group-collapsed and
+        self-hidden would reveal itself into a collapsed group. Not reachable
+        today (the one supersedable tool is group-excluded, and rows awaiting
+        approval are evicted rather than folded), but a new hide reason that can
+        coexist with a group must consult the group's state here.
+
+        The other direction is `has_own_hide_reason`, which group code checks
+        before revealing — and which this reads, so the set of hide reasons is
+        defined in exactly one place and a new one cannot be honoured by the
+        group checks while being ignored here.
+        """
+        if self.has_own_hide_reason:
+            self.display = False
+            self._self_hidden = True
+        elif self._self_hidden:
+            self.display = True
+            self._self_hidden = False
+        self._sync_own_hide_accessories()
+
+    def _sync_own_hide_accessories(self) -> None:
+        """Mirror this row's hide reasons onto linked decorations.
+
+        Tests each reason individually rather than reading `has_own_hide_reason`:
+        each carries its own class so the reasons release independently, which the
+        aggregate cannot express. A new hide reason needs a class and an entry
+        here as well as a term in `has_own_hide_reason`.
+        """
+        for accessory in self._visibility_accessories:
+            accessory.set_class(
+                self._awaiting_approval,
+                _TOOL_AWAITING_APPROVAL_ACCESSORY_CLASS,
+            )
+            accessory.set_class(
+                self._superseded_by_diff,
+                _TOOL_SUPERSEDED_ACCESSORY_CLASS,
+            )
 
     def toggle_output(self) -> None:
         """Toggle expansion of the tool's preview/full output."""
@@ -1778,14 +2430,35 @@ class ToolCallMessage(Vertical):
             "web_search": self._format_web_output,
             "fetch_url": self._format_web_output,
             "task": self._format_task_output,
+            "ask_user": self._format_ask_user_output,
         }
 
         formatter = formatters.get(self._tool_name)
         if formatter:
             return formatter(output, is_preview=is_preview)
 
+        return self._format_generic_output(output, is_preview=is_preview)
+
+    def _format_generic_output(
+        self, output: str, *, is_preview: bool = False
+    ) -> FormattedOutput:
+        """Format output using generic size-based truncation.
+
+        Used for tools with no dedicated formatter, and by a dedicated formatter
+        that cannot parse its input and so must still cap an arbitrarily long
+        body rather than dumping it into the collapsed row.
+
+        Args:
+            output: Tool output. `_format_output` has stripped trailing whitespace
+                and leading newlines, but deliberately preserves the first line's
+                leading indentation — do not assume it is fully trimmed.
+            is_preview: Whether to truncate for the collapsed row.
+
+        Returns:
+            FormattedOutput, carrying truncation info only when `is_preview` and
+                the body exceeds the line or character threshold.
+        """
         if is_preview:
-            # Fallback for unknown tools: use generic truncation
             lines = output.split("\n")
             if len(lines) > self._PREVIEW_LINES:
                 return self._format_lines_output(lines, is_preview=True)
@@ -1856,7 +2529,10 @@ class ToolCallMessage(Vertical):
         if self._tool_name == "edit_file" and self._status == "success":
             return True
 
-        if self._tool_name == "write_todos":
+        # See `_ALWAYS_PREVIEW_TOOLS`: the formatter decides whether these have
+        # anything left to reveal, rather than the raw size thresholds below.
+        # (A formatter that cannot parse its input may delegate back to them.)
+        if self._tool_name in _ALWAYS_PREVIEW_TOOLS:
             return self._format_output(output, is_preview=True).truncation is not None
 
         lines = output.split("\n")
@@ -2664,6 +3340,101 @@ class ToolCallMessage(Vertical):
 
         return FormattedOutput(content=content, truncation=truncation)
 
+    def _ask_user_question_count(self) -> int:
+        """Return the number of valid question objects in this tool call.
+
+        The count comes from the structured tool arguments rather than parsing
+        the free-form transcript. This keeps arbitrary answer text opaque while
+        still supporting the collapsed `N answers` affordance.
+
+        Returns:
+            The question count, or zero unless `questions` is a non-empty list of
+                dicts each carrying non-blank `question` text. Deliberately looser
+                than `ask_user._validate_questions` — it accepts payloads that
+                rejects, such as an unknown `type` or a `choices`/`type` mismatch —
+                because it only needs to guard the fields the count reads. Of the
+                three paths that populate `_args`, only the `ask_user` interrupt
+                (validated in `textual_adapter` via `ask_user_adapter`) is checked;
+                the streamed tool call and the persisted store
+                (`message_store.to_widget`) are not, so malformed shapes do reach
+                here and must degrade rather than raise.
+        """
+        questions = self._args.get("questions")
+        if not isinstance(questions, list) or not questions:
+            return 0
+        if not all(
+            isinstance(question, dict)
+            and isinstance(question.get("question"), str)
+            and bool(question["question"].strip())
+            for question in questions
+        ):
+            return 0
+        return len(questions)
+
+    def _format_ask_user_output(
+        self, output: str, *, is_preview: bool = False
+    ) -> FormattedOutput:
+        """Format an `ask_user` result for the collapsed or expanded row.
+
+        The inline question widget is unmounted once answered, so this row is the
+        only place the answers stay visible in the live session — the thread's
+        own `ToolMessage` is what a reload re-renders from. Collapsed, the row
+        keeps a one-line summary; expanded, it shows what was sent back.
+
+        The summary is derived from the recorded status, never from the answer
+        text (the question count only labels the expand affordance). The
+        placeholders are in-band, so a user who types `(cancelled)` or
+        `(error: ...)` must not have their answer read as control state. The cost
+        is that a cancelled prompt resumed by a non-TUI client — which `ask_user`
+        records as `status="success"` with `(cancelled)` placeholders — reads as
+        answered until expanded.
+
+        Returns:
+            FormattedOutput with the status-derived summary when `is_preview`, or
+                the output rendered literally when expanded. A row holding only a
+                fallback summary advertises no expansion. Falls back to generic
+                formatting when the structured question args are unavailable.
+        """
+        question_count = self._ask_user_question_count()
+        if question_count == 0:
+            # Route through the generic path rather than returning the body bare:
+            # `ask_user` is in `_ALWAYS_PREVIEW_TOOLS`, so the size thresholds in
+            # `_has_expandable_output`/`_update_output_display` no longer gate it
+            # and an arbitrarily long body would otherwise fill the collapsed row
+            # with no expand affordance. `_format_generic_output` reapplies them.
+            if not self._ask_user_args_warned:
+                # Once per widget: this runs on every re-render, and the
+                # condition cannot change without a new `_args`.
+                self._ask_user_args_warned = True
+                logger.warning(
+                    "ask_user row has no usable `questions` args (got %r); the "
+                    "collapsed row will show the transcript instead of a summary",
+                    self._args.get("questions"),
+                )
+            return self._format_generic_output(output, is_preview=is_preview)
+
+        if output in _ASK_USER_ROW_SUMMARIES:
+            # No authoritative ToolMessage arrived, so this row holds only the
+            # fallback summary. There is no transcript for expansion to reveal;
+            # advertising the question count would create a dead affordance.
+            return FormattedOutput(content=Content.styled(output, "dim"))
+
+        if not is_preview:
+            return FormattedOutput(content=Content(output))
+
+        if self._status == "error":
+            # The transcript holds `(error: ...)` placeholders, not answers, so
+            # count the questions instead of promising answers.
+            summary = ASK_USER_FAILED_SUMMARY
+            noun = "question" if question_count == 1 else "questions"
+        else:
+            summary = ASK_USER_ANSWERED_SUMMARY
+            noun = "answer" if question_count == 1 else "answers"
+        return FormattedOutput(
+            content=Content.styled(summary, "dim"),
+            truncation=f"{question_count} {noun}",
+        )
+
     def _update_output_display(self) -> None:
         """Update the output display based on expanded state."""
         # Guard: all widgets must be initialized before updating display state
@@ -2746,15 +3517,15 @@ class ToolCallMessage(Vertical):
                 ellipsis = get_glyphs().ellipsis
                 self._hint_widget.update(
                     Content.styled(
-                        f"{ellipsis} {self._output_hint_keys()} to expand", "dim"
+                        f"{ellipsis} {self._output_hint_keys()} to expand", "dim italic"
                     )
                 )
                 self._hint_widget.display = True
                 return
             # Truncate the preview only when the output is large enough to
-            # warrant it; `write_todos` always uses its compact per-item preview
+            # warrant it; `_ALWAYS_PREVIEW_TOOLS` use their compact preview
             # regardless of size.
-            is_preview = needs_truncation or self._tool_name == "write_todos"
+            is_preview = needs_truncation or self._tool_name in _ALWAYS_PREVIEW_TOOLS
             # Pass the raw output, not `output_stripped`: `_format_output`
             # normalizes whitespace while preserving the first line's leading
             # indentation. Pre-stripping here flattens that indent on line 0 only,
@@ -2773,7 +3544,7 @@ class ToolCallMessage(Vertical):
                     Content.styled(
                         f"{ellipsis} {result.truncation} — "
                         f"{self._output_hint_keys()} to expand",
-                        "dim",
+                        "dim italic",
                     )
                 )
                 self._hint_widget.display = True
@@ -2827,6 +3598,74 @@ class ToolCallMessage(Vertical):
     def is_success(self) -> bool:
         """Whether the tool completed successfully."""
         return self._status == "success"
+
+    @property
+    def _superseded_by_diff(self) -> bool:
+        """Whether this row hides because its `DiffMessage` says it all.
+
+        Gated on success so a row whose status later flips to error is revealed
+        again: `_diff_superseded` stays set, this goes `False`, and `set_error`
+        re-applies visibility for exactly that reason. Without the conjunct a
+        failure would be hidden behind a diff of the change it did not make.
+        """
+        return self.is_success and self._diff_superseded
+
+    @property
+    def has_display_caveat(self) -> bool:
+        """Whether this row's output leads with a caveat that must stay visible.
+
+        A caveat is the user's only account of a change the transcript cannot
+        render, and it is carried inside this row's output. A groupable tool
+        (`write_file`, `delete`) is folded at mount, and the collapsed summary
+        line is built from tool names alone — so without this the caveat is
+        folded away and destroying a 5,000-line file whose contents could not be
+        read renders as `▸ Deleted 1 file`, exactly like destroying an empty one.
+
+        Read by the group code alongside `is_failed`: a caveated row is not a
+        failure, but it has the same claim on staying on screen.
+        """
+        return self._has_display_caveat
+
+    def set_success_with_caveat(self, caveat: str, output: str) -> bool:
+        """Complete this row successfully, leading with a caveat if there is one.
+
+        The live path's single entry point, because the flag and the prose it
+        describes must not be settable apart: a flag without the sentence leaves
+        a row unfoldable for no visible reason, and — the costly direction — the
+        sentence without the flag lets the change's only account be folded into
+        a group summary.
+
+        Not routed through `set_error`: a display problem is not a tool failure.
+        That would stamp the row "Error", overwrite the tool's success message,
+        and make a completed operation count toward every failure surface, so a
+        user would retry an edit that already applied. Prepended rather than
+        appended so the caveat survives the collapsed output preview.
+
+        Args:
+            caveat: The caveat to lead with, or empty when there is none.
+            output: The tool's own output.
+
+        Returns:
+            Whether a caveat was applied, for callers tracking whether any
+            surface carried it.
+        """
+        self.set_success("\n\n".join(part for part in (caveat, output) if part))
+        self._has_display_caveat = bool(caveat)
+        return bool(caveat)
+
+    def _mark_display_caveat(self) -> None:
+        """Restore the display-caveat flag on a rehydrated row.
+
+        For `MessageData.to_widget` only, where the output carrying the caveat
+        is restored separately through `_deferred_output`. On the live path use
+        `set_success_with_caveat`, which sets both together.
+
+        Private so it is not available as a public way to set the flag alone:
+        the store already restores this widget's other private state, and a
+        caller outside that path wanting the flag without the sentence is the
+        split `set_success_with_caveat` exists to prevent.
+        """
+        self._has_display_caveat = True
 
     @property
     def is_failed(self) -> bool:
@@ -3076,6 +3915,39 @@ _TOOL_SUMMARY_PHRASES: dict[str, tuple[str, str, str, str]] = {
     "task": ("Running", "Ran", "agent", "agents"),
 }
 
+_DIFF_HEADER_CATEGORIES = frozenset({"write", "edit", "delete"})
+"""Summary categories whose past verb heads a `DiffMessage`.
+
+The file-mutating tools — the only ones that produce a diff to head.
+"""
+
+
+def _diff_header_verb(tool_name: str | None) -> str:
+    """Return the past-tense verb naming the change a diff shows.
+
+    The verb text is shared with the group-summary tables, but eligibility is
+    not: a newly added file tool needs an entry in `_DIFF_HEADER_CATEGORIES` as
+    well, or it heads its diff with no verb at all.
+
+    Args:
+        tool_name: Raw name of the tool that produced the diff.
+
+    Returns:
+        The verb, or empty when the tool does not mutate a file or has no
+        phrasing registered for its category.
+    """
+    category = _TOOL_SUMMARY_CATEGORY.get(tool_name or "", "")
+    if category not in _DIFF_HEADER_CATEGORIES:
+        return ""
+    phrases = _TOOL_SUMMARY_PHRASES.get(category)
+    if phrases is None:
+        # A category listed as diff-eligible but never given phrasing. Losing
+        # the verb beats raising inside `compose` and killing the whole diff.
+        logger.warning("No summary phrasing registered for category %r", category)
+        return ""
+    return phrases[1]
+
+
 _Tense = Literal["present", "past"]
 
 
@@ -3184,6 +4056,24 @@ def summarize_live_tool_group(
     return _join_segments(segments)
 
 
+_TOOL_GROUP_COLLAPSED_ACCESSORY_CLASS = "-tool-group-collapsed-accessory"
+"""Marker class hiding a collapsed group's accessory widgets.
+
+See `_TOOL_AWAITING_APPROVAL_ACCESSORY_CLASS` for why each hide reason carries its
+own class and why none may be replaced by assigning `display`.
+"""
+
+
+def _hides_itself(widget: Widget) -> bool:
+    """Whether a widget is hiding itself for reasons a group must not override.
+
+    Returns:
+        `True` when the widget tracks its own hide reasons and one applies. Only
+        `ToolCallMessage` does; anything else is governed by its group alone.
+    """
+    return isinstance(widget, ToolCallMessage) and widget.has_own_hide_reason
+
+
 class ToolGroupSummary(Static):
     """Collapsed one-line stand-in for an assistant step's tool calls.
 
@@ -3193,7 +4083,7 @@ class ToolGroupSummary(Static):
     live, finished calls stay visible in the past tense next to the ones still
     running in the present tense (e.g. "Ran 2 shell commands, running 1 agent…")
     so the work already done in the step doesn't disappear. Failed, rejected,
-    and skipped tools are evicted to standalone rows (see `_evict_failed`) so
+    and skipped tools are evicted to standalone rows (see `_evict_unfoldable`) so
     errors stay visible. Clicking the line or pressing Ctrl+O expands the
     underlying tool rows (and their diffs).
 
@@ -3232,6 +4122,7 @@ class ToolGroupSummary(Static):
         tools: list[ToolCallMessage] | None = None,
         collapsible: list[Widget] | None = None,
         *,
+        accessories: dict[Widget, list[Widget]] | None = None,
         live: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -3242,6 +4133,14 @@ class ToolGroupSummary(Static):
                 empty for a live group that grows via `add_member`.
             collapsible: Every widget hidden/shown with the group, including the
                 tool widgets and any interleaved diff previews.
+            accessories: Decorations (e.g. timestamp footers) keyed by the
+                collapsible they trail, hidden and shown with that owner via a
+                marker class rather than `display`. Collapsing therefore never
+                clears an accessory's own visibility class, so the
+                `/timestamps` preference reasserts itself on expand. Keys must
+                appear in `collapsible`: `_apply_visibility` iterates
+                `collapsible`, so an accessory keyed by a non-member is never
+                synced.
             live: When True, animate progress and accept new members until
                 `close`. When False, render a finalized past-tense summary.
             **kwargs: Additional arguments passed to `Static`.
@@ -3249,6 +4148,9 @@ class ToolGroupSummary(Static):
         super().__init__("", **kwargs)
         self._tools = list(tools or [])
         self._collapsible = list(collapsible or [])
+        self._accessories: dict[Widget, list[Widget]] = {}
+        for owner, widgets in (accessories or {}).items():
+            self._attach_accessories(owner, widgets)
         self._accepting_members = live
         self._finalized = not live
         self._spinner_pos = 0
@@ -3269,25 +4171,57 @@ class ToolGroupSummary(Static):
         self._render_line()
         self._sync_timer()
 
-    def add_member(self, tool: ToolCallMessage, *extra: Widget) -> None:
-        """Add a tool (and any associated widgets) to a live group."""
+    def _attach_accessories(self, owner: Widget, accessories: Iterable[Widget]) -> None:
+        """Record `owner`'s accessories and link them to its approval hiding.
+
+        The single registration point for every fold path (constructor,
+        `add_member`, `add_collapsible`) so the group's `_accessories` map and a
+        tool's own `_visibility_accessories` cannot drift apart — a tool folded
+        via one path would otherwise hide its footer on collapse but not while
+        an approval prompt replaced it.
+        """
+        linked = [a for a in accessories if a not in self._accessories.get(owner, ())]
+        if not linked:
+            return
+        self._accessories.setdefault(owner, []).extend(linked)
+        if isinstance(owner, ToolCallMessage):
+            owner._register_visibility_accessories(*linked)
+
+    def add_member(self, tool: ToolCallMessage, *accessories: Widget) -> None:
+        """Add a tool to a live group and link its accessories.
+
+        Args:
+            tool: Tool widget folded into the group.
+            accessories: Decorations (e.g. the tool's timestamp footer) that
+                follow the tool's visibility via a marker class. Not group
+                members: they take neither `-grouped` nor a `display` flip, so
+                their own visibility class survives the fold. Also linked to
+                the tool's own hide reasons — approval and diff supersession
+                both — via `has_own_hide_reason`.
+        """
         tool.add_class("-grouped")
         self._tools.append(tool)
         self._collapsible.append(tool)
-        for widget in extra:
-            widget.add_class("-grouped")
-            self._collapsible.append(widget)
+        self._attach_accessories(tool, accessories)
         self._present_text = self._past_text = self._present_key = None
         self._apply_visibility()
         in_progress = self._sync_lifecycle()
         self._render_line(in_progress=in_progress)
 
-    def add_collapsible(self, widget: Widget) -> None:
-        """Attach a non-tool widget (e.g. a diff) to be folded with the group."""
+    def add_collapsible(self, widget: Widget, *accessories: Widget) -> None:
+        """Attach a non-tool widget (e.g. a diff) and its accessories.
+
+        Args:
+            widget: Non-tool widget folded with the group.
+            accessories: Decorations (e.g. the widget's timestamp footer) that
+                follow the widget's visibility via a marker class. Not group
+                members, so their own visibility class survives the fold. No
+                approval linkage: only a `ToolCallMessage` can await approval.
+        """
         widget.add_class("-grouped")
         self._collapsible.append(widget)
-        if widget.is_attached:
-            widget.display = not self._collapsed
+        self._attach_accessories(widget, accessories)
+        self._apply_collapsible_visibility(widget, visible=not self._collapsed)
 
     def close(self) -> None:
         """Stop accepting members and finalize after every tool settles.
@@ -3298,7 +4232,7 @@ class ToolGroupSummary(Static):
         past tense as though the tool ran successfully.
         """
         self._accepting_members = False
-        self._evict_failed()
+        self._evict_unfoldable()
         in_progress = self._sync_lifecycle()
         if not self.is_attached:
             return
@@ -3306,7 +4240,38 @@ class ToolGroupSummary(Static):
             self._render_line(in_progress=in_progress)
         else:
             # Every tool failed and was ejected — nothing left to summarize.
+            # Release whatever is still folded first: once this summary is gone
+            # nothing can expand it, so a retained widget (and its accessories)
+            # would stay hidden for the rest of the session.
+            self._release_all_collapsible()
             self.remove()
+
+    def _release_collapsible(self, widget: Widget) -> None:
+        """Drop a widget's group linkage and clear its collapsed accessory class.
+
+        Only the *group's* hide reason is released. A tool's own linkage
+        (`_visibility_accessories`) intentionally survives, so a revealed row
+        still hides its footer for any of its own hide reasons — an approval
+        prompt replacing it, or a diff superseding it. See `has_own_hide_reason`
+        for the full set.
+        """
+        if widget in self._collapsible:
+            self._collapsible.remove(widget)
+        widget.remove_class("-grouped")
+        for accessory in self._accessories.pop(widget, []):
+            accessory.remove_class(_TOOL_GROUP_COLLAPSED_ACCESSORY_CLASS)
+
+    def _release_all_collapsible(self) -> None:
+        """Release and reveal every remaining folded widget.
+
+        Must run before this summary is removed: a widget left folded keeps
+        `-grouped`, `display = False`, and its accessories' marker class with no
+        summary left to expand it, which no later toggle can undo.
+        """
+        for widget in list(self._collapsible):
+            self._release_collapsible(widget)
+            if widget.is_attached and not _hides_itself(widget):
+                widget.display = True
 
     def reveal_pending(self) -> None:
         """Remove unfinished tool calls from the collapsed group."""
@@ -3315,21 +4280,15 @@ class ToolGroupSummary(Static):
             return
         for tool in pending:
             self._tools.remove(tool)
-            if tool in self._collapsible:
-                self._collapsible.remove(tool)
-            tool.remove_class("-grouped")
-            if tool.is_attached and not tool._awaiting_approval:
+            self._release_collapsible(tool)
+            if tool.is_attached and not _hides_itself(tool):
                 tool.display = True
         self._present_text = self._past_text = self._present_key = None
         in_progress = self._sync_lifecycle()
         if self._tools:
             self._render_line(in_progress=in_progress)
             return
-        for widget in self._collapsible:
-            widget.remove_class("-grouped")
-            if widget.is_attached:
-                widget.display = True
-        self._collapsible.clear()
+        self._release_all_collapsible()
         if self.is_attached:
             self.remove()
 
@@ -3381,17 +4340,22 @@ class ToolGroupSummary(Static):
         self._sync_timer()
         return in_progress
 
-    def _evict_failed(self) -> None:
-        """Un-fold errored/rejected/skipped tools so non-successes stay visible."""
-        failed = [t for t in self._tools if t.is_failed]
+    def _evict_unfoldable(self) -> None:
+        """Un-fold tools the summary line cannot speak for.
+
+        Two reasons qualify. A non-success (errored, rejected, skipped) must stay
+        visible so a failure is not summarized away. So must a success whose
+        output opens with a display caveat: the summary is built from tool names
+        alone, so folding one hides the only statement that the change could not
+        be shown — see `ToolCallMessage.has_display_caveat`.
+        """
+        failed = [t for t in self._tools if t.is_failed or t.has_display_caveat]
         if not failed:
             return
         for tool in failed:
             self._tools.remove(tool)
-            if tool in self._collapsible:
-                self._collapsible.remove(tool)
-            tool.remove_class("-grouped")
-            if tool.is_attached:
+            self._release_collapsible(tool)
+            if tool.is_attached and not _hides_itself(tool):
                 tool.display = True
         self._present_text = self._past_text = self._present_key = None
 
@@ -3413,7 +4377,7 @@ class ToolGroupSummary(Static):
         try:
             self._spinner_pos += 1
             before = len(self._tools)
-            self._evict_failed()
+            self._evict_unfoldable()
             evicted = len(self._tools) != before
             if self._collapsed:
                 # Re-assert hidden state in case a member was shown externally
@@ -3421,6 +4385,9 @@ class ToolGroupSummary(Static):
                 self._apply_visibility()
             if not self._tools:
                 self._sync_lifecycle(in_progress=False)
+                # Nothing can expand this summary once it is gone, so release
+                # anything still folded before removing it.
+                self._release_all_collapsible()
                 if self.is_attached:
                     self.remove()
                 return
@@ -3438,12 +4405,35 @@ class ToolGroupSummary(Static):
             logger.exception("ToolGroupSummary spinner tick failed; stopping timer")
             self._stop_timer()
 
+    def _apply_collapsible_visibility(self, widget: Widget, *, visible: bool) -> None:
+        """Apply the group's visibility to a widget and its accessories.
+
+        The owner is driven directly via `display`; accessories are driven by a
+        marker class instead, so hiding them leaves their independent visibility
+        class intact and it reasserts itself when the group expands. The two
+        mechanisms are not interchangeable — see
+        `_TOOL_AWAITING_APPROVAL_ACCESSORY_CLASS`.
+
+        Accessories are classed even while detached: `set_class` is safe off-DOM
+        and nothing revisits a skipped accessory, so guarding on `is_attached`
+        here would leave a late-mounted footer stranded visible over a hidden
+        row.
+
+        Expanding the group does not reveal a widget hiding for its own reasons
+        (`_hides_itself`); its accessories still follow the group, since their
+        self-hide reasons carry their own independent classes.
+        """
+        target = visible and not _hides_itself(widget)
+        if widget.is_attached and widget.display != target:
+            widget.display = target
+        for accessory in self._accessories.get(widget, []):
+            accessory.set_class(not visible, _TOOL_GROUP_COLLAPSED_ACCESSORY_CLASS)
+
     def _apply_visibility(self) -> None:
-        """Show or hide every folded widget per the collapsed state."""
+        """Show or hide every folded widget, and its accessories, per collapse."""
         visible = not self._collapsed
         for widget in self._collapsible:
-            if widget.is_attached and widget.display != visible:
-                widget.display = visible
+            self._apply_collapsible_visibility(widget, visible=visible)
 
     def _render_line(
         self, *, in_progress: bool | None = None, layout: bool = True
@@ -3493,43 +4483,41 @@ class ToolGroupSummary(Static):
 
 
 class DiffMessage(Static):
-    """Widget displaying a diff with syntax highlighting."""
+    """Widget displaying a diff with syntax highlighting.
+
+    Two behaviors beyond rendering, both easy to break from `compose` without
+    noticing, and documented per-parameter on `__init__`:
+
+    - Any `outcome` other than `shown` replaces the diff body with a caveat
+      sentence. A body rendered under a lost pre-image would be a whole-file
+      insertion that never happened, so suppression is the honest result rather
+      than a degradation.
+    - A path this session treats as sensitive suppresses the body *and* the
+      counts. Leaking `+40 -3` for a credentials file still describes its
+      contents, so the header cannot survive a redacted body.
+
+    `renders_caveat` reports whether this widget's body states the change could
+    not be shown. The adapter reads it back when deciding whether any surface
+    carried the caveat — conjoined with the mount result, since this says only
+    what the widget would render, not that it reached the screen.
+    """
 
     DEFAULT_CSS = """
     DiffMessage {
         height: auto;
-        padding: 1;
+        padding: 0 1;
         margin: 0 0 1 0;
-        background: $surface;
-        border: solid $primary;
+        background: transparent;
+        border-left: wide $panel;
         pointer: text;
     }
 
     DiffMessage .diff-header {
-        text-style: bold;
         margin-bottom: 1;
     }
-
-    DiffMessage .diff-add {
-        color: $text-success;
-        background: $success-muted;
-    }
-
-    DiffMessage .diff-remove {
-        color: $text-error;
-        background: $error-muted;
-    }
-
-    DiffMessage .diff-context {
-        color: $text-muted;
-    }
-
-    DiffMessage .diff-hunk {
-        color: $secondary;
-        text-style: bold;
-    }
     """
-    """Diff syntax coloring per theme: additions, removals, muted context."""
+    """Deliberately carries no per-line color: the row gutters and the
+    `.diff-line-*` backgrounds supply it."""
 
     def __init__(
         self,
@@ -3537,6 +4525,11 @@ class DiffMessage(Static):
         file_path: str = "",
         *,
         tool_name: str | None = None,
+        before: str = "",
+        after: str = "",
+        stats: DiffStats | None = None,
+        outcome: DiffOutcome = "shown",
+        show_caveat: bool = True,
         **kwargs: Any,
     ) -> None:
         """Initialize a diff message.
@@ -3545,12 +4538,55 @@ class DiffMessage(Static):
             diff_content: The unified diff content
             file_path: Path to the file being modified
             tool_name: Name of the file tool that produced the diff
+            before: Source aligned to the diff's old line numbers. Pass the
+                whole file, or a prefix `highlight_source_prefixes` previously
+                produced — which is what `MessageData` round-trips. Stored
+                trimmed, and dropped entirely for a credential path.
+            after: Source aligned to the diff's new line numbers, same contract.
+            stats: Authoritative `(additions, deletions)`, counted before
+                truncation. Always preferred over recounting the diff body;
+                `None` recounts.
+            outcome: What the operation can honestly say about what it changed.
+                Anything but `shown` suppresses the body and replaces it with
+                that outcome's caveat. Taken as the outcome rather than as
+                independent flags because they are not independent: a
+                `stats`-plus-"counts are fiction" pair is representable, and
+                whichever of the two a reader trusts, the other contradicts it.
+            show_caveat: Whether to render the outcome's caveat. Suppresses only
+                the sentence, never the body — an untrusted body stays hidden
+                either way. Pass `False` only when a tool row already on screen
+                carries the identical sentence, which for `edit_file` is
+                guaranteed: it can never be folded into a group, so both would
+                render adjacent. The caller owns that judgement because this
+                widget cannot see what else is mounted.
             **kwargs: Additional arguments passed to parent
         """
         super().__init__(**kwargs)
         self._diff_content = diff_content
         self._file_path = file_path
         self._tool_name = tool_name
+        self._redacted = is_sensitive_file_path(file_path)
+        if self._redacted:
+            self._before = ""
+            self._after = ""
+        else:
+            self._before, self._after = highlight_source_prefixes(
+                diff_content, before, after
+            )
+        self._stats = stats
+        self._outcome = outcome
+        self._show_caveat = show_caveat
+
+    @property
+    def renders_caveat(self) -> bool:
+        """Whether this widget's body states the change could not be shown.
+
+        Read by the adapter instead of inferring from the record's outcome: the
+        adapter cannot otherwise know whether the mounted widget actually put
+        the caveat on screen, and asserting it did is how a caveat came to be
+        both suppressed and reported as delivered.
+        """
+        return self._outcome != "shown" and self._show_caveat
 
     def compose(self) -> ComposeResult:
         """Compose the diff message layout.
@@ -3558,27 +4594,99 @@ class DiffMessage(Static):
         Yields:
             Widgets displaying the diff header and formatted content.
         """
-        if self._file_path:
-            yield Static(
-                Content.from_markup("[bold]File: $path[/bold]", path=self._file_path),
-                classes="diff-header",
-            )
+        parts: list[str | tuple[str, str] | Content] = []
+        if verb := _diff_header_verb(self._tool_name):
+            parts.append((f"{verb} ", "bold"))
+        parts.append(Content.from_markup("[dim]$path[/dim]", path=self._file_path))
 
-        # Never render the contents of credential files (e.g. `.env`) — the diff
-        # would leak secrets into the terminal UI and scrollback.
-        if is_sensitive_file_path(self._file_path):
+        # Never render the contents or line counts of credential files (e.g.
+        # `.env`) — the diff would leak secrets into the terminal UI and
+        # scrollback, and the counts would describe them.
+        if self._redacted:
+            yield Static(Content.assemble(*parts), classes="diff-header")
+            if self.renders_caveat:
+                # Rendered alongside the redaction notice, not instead of it.
+                # The two say different things: redaction means the diff was
+                # withheld deliberately, the caveat means it could not be
+                # produced at all. Showing only the former tells a reader the
+                # change is known and merely hidden. The caveat names the tool
+                # and nothing else, so it leaks no file content.
+                yield Static(
+                    Content.styled(
+                        display_caveat(self._outcome, self._tool_name or "operation"),
+                        "dim",
+                    )
+                )
             yield Static(
                 Content.styled("Diff hidden — file may contain credentials", "dim")
             )
+        elif self._outcome != "shown":
+            # The body cannot be trusted. Under `untrusted_before` the diff was
+            # computed against a stand-in empty file, so a one-line edit renders
+            # as a whole-file insertion; suppressing only the counts would leave
+            # the body making the same false claim more loudly, so the caveat
+            # replaces it outright.
+            #
+            # Gated on the outcome, not on `renders_caveat`: `show_caveat`
+            # suppresses the sentence when a row already carries it, and must
+            # never be able to bring the untrusted body back.
+            #
+            # The caveat is the shared one, so this widget stands on its own:
+            # the tool row that also carries it can be folded into a group, or
+            # never have mounted at all, and pointing at it would leave the
+            # reader chasing text that is not on screen.
+            yield Static(Content.assemble(*parts), classes="diff-header")
+            if self.renders_caveat:
+                yield Static(
+                    Content.styled(
+                        display_caveat(self._outcome, self._tool_name or "operation"),
+                        "dim",
+                    )
+                )
         else:
-            # Render the diff with per-line Statics (CSS-driven backgrounds)
-            yield from compose_diff_lines(self._diff_content, max_lines=100)
+            stats = self._stats if self._stats is not None else self._recount()
+            if stats is None:
+                parts.append(("  change counts unavailable", "dim"))
+            elif stats.additions or stats.deletions:
+                parts += ["  ", format_diff_stats(stats)]
+            elif not self._diff_content:
+                parts.append(("  no changes", "dim"))
+            header = Content.assemble(*parts)
+            if header.plain:
+                yield Static(header, classes="diff-header")
+            if self._diff_content:
+                yield from compose_diff_lines(
+                    self._diff_content,
+                    max_lines=100,
+                    path=self._file_path,
+                    before=self._before,
+                    after=self._after,
+                    show_numbers=self._tool_name != "edit_file",
+                )
+
+    def _recount(self) -> DiffStats | None:
+        """Recount the diff body when no authoritative counts were supplied.
+
+        Returns:
+            Counts from the body, or `None` when the body was clipped. A
+            truncated diff is missing lines by construction, so counting it would
+            assert a number that is known to be short and indistinguishable from
+            a correct one. `None` says the counts are unavailable, which is
+            different from — and more honest than — silently showing none.
+        """
+        lines = split_diff_lines(self._diff_content)
+        # Any position, not just the last line, and via the shared predicate:
+        # the renderer marks a truncated row wherever it appears, and the two
+        # must not disagree about whether this body is complete.
+        if any(is_truncation_marker(line) for line in lines):
+            return None
+        return count_diff_change_lines(lines)
 
     def on_mount(self) -> None:
         """Set border style based on charset mode."""
         if is_ascii_mode():
             colors = theme.get_theme_colors(self)
-            self.styles.border = ("ascii", colors.primary)
+            self.styles.border_left = ("ascii", colors.panel)
 
 
 class ErrorMessage(Static):
@@ -3809,9 +4917,34 @@ class _MutedRichMarkdown:
     }
 
     def __init__(self, markup: str) -> None:
-        from rich.markdown import Markdown as RichMarkdown
+        from rich.markdown import (
+            Markdown as RichMarkdown,
+            MarkdownElement,
+            TableElement,
+        )
+        from rich.table import Table
 
-        self._markdown = RichMarkdown(markup)
+        class _FoldingTableElement(TableElement):
+            """Render long Markdown table cells by folding instead of eliding."""
+
+            def __rich_console__(  # noqa: PLW3201  # Rich renderable protocol
+                self, console: RichConsole, options: ConsoleOptions
+            ) -> RenderResult:
+                for renderable in super().__rich_console__(console, options):
+                    if isinstance(renderable, Table):
+                        for column in renderable.columns:
+                            column.overflow = "fold"
+                    yield renderable
+
+        class _FoldingMarkdown(RichMarkdown):
+            """Rich Markdown variant that never ellipsizes table cells."""
+
+            elements: ClassVar[dict[str, type[MarkdownElement]]] = {
+                **RichMarkdown.elements,
+                "table_open": _FoldingTableElement,
+            }
+
+        self._markdown = _FoldingMarkdown(markup)
         self._markup = markup
 
     def __rich_console__(  # noqa: PLW3201  # Rich renderable protocol
@@ -4026,6 +5159,19 @@ class AppMessage(Static):
     def on_click(self, event: Click) -> None:  # noqa: PLR6301  # Textual event handler
         """Open style-embedded hyperlinks on single click."""
         open_style_link(event)
+
+    def on_mouse_move(self, event: MouseMove) -> None:
+        """Show a pointer cursor over embedded links, text cursor elsewhere."""
+        self.styles.pointer = "pointer" if event_targets_link(event) else "text"
+
+    def on_leave(self) -> None:
+        """Restore the pointer shape when the mouse leaves the message.
+
+        `"text"` restates this widget's CSS default rather than clearing the
+        inline style, so a subclass declaring a different `pointer` would be
+        forced back to `text` on leave.
+        """
+        self.styles.pointer = "text"
 
 
 class SummarizationMessage(AppMessage):

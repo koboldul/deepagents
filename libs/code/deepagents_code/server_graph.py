@@ -197,39 +197,59 @@ async def _make_graph() -> Any:  # noqa: ANN401
     """
     config = ServerConfig.from_env()
 
-    # The langgraph dev server builds this graph on its event loop, where
-    # blockbuster rejects synchronous filesystem calls. Graph construction is
-    # import-heavy, and its module-level code and lazily initialized singletons
-    # probe the filesystem: `get_server_project_context` canonicalizes the cwd
-    # and walks for the git root; importing `agent`/`config` triggers the
-    # `settings` bootstrap (`find_project_root` -> `Path.cwd`) plus a transitive
-    # `zoneinfo` -> `sysconfig` import whose module init calls `os.getcwd`. Run
-    # all of it once in a worker thread so these one-time blocking calls stay off
-    # the event loop; the imports repeated below are then cache hits and the
-    # initialized `settings` singleton is reused.
-    def _bootstrap() -> ProjectContext | None:
-        import sysconfig  # noqa: F401  # module init calls os.getcwd (3.13/Windows)
+    # Offload cwd/path resolution and the lazy settings bootstrap off the event
+    # loop. On Windows, `Path.resolve()` / `Path.cwd()` call `os.getcwd()`, which
+    # `blockbuster` rejects when invoked directly from the server loop (see
+    # issue #5043). Importing `deepagents_code.agent` / first `settings` access
+    # can also trigger `find_project_root()` -> `Path.cwd()`.
+    #
+    # Keep LangSmith redaction configuration on the server task: its fail-closed
+    # path calls `langsmith.configure(enabled=False)`, which sets both a global
+    # fallback and the current `_TRACING_ENABLED` ContextVar. `asyncio.to_thread`
+    # only updates a copied worker context, so a ContextVar disable there would
+    # not reach a parent tracing context that already has `enabled=True` (ContextVar
+    # wins over the global flag).
+    def _resolve_project_context_and_settings() -> tuple[
+        ProjectContext | None,
+        Any,
+        Any,
+        Any,
+        Any,
+        Any,
+        Any,
+    ]:
+        project_context = get_server_project_context()
 
-        import deepagents_code.agent  # noqa: F401  # top-level access inits settings
+        from deepagents_code.agent import create_cli_agent, load_async_subagents
         from deepagents_code.config import (
             configure_langsmith_secret_redaction,
+            create_model,
+            is_memory_auto_save_enabled,
             settings,
         )
 
-        context = get_server_project_context()
-        if context is not None:
-            settings.reload_from_environment(start_path=context.user_cwd)
-        configure_langsmith_secret_redaction()
-        return context
+        if project_context is not None:
+            settings.reload_from_environment(start_path=project_context.user_cwd)
+        return (
+            project_context,
+            create_cli_agent,
+            load_async_subagents,
+            create_model,
+            is_memory_auto_save_enabled,
+            settings,
+            configure_langsmith_secret_redaction,
+        )
 
-    project_context = await asyncio.to_thread(_bootstrap)
-
-    from deepagents_code.agent import create_cli_agent, load_async_subagents
-    from deepagents_code.config import (
+    (
+        project_context,
+        create_cli_agent,
+        load_async_subagents,
         create_model,
         is_memory_auto_save_enabled,
         settings,
-    )
+        configure_langsmith_secret_redaction,
+    ) = await asyncio.to_thread(_resolve_project_context_and_settings)
+    configure_langsmith_secret_redaction()
 
     # Offload to a worker thread: `create_model` does blocking disk IO for some
     # providers (e.g. the `openai_codex` token store currently acquires a file
@@ -334,6 +354,7 @@ async def _make_graph() -> Any:  # noqa: ANN401
             enable_interpreter=config.enable_interpreter,
             rubric_model=config.rubric_model,
             rubric_max_iterations=config.rubric_max_iterations,
+            auto_classifier_model=config.auto_classifier_model,
             recursion_limit=config.recursion_limit,
             mcp_server_info=mcp_server_info,
             cwd=project_context.user_cwd if project_context is not None else config.cwd,

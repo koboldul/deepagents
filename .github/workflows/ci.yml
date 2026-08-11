@@ -20,8 +20,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# `pull-requests: read` lets the called `_test.yml` reusable workflow read live
+# PR labels (re-runs replay the original event payload, so the API is the only
+# fresh source). A called workflow's token can only narrow the caller's grants.
+# The issues labels endpoint it uses accepts either `issues: read` or
+# `pull-requests: read`, so no `issues` grant is needed here.
 permissions:
   contents: read
+  pull-requests: read
 
 env:
   UV_NO_SYNC: "true"
@@ -45,7 +51,7 @@ jobs:
       quickjs: ${{ steps.filter.outputs.quickjs }}
     steps:
       - name: "📋 Checkout Code"
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -393,7 +399,7 @@ jobs:
         working-directory: "libs/partners/quickjs"
     steps:
       - name: "📋 Checkout Code"
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: "🐍 Set up Python 3.11 + UV"
         uses: "./.github/actions/uv_setup"
@@ -436,18 +442,70 @@ jobs:
           echo "$STATUS"
           echo "$STATUS" | grep 'nothing to commit, working tree clean'
 
-  # Validates every helper script under .github/scripts/test_*.py. Job id/name
+  drbench-dataset:
+    name: "🗂️ Build DRBench dataset"
+    needs: changes
+    if: needs.changes.outputs.evals == 'true' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    # `datasets/drbench-evals` commits no task directories: all 100 are generated from
+    # upstream's configs at the pinned commit. Since the generated tree is no longer in
+    # the PR diff, this job is what proves generation still works and is reproducible.
+    # `make dataset-check` builds the dataset twice and diffs -- catching a
+    # nondeterministic generator, which would otherwise silently give this runner and a
+    # developer's laptop different datasets and make their scores incomparable.
+    env:
+      UV_FROZEN: "true"
+    defaults:
+      run:
+        working-directory: "libs/evals"
+    steps:
+      - name: "📋 Checkout Code"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: "🐍 Set up Python 3.12 + UV"
+        uses: "./.github/actions/uv_setup"
+        with:
+          python-version: "3.12"
+          cache-suffix: drbench-dataset
+          working-directory: "libs/evals"
+
+      - name: "📦 Install Dependencies"
+        shell: bash
+        run: uv sync
+
+      - name: "🔁 Verify generation is deterministic"
+        shell: bash
+        run: make dataset-check
+
+      - name: "🗂️ Build the dataset in place"
+        shell: bash
+        run: make dataset
+
+      # The generated task directories are git-ignored, so building them must leave the
+      # tree clean. A failure here means a generated path escaped .gitignore.
+      - name: "🧹 Verify Clean Working Directory"
+        shell: bash
+        run: |
+          set -eu
+          STATUS="$(git status)"
+          echo "$STATUS"
+          echo "$STATUS" | grep 'nothing to commit, working tree clean'
+
+  # Validates every helper script under .github/scripts/tests/. Job id/name
   # are kept for branch-protection compatibility; rename only with a coordinated PR.
   check-release-options:
     name: "Validate Release Options"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: "🐍 Setup Python 3.11"
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
-      # test_dcode_release_notes.py shells out to `node --test`; pin Node so the
+      # test_release_notes.py shells out to `node --test`; pin Node so the
       # helper-script tests don't rely on whatever the runner image preinstalls.
       - name: "🟢 Setup Node"
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
@@ -456,7 +514,7 @@ jobs:
       - name: "📦 Install Dependencies"
         run: python -m pip install packaging pyyaml pytest
       - name: "🔍 Check workflow helper scripts"
-        run: python -m pytest .github/scripts/test_*.py -v
+        run: python -m pytest .github/scripts/tests -v
 
   # Final status check - ensures all jobs passed
   ci_success:
@@ -486,6 +544,7 @@ jobs:
       - test-vercel
       - test-quickjs
       - test-quickjs-sdk-smoke
+      - drbench-dataset
       - check-release-options
     if: always()
     runs-on: ubuntu-latest

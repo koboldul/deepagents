@@ -21,6 +21,8 @@ from rich.console import Console
 if TYPE_CHECKING:
     from prompt_toolkit.layout import Layout
 
+from deepagents_code._env_vars import INVOKED_AS
+from deepagents_code._invocation import invoked_name
 from deepagents_code.app import AppResult, DeepAgentsApp, run_textual_app
 from deepagents_code.config import build_langsmith_thread_url, reset_langsmith_url_cache
 from deepagents_code.main import (
@@ -42,6 +44,7 @@ from deepagents_code.main import (
     run_textual_cli_async,
 )
 from deepagents_code.mcp_tools import ProjectServerSummary
+from deepagents_code.update_check import update_install_lock
 
 # Most unit tests set `DEEPAGENTS_CODE_NO_UPDATE_CHECK=1` and patch
 # `is_update_check_enabled()` to avoid accidental PyPI/DNS work. This module
@@ -207,11 +210,9 @@ class TestStartupAutoUpdate:
         hermetic only by accident — the test runner's editable install
         currently short-circuits at `detect_install_method() != "uv"` — but
         a uv-tool-managed Python or CI image that does match would silently
-        re-route every "successful update" test through the new
-        `if shadow is not None: return` branch and skip the restart
-        assertion. Pin to `None` here so the contract being tested is
-        "shadow path is opt-in"; the dedicated shadow-present test below
-        patches it explicitly.
+        add an extra warning line to every "successful update" test. Pin to
+        `None` here so the contract being tested is "shadow path is opt-in";
+        the dedicated shadow-present test below patches it explicitly.
 
         Patches at the source module rather than `deepagents_code.main`
         because `_run_startup_auto_update` lazy-imports it inside the
@@ -222,6 +223,23 @@ class TestStartupAutoUpdate:
             return_value=None,
         ):
             yield
+
+    @staticmethod
+    def _restart_asserting_sentinel(**_kwargs: object) -> None:
+        """Stand in for the re-exec, pinning the sentinel *at* the restart.
+
+        The loop guard in `_run_startup_auto_update` is keyed on
+        `DEEPAGENTS_CODE_RESTARTED_AFTER_UPDATE` surviving `os.execv` into the
+        next generation. Asserting on `os.environ` after the call cannot tell
+        "set, then popped" from "never set", so the check has to happen inside
+        the restart. Without it, deleting the assignment outright leaves every
+        test in this class green.
+
+        Raises:
+            SystemExit: Always, standing in for process replacement.
+        """
+        assert os.environ["DEEPAGENTS_CODE_RESTARTED_AFTER_UPDATE"] == "9.9.9"
+        raise SystemExit(0)
 
     def test_successful_update_restarts_before_launch(self) -> None:
         """A successful startup auto-update should exec a fresh process."""
@@ -256,28 +274,32 @@ class TestStartupAutoUpdate:
             ) as clear_failure,
             patch(
                 "deepagents_code.main._restart_current_process",
-                side_effect=SystemExit(0),
+                side_effect=self._restart_asserting_sentinel,
             ) as restart,
-            pytest.raises(SystemExit),
+            pytest.raises(SystemExit) as exit_info,
         ):
             _run_startup_auto_update(console)
 
+        # Pin the code, not just the type: a failing sentinel assertion inside
+        # the restart double surfaces as an `AssertionError`, which the
+        # post-install handler converts into `SystemExit(1)`. Bare
+        # `pytest.raises(SystemExit)` would swallow that and pass.
+        assert exit_info.value.code == 0
         upgrade.assert_awaited_once()
         clear_failure.assert_called_once_with("9.9.9")
         printed = " ".join(str(c.args[0]) for c in console.print.call_args_list)
         assert _tail_log_command(Path("/tmp/dcode-update.log")) in printed
         restart.assert_called_once_with()
 
-    def test_successful_update_skips_restart_when_shadowed(self) -> None:
-        """Successful upgrade + shadowed dcode must NOT restart into the old binary.
+    def test_successful_update_restarts_through_upgraded_shim_when_shadowed(
+        self,
+    ) -> None:
+        """A PATH shadow restarts through uv's upgraded shim.
 
-        Regression guard for the critical bug: when a stale `dcode` is
-        earlier on PATH than uv's bin dir, re-exec'ing would silently
-        re-launch the old version. The pre-launch path must surface a
-        warning and return *before* `_restart_current_process` so the user
-        sees the message and isn't stranded on the old in-memory version
-        with no explanation. Also pins the markup-escape behavior: a path
-        containing a Rich-special character must not raise.
+        The shadow can belong to a different uv tool environment from
+        `sys.executable`. Restarting that interpreter would reload stale code,
+        so the upgraded shim is used instead. Also pins the markup-escape
+        behavior: a path containing a Rich-special character must not raise.
         """
         from rich.markup import escape
 
@@ -324,14 +346,31 @@ class TestStartupAutoUpdate:
                 "deepagents_code.update_check.detect_shadowed_dcode",
                 return_value=shadow,
             ),
-            patch("deepagents_code.main._restart_current_process") as restart,
+            patch(
+                "deepagents_code.main._restart_current_process",
+                side_effect=self._restart_asserting_sentinel,
+            ) as restart,
+            pytest.raises(SystemExit) as exit_info,
         ):
             _run_startup_auto_update(console)
 
+        # See the sibling test: a failed sentinel assertion would otherwise be
+        # laundered into `SystemExit(1)` by the post-install handler.
+        assert exit_info.value.code == 0
         upgrade.assert_awaited_once()
-        restart.assert_not_called()
-        printed = " ".join(str(c.args[0]) for c in console.print.call_args_list)
+        restart.assert_called_once_with(restart_path=shadow.upgraded_bin)
+        lines = [str(c.args[0]) for c in console.print.call_args_list]
+        printed = " ".join(lines)
         assert "Warning:" in printed
+        # The source places the warning *before* the `Launching...` status
+        # deliberately, so `_confirm_update_after_restart`'s row-erase in the
+        # next generation cannot wipe it. Substring checks over the joined
+        # output would pass with the two prints swapped, so pin the order.
+        warning_index = next(i for i, line in enumerate(lines) if "Warning:" in line)
+        launching_index = next(
+            i for i, line in enumerate(lines) if "Launching..." in line
+        )
+        assert warning_index < launching_index
         # The path's `[legacy]` segment must be Rich-escaped (`\[legacy]`)
         # before interpolation under `markup=True`; a regression that
         # dropped `escape()` would either raise `MarkupError` (test fails)
@@ -339,7 +378,158 @@ class TestStartupAutoUpdate:
         # escaped form pins the fix.
         assert escape(str(shadow.shadowing_bin)) in printed
         assert escape(str(shadow.upgraded_bin_dir)) in printed
-        assert "Continuing with v" in printed
+        # The warning is about the *next* manual launch, so it must not claim
+        # this session stays on the old version.
+        assert "Continuing with v" not in printed
+        assert "Launching..." in printed
+
+    def test_update_held_by_another_session_is_skipped(self) -> None:
+        """A terminal that loses the update race launches on the old version.
+
+        The install must not run, the process must not restart, and — because
+        nothing actually failed — no failure cooldown may be recorded, or the
+        winning session's upgrade would suppress this one's next few attempts.
+        """
+        console = MagicMock()
+        upgrade = AsyncMock(return_value=(True, "updated"))
+
+        with (
+            patch("deepagents_code.config._is_editable_install", return_value=False),
+            patch(
+                "deepagents_code.update_check.is_update_check_enabled",
+                return_value=True,
+            ),
+            patch(
+                "deepagents_code.update_check.is_auto_update_enabled",
+                return_value=True,
+            ),
+            patch(
+                "deepagents_code.update_check.get_cached_update_available",
+                return_value=(True, "9.9.9"),
+            ),
+            patch("deepagents_code.update_check.perform_upgrade", upgrade),
+            patch(
+                "deepagents_code.update_check.mark_startup_auto_update_failed"
+            ) as mark_failed,
+            patch("deepagents_code.main._restart_current_process") as restart,
+            # Holds the lock the same way a second dcode process would. Taken
+            # in-process for determinism, so it is `_UPDATE_INSTALL_THREAD_LOCK`
+            # that refuses here; genuine cross-process exclusion is covered by
+            # `TestUpdateInstallLock::test_other_process_is_refused_while_lock_is_held`.
+            update_install_lock() as holding,
+        ):
+            assert holding is True
+            _run_startup_auto_update(console)
+
+        upgrade.assert_not_awaited()
+        restart.assert_not_called()
+        mark_failed.assert_not_called()
+        printed = " ".join(str(c.args[0]) for c in console.print.call_args_list)
+        assert "Another dcode session is updating to v9.9.9" in printed
+
+    def test_install_runs_while_holding_the_update_lock(self) -> None:
+        """The install itself must be inside the lock, not merely after a check.
+
+        Every other test here would still pass if the `with` block were shrunk
+        to cover only the boolean check, which would leave the install entirely
+        unguarded — the exact bug this lock exists to prevent. Re-entering from
+        inside `perform_upgrade` proves the lock is held for the real work: the
+        lock is not reentrant, so a held lock refuses.
+        """
+        console = MagicMock()
+        held_during_install: list[bool] = []
+
+        # Async to match the `perform_upgrade` it replaces, which is awaited.
+        async def _record_lock_state(**_kwargs: object) -> tuple[bool, str]:  # noqa: RUF029
+            with update_install_lock() as holding:
+                held_during_install.append(holding)
+            return True, "updated"
+
+        with (
+            patch("deepagents_code.config._is_editable_install", return_value=False),
+            patch(
+                "deepagents_code.update_check.is_update_check_enabled",
+                return_value=True,
+            ),
+            patch(
+                "deepagents_code.update_check.is_auto_update_enabled",
+                return_value=True,
+            ),
+            patch(
+                "deepagents_code.update_check.get_cached_update_available",
+                return_value=(True, "9.9.9"),
+            ),
+            patch(
+                "deepagents_code.update_check.format_release_age_parenthetical",
+                return_value="",
+            ),
+            patch(
+                "deepagents_code.update_check.create_update_log_path",
+                return_value=Path("/tmp/dcode-update.log"),
+            ),
+            patch("deepagents_code.update_check.perform_upgrade", _record_lock_state),
+            patch("deepagents_code.update_check.clear_startup_auto_update_failure"),
+            patch(
+                "deepagents_code.update_check.detect_shadowed_dcode",
+                return_value=None,
+            ),
+            patch("deepagents_code.main._restart_current_process"),
+        ):
+            _run_startup_auto_update(console)
+
+        assert held_during_install == [False], (
+            "the install ran without holding the update lock"
+        )
+
+    def test_update_lock_is_released_before_restart(self) -> None:
+        """The lock must not survive into the re-exec.
+
+        `os.execv` would drop it anyway — filelock's fd is non-inheritable under
+        PEP 446 — but correctness here must not depend on the fd-inheritance
+        behavior of a dependency, and the release also has to happen on the path
+        where the restart raises and this process keeps running.
+        """
+        console = MagicMock()
+        upgrade = AsyncMock(return_value=(True, "updated"))
+        held_during_restart: list[bool] = []
+
+        def _record_lock_state() -> None:
+            with update_install_lock() as holding:
+                held_during_restart.append(holding)
+            raise SystemExit(0)
+
+        with (
+            patch("deepagents_code.config._is_editable_install", return_value=False),
+            patch(
+                "deepagents_code.update_check.is_update_check_enabled",
+                return_value=True,
+            ),
+            patch(
+                "deepagents_code.update_check.is_auto_update_enabled",
+                return_value=True,
+            ),
+            patch(
+                "deepagents_code.update_check.get_cached_update_available",
+                return_value=(True, "9.9.9"),
+            ),
+            patch(
+                "deepagents_code.update_check.format_release_age_parenthetical",
+                return_value="",
+            ),
+            patch(
+                "deepagents_code.update_check.create_update_log_path",
+                return_value=Path("/tmp/dcode-update.log"),
+            ),
+            patch("deepagents_code.update_check.perform_upgrade", upgrade),
+            patch(
+                "deepagents_code.main._restart_current_process",
+                side_effect=_record_lock_state,
+            ),
+            pytest.raises(SystemExit),
+        ):
+            _run_startup_auto_update(console)
+
+        assert held_during_restart == [True]
 
     def test_disabled_update_does_not_check_pypi(self) -> None:
         """Disabled auto-update should not perform network or install work."""
@@ -397,6 +587,36 @@ class TestStartupAutoUpdate:
             "/tool/bin/python",
             ["/tool/bin/python", "-m", "deepagents_code", "--model", "openai:gpt-5.5"],
         )
+
+    def test_restart_uses_upgraded_shim_when_provided(self) -> None:
+        """A shadowed uv install must restart through its upgraded shim."""
+        shim = Path("/home/user/.local/bin/dcode")
+        with (
+            patch.object(sys, "argv", ["dcode", "--model", "openai:gpt-5.5"]),
+            patch("os.execv", side_effect=SystemExit(0)) as execv,
+            pytest.raises(SystemExit),
+        ):
+            _restart_current_process(restart_path=shim)
+
+        execv.assert_called_once_with(
+            str(shim), [str(shim), "--model", "openai:gpt-5.5"]
+        )
+
+    def test_restart_carries_launch_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The `-m` re-exec drops argv[0], so the launch name goes via the env."""
+        invoked_name.cache_clear()
+        # Empty is treated as absent, and registering the key with monkeypatch
+        # means the value the restart writes is cleaned up after the test.
+        monkeypatch.setenv(INVOKED_AS, "")
+        monkeypatch.setattr(sys, "executable", "/tool/bin/python")
+        monkeypatch.setattr(sys, "argv", ["/home/user/.local/bin/abc"])
+        with (
+            patch("os.execv", side_effect=SystemExit(0)),
+            pytest.raises(SystemExit),
+        ):
+            _restart_current_process()
+
+        assert os.environ[INVOKED_AS] == "abc"
 
     def test_failed_update_does_not_restart_and_continues(self) -> None:
         """A failed upgrade must not restart; it surfaces the error and returns."""
@@ -717,8 +937,15 @@ class TestStartupAutoUpdate:
         printed = " ".join(str(c.args[0]) for c in console.print.call_args_list)
         assert "restart loop" in printed
 
-    def test_restart_failure_after_successful_install_continues(self) -> None:
-        """A successful install with a failed re-exec reports an accurate message."""
+    def test_restart_failure_after_successful_install_exits(self) -> None:
+        """A successful install with a failed re-exec must exit, not launch.
+
+        The install already replaced the site-packages this process imports
+        from, so launching would mix pre-upgrade modules with post-upgrade ones
+        — the splash would report the old version and a renamed constant would
+        raise `ImportError`. Exiting `0` with a relaunch hint is the only safe
+        outcome, and must not be worded as an update failure.
+        """
         console = MagicMock()
         upgrade = AsyncMock(return_value=(True, "updated"))
 
@@ -742,20 +969,260 @@ class TestStartupAutoUpdate:
             ),
             patch("deepagents_code.update_check.perform_upgrade", upgrade),
             patch(
+                "deepagents_code.update_check.mark_startup_auto_update_failed"
+            ) as mark_failed,
+            patch(
                 "deepagents_code.main._restart_current_process",
                 side_effect=OSError("exec failed"),
             ) as restart,
+            pytest.raises(SystemExit) as exit_info,
         ):
-            # Install succeeded; a failed re-exec must not raise or claim the
-            # update failed.
             _run_startup_auto_update(console)
 
+        assert exit_info.value.code == 0
         restart.assert_called_once_with()
         # Sentinel is dropped since the restart did not happen.
         assert os.environ.get("DEEPAGENTS_CODE_RESTARTED_AFTER_UPDATE") is None
+        # Exiting means no sentinel reaches a next generation, so the
+        # `restarted_for` loop guard can never fire for this path. The cooldown
+        # is the only thing stopping a no-op-but-successful upgrade paired with
+        # a persistently failing `os.execv` from re-upgrading and re-exiting on
+        # every launch, which would make the TUI permanently unreachable.
+        mark_failed.assert_called_once_with("9.9.9")
         printed = " ".join(str(c.args[0]) for c in console.print.call_args_list)
-        assert "automatic restart failed" in printed
+        assert "automatic restart could not run" in printed
+        assert "Updated to v9.9.9" in printed
         assert "Auto-update failed" not in printed
+        # The relaunch hint is the entire point of the message; without a
+        # command name the user is told to "run again" with nothing to run.
+        assert "again to start on v9.9.9" in printed
+
+    def test_shadowed_windows_install_resolves_upgraded_executable(self) -> None:
+        """A shadowed Windows `.cmd` must re-exec uv's `dcode.exe` shim."""
+        from deepagents_code.update_check import ShadowedDcode
+
+        console = MagicMock()
+        upgrade = AsyncMock(return_value=(True, "updated"))
+        shadow = ShadowedDcode(
+            shadowing_bin=Path("C:/old/bin/dcode.cmd"),
+            upgraded_bin_dir=Path("C:/uv/bin"),
+            entry_point="dcode",
+        )
+
+        with (
+            patch("deepagents_code.config._is_editable_install", return_value=False),
+            patch(
+                "deepagents_code.update_check.is_auto_update_enabled",
+                return_value=True,
+            ),
+            patch(
+                "deepagents_code.update_check.get_cached_update_available",
+                return_value=(True, "9.9.9"),
+            ),
+            patch(
+                "deepagents_code.update_check.format_release_age_parenthetical",
+                return_value="",
+            ),
+            patch(
+                "deepagents_code.update_check.create_update_log_path",
+                return_value=Path("/tmp/dcode-update.log"),
+            ),
+            patch("deepagents_code.update_check.perform_upgrade", upgrade),
+            patch(
+                "deepagents_code.update_check.detect_shadowed_dcode",
+                return_value=shadow,
+            ),
+            patch(
+                "deepagents_code.update_check._upgraded_entry_point",
+                return_value=Path("C:/uv/bin/dcode.exe"),
+            ),
+            patch(
+                "deepagents_code.main._restart_current_process",
+                side_effect=SystemExit(0),
+            ) as restart,
+            pytest.raises(SystemExit),
+        ):
+            _run_startup_auto_update(console)
+
+        restart.assert_called_once_with(restart_path=Path("C:/uv/bin/dcode.exe"))
+
+    def test_error_after_successful_install_exits_instead_of_launching(self) -> None:
+        """A post-install exception must not launch a mixed-version process.
+
+        The fail-soft handler exists for upgrades that never happened. Once the
+        install has landed, "continuing with the installed version" is a lie —
+        the loaded modules are the old release — so the handler exits with the
+        relaunch hint instead.
+
+        Unlike the failed-re-exec path this exits *non-zero*: an unexpected
+        error was swallowed and will likely recur, and the traceback only
+        reaches the in-memory debug buffer that dies with this process. A `0`
+        here would leave the failure invisible to the user, the terminal, the
+        log and the exit status simultaneously.
+        """
+        console = MagicMock()
+        upgrade = AsyncMock(return_value=(True, "updated"))
+
+        with (
+            patch("deepagents_code.config._is_editable_install", return_value=False),
+            patch(
+                "deepagents_code.update_check.is_auto_update_enabled",
+                return_value=True,
+            ),
+            patch(
+                "deepagents_code.update_check.get_cached_update_available",
+                return_value=(True, "9.9.9"),
+            ),
+            patch(
+                "deepagents_code.update_check.format_release_age_parenthetical",
+                return_value="",
+            ),
+            patch(
+                "deepagents_code.update_check.create_update_log_path",
+                return_value=Path("/tmp/dcode-update.log"),
+            ),
+            patch("deepagents_code.update_check.perform_upgrade", upgrade),
+            patch(
+                "deepagents_code.update_check.clear_startup_auto_update_failure",
+                side_effect=RuntimeError("state dir exploded"),
+            ),
+            patch(
+                "deepagents_code.update_check.mark_startup_auto_update_failed"
+            ) as mark_failed,
+            patch("deepagents_code.main._restart_current_process") as restart,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            _run_startup_auto_update(console)
+
+        assert exit_info.value.code == 1
+        restart.assert_not_called()
+        mark_failed.assert_called_once_with("9.9.9")
+        printed = " ".join(str(c.args[0]) for c in console.print.call_args_list)
+        assert "Updated to v9.9.9" in printed
+        assert "continuing with the installed version" not in printed
+        assert "again to start on v9.9.9" in printed
+        # The traceback goes to the in-memory debug buffer, which only the TUI
+        # drains — and this process never starts one. The message must carry
+        # the error itself, or the failure leaves no trace at all.
+        assert "state dir exploded" in printed
+        # The restart was never attempted here, so claiming it "could not run"
+        # would send the user chasing an exec problem that did not happen.
+        assert "automatic restart could not run" not in printed
+
+    def test_error_after_shadow_warning_exits_without_contradicting_itself(
+        self,
+    ) -> None:
+        """A failure late in the success branch still exits with the hint.
+
+        The earlier post-install test injects at the first statement after the
+        install lands. This one fires deeper in, after the shadow warning has
+        started rendering, which is the realistic mid-branch failure — and the
+        window where a duplicated, contradictory pair of messages would show up.
+        """
+        from deepagents_code.update_check import ShadowedDcode
+
+        console = MagicMock()
+        upgrade = AsyncMock(return_value=(True, "updated"))
+        shadow = ShadowedDcode(
+            shadowing_bin=Path("/opt/old/bin/dcode"),
+            upgraded_bin_dir=Path("/home/user/.local/bin"),
+        )
+
+        with (
+            patch("deepagents_code.config._is_editable_install", return_value=False),
+            patch(
+                "deepagents_code.update_check.is_auto_update_enabled",
+                return_value=True,
+            ),
+            patch(
+                "deepagents_code.update_check.get_cached_update_available",
+                return_value=(True, "9.9.9"),
+            ),
+            patch(
+                "deepagents_code.update_check.format_release_age_parenthetical",
+                return_value="",
+            ),
+            patch(
+                "deepagents_code.update_check.create_update_log_path",
+                return_value=Path("/tmp/dcode-update.log"),
+            ),
+            patch("deepagents_code.update_check.perform_upgrade", upgrade),
+            patch(
+                "deepagents_code.update_check.detect_shadowed_dcode",
+                return_value=shadow,
+            ),
+            patch(
+                "deepagents_code.update_check.format_shadowed_dcode_warning",
+                side_effect=RuntimeError("warning render exploded"),
+            ),
+            # Must be patched: `UPDATE_STATE_FILE` is bound at import from the
+            # real state dir, so the autouse `_isolate_state_dir` fixture (which
+            # only redirects `model_config.DEFAULT_STATE_DIR`) does not cover it
+            # and the unpatched call writes a cooldown to the developer's own
+            # `~/.deepagents/.state/update_state.json`, then leaks into every
+            # later test in the session.
+            patch("deepagents_code.update_check.mark_startup_auto_update_failed"),
+            patch("deepagents_code.main._restart_current_process") as restart,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            _run_startup_auto_update(console)
+
+        assert exit_info.value.code == 1
+        restart.assert_not_called()
+        printed = " ".join(str(c.args[0]) for c in console.print.call_args_list)
+        assert "Updated to v9.9.9" in printed
+        assert "warning render exploded" in printed
+        # `Launching...` prints *after* the shadow warning, so a failure here
+        # must not have already promised a launch that never happens.
+        assert "Launching..." not in printed
+        assert "continuing with the installed version" not in printed
+
+    def test_cooldown_failure_after_install_still_exits_with_hint(self) -> None:
+        """A failing cooldown write must not replace the hint with a traceback.
+
+        The exits after a successful install record a cooldown to break the
+        retry loop, but the reason they are exiting is often an unwritable state
+        directory — the same thing `mark_startup_auto_update_failed` trips over.
+        Since it runs inside the handler, an unguarded raise would escape
+        uncaught and crash startup after an otherwise-successful upgrade.
+        """
+        console = MagicMock()
+        upgrade = AsyncMock(return_value=(True, "updated"))
+
+        with (
+            patch("deepagents_code.config._is_editable_install", return_value=False),
+            patch(
+                "deepagents_code.update_check.is_auto_update_enabled",
+                return_value=True,
+            ),
+            patch(
+                "deepagents_code.update_check.get_cached_update_available",
+                return_value=(True, "9.9.9"),
+            ),
+            patch(
+                "deepagents_code.update_check.format_release_age_parenthetical",
+                return_value="",
+            ),
+            patch(
+                "deepagents_code.update_check.create_update_log_path",
+                return_value=Path("/tmp/dcode-update.log"),
+            ),
+            patch("deepagents_code.update_check.perform_upgrade", upgrade),
+            patch(
+                "deepagents_code.update_check.mark_startup_auto_update_failed",
+                side_effect=OSError("read-only state dir"),
+            ),
+            patch(
+                "deepagents_code.main._restart_current_process",
+                side_effect=OSError("exec failed"),
+            ),
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            _run_startup_auto_update(console)
+
+        assert exit_info.value.code == 0
+        printed = " ".join(str(c.args[0]) for c in console.print.call_args_list)
+        assert "again to start on v9.9.9" in printed
 
     def test_restart_after_update_clears_transient_launch_status(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1063,7 +1530,7 @@ class TestStartupAutoUpdate:
 
     def test_project_mcp_prompt_interrupt_aborts_before_tui(self) -> None:
         """Ctrl+C at the project MCP prompt exits before launching Textual."""
-        from deepagents_code.main import _ProjectMcpTrustPromptOutcome
+        from deepagents_code.main import _TrustPromptOutcome
 
         launch = AsyncMock(return_value=AppResult(return_code=0, thread_id="thread"))
         with (
@@ -1076,7 +1543,7 @@ class TestStartupAutoUpdate:
             ),
             patch(
                 "deepagents_code.main._check_mcp_project_trust",
-                return_value=_ProjectMcpTrustPromptOutcome.INTERRUPTED,
+                return_value=_TrustPromptOutcome.INTERRUPTED,
             ),
             patch("deepagents_code.main.run_textual_cli_async", launch),
             pytest.raises(SystemExit) as exc_info,
@@ -1124,7 +1591,7 @@ class TestStartupAutoUpdate:
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Esc in the server selector cancels launch before Textual starts."""
-        from deepagents_code.main import _ProjectMcpTrustPromptOutcome
+        from deepagents_code.main import _TrustPromptOutcome
 
         launch = AsyncMock(return_value=AppResult(return_code=0, thread_id="thread"))
         with (
@@ -1137,7 +1604,7 @@ class TestStartupAutoUpdate:
             ),
             patch(
                 "deepagents_code.main._check_mcp_project_trust",
-                return_value=_ProjectMcpTrustPromptOutcome.CANCELLED,
+                return_value=_TrustPromptOutcome.CANCELLED,
             ),
             patch("deepagents_code.main.run_textual_cli_async", launch),
         ):
@@ -1488,16 +1955,20 @@ class TestRenderTeardownThreadHints:
         thread_exists_mock: AsyncMock,
         thread_url: str | None,
         return_code: int = 0,
+        launch_name: str = "dcode",
     ) -> str:
         """Render the hints with patched dependencies, returning the output."""
         buffer = StringIO()
         console = Console(file=buffer, width=200)
+        # `launch_name` is resolved (and cached) inside the renderer.
+        invoked_name.cache_clear()
         with (
             patch("deepagents_code.sessions.thread_exists", thread_exists_mock),
             patch(
                 "deepagents_code.config.build_langsmith_thread_url",
                 return_value=thread_url,
             ),
+            patch.dict(os.environ, {INVOKED_AS: launch_name}),
         ):
             _render_teardown_thread_hints(console, "test123", return_code=return_code)
         return buffer.getvalue()
@@ -1516,6 +1987,19 @@ class TestRenderTeardownThreadHints:
         thread_exists_mock.assert_awaited_once()
         assert "Resume this thread with:" in output
         assert "dcode -r test123" in output
+
+    def test_resume_hint_echoes_launch_command(self) -> None:
+        """The hint names the shim the user launched, not a hardcoded `dcode`."""
+        thread_exists_mock = AsyncMock(return_value=True)
+
+        output = self._render(
+            thread_exists_mock=thread_exists_mock,
+            thread_url=None,
+            launch_name="abc",
+        )
+
+        assert "abc -r test123" in output
+        assert "dcode" not in output
 
     def test_prints_langsmith_link_when_available(self) -> None:
         """A configured LangSmith URL is shown alongside the resume hint."""
@@ -1719,6 +2203,98 @@ class TestRunTextualCliAsyncMcp:
             )
 
         assert captured_kwargs["mcp_preload_kwargs"] is None
+
+    async def test_resolves_configured_auto_classifier_before_tui_launch(self) -> None:
+        """The TUI and server receive the same effective env/TOML classifier."""
+        app_result = AppResult(return_code=0, thread_id="thread-123")
+        captured_kwargs: dict[str, Any] = {}
+        classifier = "anthropic:claude-haiku-4-5"
+
+        async def _run_textual_app_stub(**kwargs: Any) -> AppResult:
+            captured_kwargs.update(kwargs)
+            await asyncio.sleep(0)
+            return app_result
+
+        with (
+            patch("deepagents_code.app.run_textual_app", new=_run_textual_app_stub),
+            patch(
+                "deepagents_code.config.resolve_auto_classifier_model_with_problem",
+                return_value=(classifier, None),
+            ) as resolve_classifier,
+        ):
+            await run_textual_cli_async(
+                "agent",
+                model_name="openai:gpt-5.5",
+            )
+
+        resolve_classifier.assert_called_once_with()
+        assert captured_kwargs["server_kwargs"]["auto_classifier_model"] == classifier
+
+    async def test_explicit_auto_classifier_precedes_config(self) -> None:
+        """The CLI classifier remains authoritative over env/TOML config."""
+        app_result = AppResult(return_code=0, thread_id="thread-123")
+        captured_kwargs: dict[str, Any] = {}
+        classifier = "openai:gpt-5.5-mini"
+
+        async def _run_textual_app_stub(**kwargs: Any) -> AppResult:
+            captured_kwargs.update(kwargs)
+            await asyncio.sleep(0)
+            return app_result
+
+        with (
+            patch("deepagents_code.app.run_textual_app", new=_run_textual_app_stub),
+            patch(
+                "deepagents_code.config.resolve_auto_classifier_model_with_problem"
+            ) as resolve_classifier,
+        ):
+            await run_textual_cli_async(
+                "agent",
+                model_name="openai:gpt-5.5",
+                auto_classifier_model=classifier,
+            )
+
+        resolve_classifier.assert_not_called()
+        assert captured_kwargs["server_kwargs"]["auto_classifier_model"] == classifier
+
+    async def test_blank_auto_classifier_flag_overrides_configured_classifier(
+        self,
+    ) -> None:
+        """`--auto-classifier-model ""` inherits the main model, not env/TOML.
+
+        An explicit blank flag means "review with the main agent model", so it
+        must override a classifier configured via env var or `config.toml` —
+        collapsing the blank to `None` would defer to those sources and leave
+        the weaker configured classifier authorizing actions. The TUI receives
+        the `INHERIT_CLASSIFIER_MODEL` sentinel so the server resolves inherit
+        instead of re-reading env/TOML.
+        """
+        from deepagents_code._cli_context import INHERIT_CLASSIFIER_MODEL
+
+        app_result = AppResult(return_code=0, thread_id="thread-123")
+        captured_kwargs: dict[str, Any] = {}
+
+        async def _run_textual_app_stub(**kwargs: Any) -> AppResult:
+            captured_kwargs.update(kwargs)
+            await asyncio.sleep(0)
+            return app_result
+
+        with (
+            patch("deepagents_code.app.run_textual_app", new=_run_textual_app_stub),
+            patch(
+                "deepagents_code.config.resolve_auto_classifier_model_with_problem"
+            ) as resolve_classifier,
+        ):
+            await run_textual_cli_async(
+                "agent",
+                model_name="openai:gpt-5.5",
+                auto_classifier_model="",
+            )
+
+        resolve_classifier.assert_not_called()
+        assert (
+            captured_kwargs["server_kwargs"]["auto_classifier_model"]
+            == INHERIT_CLASSIFIER_MODEL
+        )
 
     async def test_onboarding_trigger_reaches_textual_app(self) -> None:
         """First-run onboarding state should control the app launch flag."""
@@ -2724,7 +3300,7 @@ class TestCheckMcpProjectTrustPrompt:
         from deepagents_code._env_vars import DEBUG_MCP_PROJECT_TRUST
         from deepagents_code.main import (
             _check_mcp_project_trust,
-            _ProjectMcpTrustPromptOutcome,
+            _TrustPromptOutcome,
         )
 
         project_context = SimpleNamespace(project_root=tmp_path, user_cwd=tmp_path)
@@ -2746,13 +3322,13 @@ class TestCheckMcpProjectTrustPrompt:
                 return_value=([], []),
             ),
             patch(
-                "deepagents_code.main._select_project_mcp_trust_action",
-                return_value=_ProjectMcpTrustPromptOutcome.CANCELLED,
+                "deepagents_code.main._select_trust_action",
+                return_value=_TrustPromptOutcome.CANCELLED,
             ),
         ):
             decision = _check_mcp_project_trust(trust_flag=False)
 
-        assert decision is _ProjectMcpTrustPromptOutcome.CANCELLED
+        assert decision is _TrustPromptOutcome.CANCELLED
         assert "denied" not in capsys.readouterr().err.lower()
         assert not user_config.exists()
 
@@ -2770,7 +3346,7 @@ class TestCheckMcpProjectTrustPrompt:
         from deepagents_code._env_vars import DEBUG_MCP_PROJECT_TRUST
         from deepagents_code.main import (
             _check_mcp_project_trust,
-            _ProjectMcpTrustAction,
+            _TrustAction,
         )
 
         project_context = SimpleNamespace(project_root=tmp_path, user_cwd=tmp_path)
@@ -2790,8 +3366,8 @@ class TestCheckMcpProjectTrustPrompt:
                 return_value=([], []),
             ),
             patch(
-                "deepagents_code.main._select_project_mcp_trust_action",
-                return_value=_ProjectMcpTrustAction.DENY,
+                "deepagents_code.main._select_trust_action",
+                return_value=_TrustAction.DENY,
             ),
         ):
             decision = _check_mcp_project_trust(trust_flag=False)
@@ -3263,7 +3839,7 @@ class TestCheckMcpProjectTrustPrompt:
         from deepagents_code import model_config
         from deepagents_code.main import (
             _check_mcp_project_trust,
-            _ProjectMcpTrustPromptOutcome,
+            _TrustPromptOutcome,
         )
 
         project_root = tmp_path / "proj"
@@ -3309,12 +3885,12 @@ class TestCheckMcpProjectTrustPrompt:
             patch("builtins.input", return_value="a"),
             patch(
                 "deepagents_code.main._run_project_mcp_server_checkbox_picker",
-                return_value=_ProjectMcpTrustPromptOutcome.CANCELLED,
+                return_value=_TrustPromptOutcome.CANCELLED,
             ),
         ):
             decision = _check_mcp_project_trust(trust_flag=False)
 
-        assert decision is _ProjectMcpTrustPromptOutcome.CANCELLED
+        assert decision is _TrustPromptOutcome.CANCELLED
         assert not user_config.exists()
         assert "denied" not in capsys.readouterr().err.lower()
 
@@ -3651,7 +4227,7 @@ class TestCheckMcpProjectTrustPrompt:
         """Ctrl+C at the approval prompt cancels launch instead of denying MCP."""
         from deepagents_code.main import (
             _check_mcp_project_trust,
-            _ProjectMcpTrustPromptOutcome,
+            _TrustPromptOutcome,
         )
 
         project_root = tmp_path / "proj"
@@ -3687,7 +4263,7 @@ class TestCheckMcpProjectTrustPrompt:
         ):
             decision = _check_mcp_project_trust(trust_flag=False)
 
-        assert decision is _ProjectMcpTrustPromptOutcome.INTERRUPTED
+        assert decision is _TrustPromptOutcome.INTERRUPTED
 
     def test_eof_at_prompt_denies(self, tmp_path: Path) -> None:
         """EOF (closed stdin) at the approval prompt fails safe to deny.
@@ -3920,7 +4496,7 @@ class TestSelectProjectServersToPersist:
         from prompt_toolkit.output import DummyOutput
 
         monkeypatch.setattr(
-            "deepagents_code.main._project_mcp_picker_has_terminal",
+            "deepagents_code.main._trust_picker_has_terminal",
             lambda: True,
         )
         monkeypatch.setattr(
@@ -3999,8 +4575,8 @@ class TestSelectProjectServersToPersist:
         from rich.console import Console
 
         from deepagents_code.main import (
-            _ProjectMcpTrustAction,
-            _run_project_mcp_trust_action_picker,
+            _run_trust_action_picker,
+            _TrustAction,
         )
 
         captured: dict[str, Any] = {}
@@ -4012,9 +4588,9 @@ class TestSelectProjectServersToPersist:
             def __init__(self, **kwargs: Any) -> None:
                 captured.update(kwargs)
 
-            def run(self) -> _ProjectMcpTrustAction:
+            def run(self) -> _TrustAction:
                 bindings = captured["key_bindings"].bindings
-                holder: dict[str, _ProjectMcpTrustAction] = {}
+                holder: dict[str, _TrustAction] = {}
                 event = SimpleNamespace(
                     app=SimpleNamespace(
                         exit=lambda *, result: holder.update(value=result)
@@ -4029,9 +4605,9 @@ class TestSelectProjectServersToPersist:
                 return holder["value"]
 
         monkeypatch.setattr("prompt_toolkit.Application", _FakeApplication)
-        result = _run_project_mcp_trust_action_picker(Console(stderr=True))
+        result = _run_trust_action_picker(Console(stderr=True))
 
-        assert result is _ProjectMcpTrustAction.DENY
+        assert result is _TrustAction.DENY
         assert captured["full_screen"] is False
         rendered = "".join(
             text for _style, text in captured["layout"].container.content.text()
@@ -4050,8 +4626,8 @@ class TestSelectProjectServersToPersist:
         from rich.console import Console
 
         from deepagents_code.main import (
-            _ProjectMcpTrustAction,
-            _run_project_mcp_trust_action_picker,
+            _run_trust_action_picker,
+            _TrustAction,
         )
 
         captured: dict[str, Any] = {}
@@ -4063,11 +4639,11 @@ class TestSelectProjectServersToPersist:
             def __init__(self, **kwargs: Any) -> None:
                 captured.update(kwargs)
 
-            def run(self) -> _ProjectMcpTrustAction:
-                return _ProjectMcpTrustAction.DENY
+            def run(self) -> _TrustAction:
+                return _TrustAction.DENY
 
         monkeypatch.setattr("prompt_toolkit.Application", _FakeApplication)
-        _run_project_mcp_trust_action_picker(Console(stderr=True))
+        _run_trust_action_picker(Console(stderr=True))
 
         _assert_all_controls_hide_cursor(captured["layout"])
 
@@ -4082,8 +4658,8 @@ class TestSelectProjectServersToPersist:
         from rich.console import Console
 
         from deepagents_code.main import (
-            _ProjectMcpTrustPromptOutcome,
-            _run_project_mcp_trust_action_picker,
+            _run_trust_action_picker,
+            _TrustPromptOutcome,
         )
 
         captured: dict[str, Any] = {}
@@ -4095,9 +4671,9 @@ class TestSelectProjectServersToPersist:
             def __init__(self, **kwargs: Any) -> None:
                 captured.update(kwargs)
 
-            def run(self) -> _ProjectMcpTrustPromptOutcome:
+            def run(self) -> _TrustPromptOutcome:
                 bindings = captured["key_bindings"].bindings
-                holder: dict[str, _ProjectMcpTrustPromptOutcome] = {}
+                holder: dict[str, _TrustPromptOutcome] = {}
                 event = SimpleNamespace(
                     app=SimpleNamespace(
                         exit=lambda *, result: holder.update(value=result)
@@ -4115,9 +4691,9 @@ class TestSelectProjectServersToPersist:
                 return holder["value"]
 
         monkeypatch.setattr("prompt_toolkit.Application", _FakeApplication)
-        result = _run_project_mcp_trust_action_picker(Console(stderr=True))
+        result = _run_trust_action_picker(Console(stderr=True))
 
-        assert result is _ProjectMcpTrustPromptOutcome.CANCELLED
+        assert result is _TrustPromptOutcome.CANCELLED
         rendered = "".join(
             text for _style, text in captured["layout"].container.content.text()
         )
@@ -4132,18 +4708,18 @@ class TestSelectProjectServersToPersist:
         from rich.console import Console
 
         from deepagents_code.main import (
-            _ProjectMcpTrustPromptOutcome,
-            _select_project_mcp_trust_action,
+            _select_trust_action,
+            _TrustPromptOutcome,
         )
 
         monkeypatch.setattr(
-            "deepagents_code.main._run_project_mcp_trust_action_picker",
-            lambda _console: _ProjectMcpTrustPromptOutcome.CANCELLED,
+            "deepagents_code.main._run_trust_action_picker",
+            lambda _console, **_kwargs: _TrustPromptOutcome.CANCELLED,
         )
 
-        result = _select_project_mcp_trust_action(Console(stderr=True))
+        result = _select_trust_action(Console(stderr=True))
 
-        assert result is _ProjectMcpTrustPromptOutcome.CANCELLED
+        assert result is _TrustPromptOutcome.CANCELLED
 
     def test_action_picker_falls_back_when_stderr_is_redirected(
         self, monkeypatch: pytest.MonkeyPatch
@@ -4151,7 +4727,7 @@ class TestSelectProjectServersToPersist:
         """A hidden selector is not launched when stderr is not a terminal."""
         from rich.console import Console
 
-        from deepagents_code.main import _run_project_mcp_trust_action_picker
+        from deepagents_code.main import _run_trust_action_picker
 
         monkeypatch.setattr(
             "deepagents_code.main.sys.stdin", SimpleNamespace(isatty=lambda: True)
@@ -4160,7 +4736,7 @@ class TestSelectProjectServersToPersist:
             "deepagents_code.main.sys.stderr", SimpleNamespace(isatty=lambda: False)
         )
 
-        result = _run_project_mcp_trust_action_picker(Console(stderr=True))
+        result = _run_trust_action_picker(Console(stderr=True))
 
         assert result is None
 
@@ -4473,8 +5049,8 @@ class TestSelectProjectServersToPersist:
         from rich.console import Console
 
         from deepagents_code.main import (
-            _ProjectMcpTrustPromptOutcome,
             _run_project_mcp_server_checkbox_picker,
+            _TrustPromptOutcome,
         )
 
         captured: dict[str, Any] = {}
@@ -4512,7 +5088,7 @@ class TestSelectProjectServersToPersist:
         ]
         result = _run_project_mcp_server_checkbox_picker(servers, Console(stderr=True))
 
-        assert result is _ProjectMcpTrustPromptOutcome.CANCELLED
+        assert result is _TrustPromptOutcome.CANCELLED
         help_control = captured["layout"].container.children[0].content
         rendered = "".join(text for _style, text in help_control.text())
         assert "Esc abort" in rendered
@@ -4527,8 +5103,8 @@ class TestSelectProjectServersToPersist:
         from rich.console import Console
 
         from deepagents_code.main import (
-            _ProjectMcpTrustPromptOutcome,
             _run_project_mcp_server_checkbox_picker,
+            _TrustPromptOutcome,
         )
 
         captured: dict[str, Any] = {}
@@ -4540,9 +5116,9 @@ class TestSelectProjectServersToPersist:
             def __init__(self, **kwargs: Any) -> None:
                 captured.update(kwargs)
 
-            def run(self) -> _ProjectMcpTrustPromptOutcome:
+            def run(self) -> _TrustPromptOutcome:
                 bindings = captured["key_bindings"].bindings
-                holder: dict[str, _ProjectMcpTrustPromptOutcome] = {}
+                holder: dict[str, _TrustPromptOutcome] = {}
                 event = SimpleNamespace(
                     app=SimpleNamespace(
                         exit=lambda *, result: holder.update(value=result)
@@ -4564,7 +5140,7 @@ class TestSelectProjectServersToPersist:
         ]
         result = _run_project_mcp_server_checkbox_picker(servers, Console(stderr=True))
 
-        assert result is _ProjectMcpTrustPromptOutcome.INTERRUPTED
+        assert result is _TrustPromptOutcome.INTERRUPTED
 
     @pytest.mark.usefixtures("_interactive_picker_terminal")
     def test_checkbox_picker_eof_cancels(
@@ -4575,8 +5151,8 @@ class TestSelectProjectServersToPersist:
         from rich.console import Console
 
         from deepagents_code.main import (
-            _ProjectMcpTrustPromptOutcome,
             _run_project_mcp_server_checkbox_picker,
+            _TrustPromptOutcome,
         )
 
         class _FakeApplication:
@@ -4597,7 +5173,7 @@ class TestSelectProjectServersToPersist:
         ]
         result = _run_project_mcp_server_checkbox_picker(servers, Console(stderr=True))
 
-        assert result is _ProjectMcpTrustPromptOutcome.CANCELLED
+        assert result is _TrustPromptOutcome.CANCELLED
 
     @pytest.mark.usefixtures("_interactive_picker_terminal")
     def test_checkbox_picker_falls_back_when_app_run_fails(
@@ -4640,7 +5216,7 @@ class TestSelectProjectServersToPersist:
         """A runtime failure launching the action picker falls back to text input."""
         from rich.console import Console
 
-        from deepagents_code.main import _run_project_mcp_trust_action_picker
+        from deepagents_code.main import _run_trust_action_picker
 
         class _FakeApplication:
             def __class_getitem__(cls, _item: object) -> type["_FakeApplication"]:
@@ -4654,7 +5230,7 @@ class TestSelectProjectServersToPersist:
 
         monkeypatch.setattr("prompt_toolkit.Application", _FakeApplication)
 
-        result = _run_project_mcp_trust_action_picker(Console(stderr=True))
+        result = _run_trust_action_picker(Console(stderr=True))
 
         assert result is None
 
@@ -4741,8 +5317,8 @@ class TestSelectProjectServersToPersist:
         from rich.console import Console
 
         from deepagents_code.main import (
-            _ProjectMcpTrustPromptOutcome,
             _select_project_servers_to_persist,
+            _TrustPromptOutcome,
         )
 
         servers = [
@@ -4758,15 +5334,15 @@ class TestSelectProjectServersToPersist:
         ):
             names = _select_project_servers_to_persist(servers, Console(stderr=True))
 
-        assert names is _ProjectMcpTrustPromptOutcome.INTERRUPTED
+        assert names is _TrustPromptOutcome.INTERRUPTED
 
     def test_fallback_blank_cancels(self) -> None:
         """Blank fallback input cancels (deny) rather than confirming nothing."""
         from rich.console import Console
 
         from deepagents_code.main import (
-            _ProjectMcpTrustPromptOutcome,
             _select_project_servers_to_persist,
+            _TrustPromptOutcome,
         )
 
         servers = [
@@ -4782,15 +5358,15 @@ class TestSelectProjectServersToPersist:
         ):
             names = _select_project_servers_to_persist(servers, Console(stderr=True))
 
-        assert names is _ProjectMcpTrustPromptOutcome.CANCELLED
+        assert names is _TrustPromptOutcome.CANCELLED
 
     def test_fallback_eof_cancels(self) -> None:
         """EOF (Ctrl+D) at the fallback prompt cancels, not an empty confirm."""
         from rich.console import Console
 
         from deepagents_code.main import (
-            _ProjectMcpTrustPromptOutcome,
             _select_project_servers_to_persist,
+            _TrustPromptOutcome,
         )
 
         servers = [
@@ -4806,7 +5382,7 @@ class TestSelectProjectServersToPersist:
         ):
             names = _select_project_servers_to_persist(servers, Console(stderr=True))
 
-        assert names is _ProjectMcpTrustPromptOutcome.CANCELLED
+        assert names is _TrustPromptOutcome.CANCELLED
 
 
 class TestSelectProjectMcpTrustAction:
@@ -4837,20 +5413,20 @@ class TestSelectProjectMcpTrustAction:
         from rich.console import Console
 
         from deepagents_code.main import (
-            _ProjectMcpTrustAction,
-            _select_project_mcp_trust_action,
+            _select_trust_action,
+            _TrustAction,
         )
 
         # Force the inline picker to defer to the text prompt.
         monkeypatch.setattr(
-            "deepagents_code.main._run_project_mcp_trust_action_picker",
+            "deepagents_code.main._run_trust_action_picker",
             lambda *_args, **_kwargs: None,
         )
         monkeypatch.setattr("builtins.input", lambda _prompt="": token)
 
-        result = _select_project_mcp_trust_action(Console(stderr=True))
+        result = _select_trust_action(Console(stderr=True))
 
-        assert result is _ProjectMcpTrustAction[expected_name]
+        assert result is _TrustAction[expected_name]
 
 
 class TestCheckMcpProjectTrustDedupe:

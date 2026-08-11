@@ -77,23 +77,7 @@ Reading sequentially when parallel is possible:
 read_file("/path/a.py") → wait → read_file("/path/b.py") → wait
 </bad-example>
 
-### shell
-
-Execute shell commands. Always quote paths with spaces using syntax supported by the configured shell. Commands run from your current working directory. For verbose commands, use quiet flags or capture output to a file and inspect it with the specialized file tools.
-
-<good-example>
-python -m pytest tests
-</good-example>
-
-<bad-example>
-cd another-directory && python -m pytest tests
-</bad-example>
-
 When a single tool call in a parallel fanout fails with a schema error like `Unknown JSON field`, do NOT submit additional parallel calls with the same invalid field — drop the offending field and retry as a single corrected call before fanning out again.
-
-### web_search
-
-Search for documentation, error solutions, and code examples.
 
 ## File Reading Best Practices
 

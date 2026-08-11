@@ -19,9 +19,11 @@ _TIP_SHIFT_TAB_WITHOUT_YOLO = "Press Shift+Tab to toggle Manual and Auto modes"
 _TIPS: dict[str, int] = {
     "Use @ to reference files and / for commands": 3,
     "Try /threads to resume a previous conversation": 2,
-    "Use /offload when your conversation gets long": 2,
+    "Use /offload to summarize older messages and free up the context window": 2,
     "Use /copy to copy the latest message": 3,
+    "Use /cost to see a breakdown of estimated spend": 1,
     "Use /tools to list the tools available to the agent": 1,
+    "Use dcode install <name> for optional providers": 1,
     "Use /mcp login <server> to authenticate MCP servers": 1,
     "Use /remember to save learnings from this conversation": 1,
     "Use /model to switch models mid-conversation": 2,
@@ -32,7 +34,9 @@ _TIPS: dict[str, int] = {
     "Use /skill-creator to build reusable agent skills": 1,
     "Ask for a workflow to fan work out to subagents in parallel": 3,
     "Use /timestamps to show or hide message timestamp footers": 1,
+    "Click a collapsed message or press Ctrl+O to expand it": 1,
     "Use /agents to browse and switch between your available agents": 2,
+    "Use /auto model to review Auto actions with a faster, cheaper model": 1,
     _TIP_SHIFT_TAB_WITH_YOLO: 2,
     "Use !! for incognito shell commands that stay out of model context": 1,
     "Deep Agents can explain its own features and look up its docs. Ask it how to use.": 3,  # noqa: E501
