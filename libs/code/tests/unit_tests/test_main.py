@@ -5,7 +5,6 @@ import inspect
 import os
 import shutil
 import signal
-import subprocess
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -21,9 +20,20 @@ from rich.console import Console
 if TYPE_CHECKING:
     from prompt_toolkit.layout import Layout
 
-from deepagents_code._env_vars import INVOKED_AS
+from deepagents_code._env_vars import (
+    DEBUG,
+    EXPERIMENTAL,
+    INVOKED_AS,
+    LAUNCH_TERM_PROGRAM,
+    RESUME_TERM_PROGRAM,
+)
 from deepagents_code._invocation import invoked_name
-from deepagents_code.app import AppResult, DeepAgentsApp, run_textual_app
+from deepagents_code.app import (
+    AppResult,
+    DeepAgentsApp,
+    TextualAppError,
+    run_textual_app,
+)
 from deepagents_code.config import build_langsmith_thread_url, reset_langsmith_url_cache
 from deepagents_code.main import (
     _auto_install_ripgrep_cli,
@@ -35,7 +45,6 @@ from deepagents_code.main import (
     _ripgrep_install_hint,
     _run_startup_auto_update,
     _should_check_teardown_thread,
-    _tail_log_command,
     _terminal_row_count,
     build_missing_tool_notification,
     check_optional_tools,
@@ -44,7 +53,7 @@ from deepagents_code.main import (
     run_textual_cli_async,
 )
 from deepagents_code.mcp_tools import ProjectServerSummary
-from deepagents_code.update_check import update_install_lock
+from deepagents_code.update_check import format_log_follow_command, update_install_lock
 
 # Most unit tests set `DEEPAGENTS_CODE_NO_UPDATE_CHECK=1` and patch
 # `is_update_check_enabled()` to avoid accidental PyPI/DNS work. This module
@@ -109,80 +118,10 @@ class TestTerminationSignalHandling:
         install.assert_not_called()
 
 
-class TestTailLogCommand:
-    """Tests for platform-specific log-follow commands."""
-
-    def test_posix_uses_shell_quoting(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """POSIX log paths are safely quoted for `tail`."""
-        monkeypatch.setattr("deepagents_code.main.sys.platform", "linux")
-
-        command = _tail_log_command("/tmp/it's [ready].log")
-
-        assert command == """tail -f '/tmp/it'"'"'s [ready].log'"""
-
-    def test_windows_uses_powershell_quoting(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Windows log paths are safely quoted for PowerShell."""
-        monkeypatch.setattr("deepagents_code.main.sys.platform", "win32")
-
-        command = _tail_log_command(r"C:\logs\O'Brien [ready].log")
-
-        assert command == (
-            'powershell -NoProfile -Command "'
-            "Get-Content -Wait -LiteralPath 'C:\\logs\\O''Brien [ready].log'"
-            '"'
-        )
-
-    @pytest.mark.skipif(sys.platform != "win32", reason="requires Windows shells")
-    def test_windows_command_executes_from_powershell_and_cmd(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """The emitted nested quoting survives both supported Windows shells."""
-        log_path = tmp_path / "logs with spaces" / "O'Brien [ready].log"
-        log_path.parent.mkdir()
-        log_path.write_text("tail-marker\n", encoding="utf-8")
-        monkeypatch.setattr("deepagents_code.main.sys.platform", "win32")
-        command = _tail_log_command(log_path)
-        assert command.endswith('"')
-        one_line_command = f'{command[:-1]} | Select-Object -First 1"'
-
-        shells: list[tuple[str, list[str] | str, bool]] = []
-        for name in ("powershell.exe", "pwsh.exe"):
-            executable = shutil.which(name)
-            if executable is not None:
-                shells.append(
-                    (
-                        Path(executable).stem,
-                        [executable, "-NoProfile", "-Command", one_line_command],
-                        False,
-                    )
-                )
-        command_prompt = shutil.which("cmd.exe")
-        if command_prompt is not None:
-            shells.append(("cmd", one_line_command, True))
-        assert shells
-
-        for shell, arguments, use_shell in shells:
-            result = subprocess.run(
-                arguments,
-                check=False,
-                capture_output=True,
-                executable=command_prompt if use_shell else None,
-                shell=use_shell,
-                text=True,
-                timeout=15,
-            )
-            assert result.returncode == 0, f"{shell}: {result.stderr}"
-            assert result.stdout.strip() == "tail-marker", shell
-
-
 class TestStartupAutoUpdate:
     """Tests for startup auto-update behavior."""
 
-    @pytest.fixture(autouse=True, scope="class")
+    @pytest.fixture(autouse=True)
     def _hermetic_startup_auto_update_defaults(self) -> Iterator[None]:
         """Default startup update tests to no failure marker and no live lookups."""
         with _startup_auto_update_hermetic_defaults():
@@ -244,7 +183,7 @@ class TestStartupAutoUpdate:
     def test_successful_update_restarts_before_launch(self) -> None:
         """A successful startup auto-update should exec a fresh process."""
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(True, "updated"))
+        upgrade = AsyncMock(return_value=(True, "updated", "9.9.9"))
 
         with (
             patch("deepagents_code.config._is_editable_install", return_value=False),
@@ -265,9 +204,9 @@ class TestStartupAutoUpdate:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
-            ),
+            ) as create_log_file,
             patch("deepagents_code.update_check.perform_upgrade", upgrade),
             patch(
                 "deepagents_code.update_check.clear_startup_auto_update_failure"
@@ -286,9 +225,10 @@ class TestStartupAutoUpdate:
         # `pytest.raises(SystemExit)` would swallow that and pass.
         assert exit_info.value.code == 0
         upgrade.assert_awaited_once()
+        create_log_file.assert_called_once_with()
         clear_failure.assert_called_once_with("9.9.9")
         printed = " ".join(str(c.args[0]) for c in console.print.call_args_list)
-        assert _tail_log_command(Path("/tmp/dcode-update.log")) in printed
+        assert format_log_follow_command(Path("/tmp/dcode-update.log")) in printed
         restart.assert_called_once_with()
 
     def test_successful_update_restarts_through_upgraded_shim_when_shadowed(
@@ -306,7 +246,7 @@ class TestStartupAutoUpdate:
         from deepagents_code.update_check import ShadowedDcode
 
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(True, "updated"))
+        upgrade = AsyncMock(return_value=(True, "updated", "9.9.9"))
         # Embed `[` in the shadowing path — legal on POSIX filesystems —
         # so a regression that dropped `escape()` would raise a Rich
         # `MarkupError` here instead of silently emitting broken styling.
@@ -334,7 +274,7 @@ class TestStartupAutoUpdate:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
             ),
             patch("deepagents_code.update_check.perform_upgrade", upgrade),
@@ -391,7 +331,7 @@ class TestStartupAutoUpdate:
         winning session's upgrade would suppress this one's next few attempts.
         """
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(True, "updated"))
+        upgrade = AsyncMock(return_value=(True, "updated", "9.9.9"))
 
         with (
             patch("deepagents_code.config._is_editable_install", return_value=False),
@@ -440,10 +380,12 @@ class TestStartupAutoUpdate:
         held_during_install: list[bool] = []
 
         # Async to match the `perform_upgrade` it replaces, which is awaited.
-        async def _record_lock_state(**_kwargs: object) -> tuple[bool, str]:  # noqa: RUF029
+        async def _record_lock_state(  # noqa: RUF029
+            **_kwargs: object,
+        ) -> tuple[bool, str, str | None]:
             with update_install_lock() as holding:
                 held_during_install.append(holding)
-            return True, "updated"
+            return True, "updated", "9.9.9"
 
         with (
             patch("deepagents_code.config._is_editable_install", return_value=False),
@@ -464,7 +406,7 @@ class TestStartupAutoUpdate:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
             ),
             patch("deepagents_code.update_check.perform_upgrade", _record_lock_state),
@@ -490,7 +432,7 @@ class TestStartupAutoUpdate:
         where the restart raises and this process keeps running.
         """
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(True, "updated"))
+        upgrade = AsyncMock(return_value=(True, "updated", "9.9.9"))
         held_during_restart: list[bool] = []
 
         def _record_lock_state() -> None:
@@ -517,7 +459,7 @@ class TestStartupAutoUpdate:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
             ),
             patch("deepagents_code.update_check.perform_upgrade", upgrade),
@@ -621,7 +563,7 @@ class TestStartupAutoUpdate:
     def test_failed_update_does_not_restart_and_continues(self) -> None:
         """A failed upgrade must not restart; it surfaces the error and returns."""
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(False, "pip exploded"))
+        upgrade = AsyncMock(return_value=(False, "pip exploded", None))
 
         with (
             patch("deepagents_code.config._is_editable_install", return_value=False),
@@ -638,7 +580,7 @@ class TestStartupAutoUpdate:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
             ),
             patch(
@@ -662,7 +604,7 @@ class TestStartupAutoUpdate:
     def test_unpersisted_failure_marker_warns_user(self) -> None:
         """An unwritable cooldown marker must be surfaced, not silently dropped."""
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(False, "pip exploded"))
+        upgrade = AsyncMock(return_value=(False, "pip exploded", None))
 
         with (
             patch("deepagents_code.config._is_editable_install", return_value=False),
@@ -679,7 +621,7 @@ class TestStartupAutoUpdate:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
             ),
             patch(
@@ -722,7 +664,7 @@ class TestStartupAutoUpdate:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
             ),
             patch("deepagents_code.update_check.perform_upgrade", upgrade),
@@ -947,7 +889,7 @@ class TestStartupAutoUpdate:
         outcome, and must not be worded as an update failure.
         """
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(True, "updated"))
+        upgrade = AsyncMock(return_value=(True, "updated", "9.9.9"))
 
         with (
             patch("deepagents_code.config._is_editable_install", return_value=False),
@@ -964,7 +906,7 @@ class TestStartupAutoUpdate:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
             ),
             patch("deepagents_code.update_check.perform_upgrade", upgrade),
@@ -1002,7 +944,7 @@ class TestStartupAutoUpdate:
         from deepagents_code.update_check import ShadowedDcode
 
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(True, "updated"))
+        upgrade = AsyncMock(return_value=(True, "updated", "9.9.9"))
         shadow = ShadowedDcode(
             shadowing_bin=Path("C:/old/bin/dcode.cmd"),
             upgraded_bin_dir=Path("C:/uv/bin"),
@@ -1024,7 +966,7 @@ class TestStartupAutoUpdate:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
             ),
             patch("deepagents_code.update_check.perform_upgrade", upgrade),
@@ -1061,7 +1003,7 @@ class TestStartupAutoUpdate:
         log and the exit status simultaneously.
         """
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(True, "updated"))
+        upgrade = AsyncMock(return_value=(True, "updated", "9.9.9"))
 
         with (
             patch("deepagents_code.config._is_editable_install", return_value=False),
@@ -1078,7 +1020,7 @@ class TestStartupAutoUpdate:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
             ),
             patch("deepagents_code.update_check.perform_upgrade", upgrade),
@@ -1122,7 +1064,7 @@ class TestStartupAutoUpdate:
         from deepagents_code.update_check import ShadowedDcode
 
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(True, "updated"))
+        upgrade = AsyncMock(return_value=(True, "updated", "9.9.9"))
         shadow = ShadowedDcode(
             shadowing_bin=Path("/opt/old/bin/dcode"),
             upgraded_bin_dir=Path("/home/user/.local/bin"),
@@ -1143,7 +1085,7 @@ class TestStartupAutoUpdate:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
             ),
             patch("deepagents_code.update_check.perform_upgrade", upgrade),
@@ -1187,7 +1129,7 @@ class TestStartupAutoUpdate:
         uncaught and crash startup after an otherwise-successful upgrade.
         """
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(True, "updated"))
+        upgrade = AsyncMock(return_value=(True, "updated", "9.9.9"))
 
         with (
             patch("deepagents_code.config._is_editable_install", return_value=False),
@@ -1204,7 +1146,7 @@ class TestStartupAutoUpdate:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
             ),
             patch("deepagents_code.update_check.perform_upgrade", upgrade),
@@ -1447,7 +1389,7 @@ class TestStartupAutoUpdate:
         stream = StringIO()
         console = Console(file=stream, force_terminal=True, no_color=True, width=80)
         monkeypatch.setenv("DEEPAGENTS_CODE_RESTARTED_AFTER_UPDATE", "9.9.8")
-        upgrade = AsyncMock(return_value=(True, ""))
+        upgrade = AsyncMock(return_value=(True, "", "9.9.9"))
 
         with (
             patch("deepagents_code.config._is_editable_install", return_value=False),
@@ -1474,7 +1416,7 @@ class TestStartupAutoUpdate:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
             ),
             patch("deepagents_code.update_check.perform_upgrade", upgrade),
@@ -1614,10 +1556,55 @@ class TestStartupAutoUpdate:
         assert "Aborted; no project MCP servers loaded" in capsys.readouterr().err
 
 
+class TestLaunchTermProgramSnapshot:
+    """`cli_main` records launch-time `TERM_PROGRAM` for the resume hint."""
+
+    def _run_cli_main(self) -> None:
+        """Run `cli_main` through its early exit, past the snapshot."""
+        with (
+            patch.object(sys, "argv", ["dcode", "--version"]),
+            pytest.raises(SystemExit),
+        ):
+            cli_main()
+
+    def test_snapshots_launch_term_program(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `TERM_PROGRAM` present at entry is recorded for the resume hint."""
+        monkeypatch.setenv("TERM_PROGRAM", "WezTerm")
+        monkeypatch.delenv(LAUNCH_TERM_PROGRAM, raising=False)
+
+        self._run_cli_main()
+
+        assert os.environ[LAUNCH_TERM_PROGRAM] == "WezTerm"
+
+    def test_skips_snapshot_when_term_program_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without a launch `TERM_PROGRAM` no sentinel is written."""
+        monkeypatch.delenv("TERM_PROGRAM", raising=False)
+        monkeypatch.delenv(LAUNCH_TERM_PROGRAM, raising=False)
+
+        self._run_cli_main()
+
+        assert LAUNCH_TERM_PROGRAM not in os.environ
+
+    def test_inherited_snapshot_wins_over_launch_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The update re-exec's inherited sentinel is not overwritten."""
+        monkeypatch.setenv("TERM_PROGRAM", "WezTerm")
+        monkeypatch.setenv(LAUNCH_TERM_PROGRAM, "iTerm.app")
+
+        self._run_cli_main()
+
+        assert os.environ[LAUNCH_TERM_PROGRAM] == "iTerm.app"
+
+
 class TestAutoUpdateDefaultMigration:
     """First-run consent/migration notice for the auto-update opt-out default."""
 
-    @pytest.fixture(autouse=True, scope="class")
+    @pytest.fixture(autouse=True)
     def _hermetic_startup_auto_update_defaults(self) -> Iterator[None]:
         """Default startup update tests to no failure marker and no live lookups."""
         with _startup_auto_update_hermetic_defaults():
@@ -1635,7 +1622,7 @@ class TestAutoUpdateDefaultMigration:
     def test_first_run_announces_and_skips_install(self) -> None:
         """An implicit (default) opt-in announces once and skips the install."""
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(True, "updated"))
+        upgrade = AsyncMock(return_value=(True, "updated", "9.9.9"))
 
         with (
             patch("deepagents_code.config._is_editable_install", return_value=False),
@@ -1675,7 +1662,7 @@ class TestAutoUpdateDefaultMigration:
     def test_first_run_persist_failure_warns_repeat(self) -> None:
         """A failed acknowledgement persist surfaces that the notice may repeat."""
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(True, "updated"))
+        upgrade = AsyncMock(return_value=(True, "updated", "9.9.9"))
 
         with (
             patch("deepagents_code.config._is_editable_install", return_value=False),
@@ -1722,7 +1709,7 @@ class TestAutoUpdateDefaultMigration:
         """
         monkeypatch.setenv("DEEPAGENTS_CODE_DEBUG_UPDATE", "1")
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(True, "updated"))
+        upgrade = AsyncMock(return_value=(True, "updated", "9.9.9"))
 
         with (
             patch("deepagents_code.config._is_editable_install", return_value=False),
@@ -1761,7 +1748,7 @@ class TestAutoUpdateDefaultMigration:
     def test_acknowledged_default_proceeds_with_install(self) -> None:
         """Once acknowledged, the install proceeds normally on later launches."""
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(True, "updated"))
+        upgrade = AsyncMock(return_value=(True, "updated", "9.9.9"))
 
         with (
             patch("deepagents_code.config._is_editable_install", return_value=False),
@@ -1786,7 +1773,7 @@ class TestAutoUpdateDefaultMigration:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
             ),
             patch("deepagents_code.update_check.perform_upgrade", upgrade),
@@ -1812,7 +1799,7 @@ class TestAutoUpdateDefaultMigration:
         config_path = tmp_path / "config.toml"
         state_file = tmp_path / "update_state.json"
         console = MagicMock()
-        upgrade = AsyncMock(return_value=(True, "updated"))
+        upgrade = AsyncMock(return_value=(True, "updated", "9.9.9"))
 
         with (
             patch("deepagents_code.config._is_editable_install", return_value=False),
@@ -1827,7 +1814,7 @@ class TestAutoUpdateDefaultMigration:
                 return_value="",
             ),
             patch(
-                "deepagents_code.update_check.create_update_log_path",
+                "deepagents_code.update_check.create_update_log_file",
                 return_value=Path("/tmp/dcode-update.log"),
             ),
             patch("deepagents_code.update_check.perform_upgrade", upgrade),
@@ -1956,20 +1943,47 @@ class TestRenderTeardownThreadHints:
         thread_url: str | None,
         return_code: int = 0,
         launch_name: str = "dcode",
+        term_program: str = "",
+        launch_term_program: str | None = None,
+        resume_term_program: bool | None = None,
+        debug: bool = False,
+        experimental: bool = False,
+        toml_data: dict | None = None,
+        toml_error: Exception | None = None,
     ) -> str:
-        """Render the hints with patched dependencies, returning the output."""
+        """Render teardown hints under controlled feature configuration."""
         buffer = StringIO()
         console = Console(file=buffer, width=200)
         # `launch_name` is resolved (and cached) inside the renderer.
         invoked_name.cache_clear()
+        env = {
+            INVOKED_AS: launch_name,
+            "TERM_PROGRAM": term_program,
+            DEBUG: "1" if debug else "0",
+            EXPERIMENTAL: "1" if experimental else "0",
+        }
+        if launch_term_program is not None:
+            env[LAUNCH_TERM_PROGRAM] = launch_term_program
+        if resume_term_program is not None:
+            env[RESUME_TERM_PROGRAM] = "1" if resume_term_program else "0"
         with (
             patch("deepagents_code.sessions.thread_exists", thread_exists_mock),
             patch(
                 "deepagents_code.config.build_langsmith_thread_url",
                 return_value=thread_url,
             ),
-            patch.dict(os.environ, {INVOKED_AS: launch_name}),
+            patch(
+                "deepagents_code.config_manifest.load_config_toml",
+                side_effect=toml_error,
+                return_value={} if toml_data is None else toml_data,
+            ),
+            patch.dict(os.environ, env),
+            patch.object(sys, "platform", "darwin"),
         ):
+            if launch_term_program is None:
+                os.environ.pop(LAUNCH_TERM_PROGRAM, None)
+            if resume_term_program is None:
+                os.environ.pop(RESUME_TERM_PROGRAM, None)
             _render_teardown_thread_hints(console, "test123", return_code=return_code)
         return buffer.getvalue()
 
@@ -1988,18 +2002,269 @@ class TestRenderTeardownThreadHints:
         assert "Resume this thread with:" in output
         assert "dcode -r test123" in output
 
-    def test_resume_hint_echoes_launch_command(self) -> None:
+    def test_resume_hint_honors_toml_feature_flag(self) -> None:
+        """`[features] resume_term_program` reaches the hint without an env var.
+
+        The helper otherwise stubs `load_config_toml` to `{}`, so without this
+        case the entire config.toml route to the prefix could break with the
+        suite still green.
+        """
+        thread_exists_mock = AsyncMock(return_value=True)
+
+        output = self._render(
+            thread_exists_mock=thread_exists_mock,
+            thread_url=None,
+            launch_term_program="iTerm.app",
+            toml_data={"features": {"resume_term_program": True}},
+        )
+
+        assert "TERM_PROGRAM=iTerm.app dcode -r test123" in output
+
+    def test_resume_hint_survives_config_read_failure(self) -> None:
+        """A raising config read must not take down the exit path.
+
+        `_render_teardown_thread_hints` runs from a bare `finally` in
+        `cli_main`, so an exception escaping here would replace whatever is
+        already unwinding -- including the `KeyboardInterrupt` that produces
+        exit code 130.
+        """
+        thread_exists_mock = AsyncMock(return_value=True)
+
+        output = self._render(
+            thread_exists_mock=thread_exists_mock,
+            thread_url=None,
+            launch_term_program="iTerm.app",
+            resume_term_program=True,
+            toml_error=RecursionError("deeply nested TOML"),
+        )
+
+        assert "dcode -r test123" in output
+        assert "TERM_PROGRAM=" not in output
+
+    @pytest.mark.parametrize("return_code", [0, 1])
+    def test_resume_hint_echoes_launch_command(self, return_code: int) -> None:
         """The hint names the shim the user launched, not a hardcoded `dcode`."""
         thread_exists_mock = AsyncMock(return_value=True)
 
         output = self._render(
             thread_exists_mock=thread_exists_mock,
             thread_url=None,
+            return_code=return_code,
             launch_name="abc",
         )
 
         assert "abc -r test123" in output
         assert "dcode" not in output
+
+    @pytest.mark.parametrize("return_code", [0, 1])
+    def test_resume_hint_carries_term_program_when_enabled(
+        self, return_code: int
+    ) -> None:
+        """An enabled launch-time `TERM_PROGRAM` rides along as an env prefix."""
+        thread_exists_mock = AsyncMock(return_value=True)
+
+        output = self._render(
+            thread_exists_mock=thread_exists_mock,
+            thread_url=None,
+            return_code=return_code,
+            term_program="WezTerm",
+            launch_term_program="WezTerm",
+            resume_term_program=True,
+        )
+
+        assert "TERM_PROGRAM=WezTerm dcode -r test123" in output
+
+    def test_resume_hint_omits_term_program_by_default(self) -> None:
+        """An ambient launch value is not echoed without an enabling mode or flag."""
+        thread_exists_mock = AsyncMock(return_value=True)
+
+        output = self._render(
+            thread_exists_mock=thread_exists_mock,
+            thread_url=None,
+            term_program="WezTerm",
+            launch_term_program="WezTerm",
+        )
+
+        assert "TERM_PROGRAM" not in output
+        assert "dcode -r test123" in output
+
+    @pytest.mark.parametrize("mode", ["debug", "experimental"])
+    def test_resume_hint_carries_term_program_in_enabled_modes(self, mode: str) -> None:
+        """Debug and experimental mode each enable the prefix by default."""
+        thread_exists_mock = AsyncMock(return_value=True)
+
+        output = self._render(
+            thread_exists_mock=thread_exists_mock,
+            thread_url=None,
+            term_program="WezTerm",
+            launch_term_program="WezTerm",
+            debug=mode == "debug",
+            experimental=mode == "experimental",
+        )
+
+        assert "TERM_PROGRAM=WezTerm dcode -r test123" in output
+
+    @pytest.mark.parametrize("mode", ["debug", "experimental"])
+    def test_resume_hint_explicit_disable_overrides_enabled_modes(
+        self, mode: str
+    ) -> None:
+        """The feature flag can suppress the mode-dependent opt-in."""
+        thread_exists_mock = AsyncMock(return_value=True)
+
+        output = self._render(
+            thread_exists_mock=thread_exists_mock,
+            thread_url=None,
+            term_program="WezTerm",
+            launch_term_program="WezTerm",
+            resume_term_program=False,
+            debug=mode == "debug",
+            experimental=mode == "experimental",
+        )
+
+        assert "TERM_PROGRAM" not in output
+        assert "dcode -r test123" in output
+
+    def test_resume_hint_omits_term_program_without_launch_snapshot(self) -> None:
+        """A `TERM_PROGRAM` set only after launch (a `.env` file) stays out."""
+        thread_exists_mock = AsyncMock(return_value=True)
+
+        output = self._render(
+            thread_exists_mock=thread_exists_mock,
+            thread_url=None,
+            term_program="WezTerm",
+            resume_term_program=True,
+        )
+
+        assert "TERM_PROGRAM" not in output
+        assert "dcode -r test123" in output
+
+    def test_resume_hint_omits_prefix_when_term_program_unset(self) -> None:
+        """An unset `TERM_PROGRAM` leaves the command bare, with no empty prefix."""
+        thread_exists_mock = AsyncMock(return_value=True)
+
+        output = self._render(
+            thread_exists_mock=thread_exists_mock,
+            thread_url=None,
+            resume_term_program=True,
+        )
+
+        assert "dcode -r test123" in output
+        assert "TERM_PROGRAM" not in output
+
+    @pytest.mark.parametrize("term_program", ["   ", "\t"])
+    def test_resume_hint_omits_blank_term_program(self, term_program: str) -> None:
+        """A whitespace-only value is treated as unset, matching other readers."""
+        thread_exists_mock = AsyncMock(return_value=True)
+
+        output = self._render(
+            thread_exists_mock=thread_exists_mock,
+            thread_url=None,
+            term_program=term_program,
+            launch_term_program=term_program,
+            resume_term_program=True,
+        )
+
+        assert "TERM_PROGRAM" not in output
+
+    def test_resume_hint_quotes_term_program_needing_quotes(self) -> None:
+        """A value the shell would split is quoted, keeping the line pasteable."""
+        thread_exists_mock = AsyncMock(return_value=True)
+
+        output = self._render(
+            thread_exists_mock=thread_exists_mock,
+            thread_url=None,
+            term_program="Wez Term&whoami",
+            launch_term_program="Wez Term&whoami",
+            resume_term_program=True,
+        )
+
+        assert "TERM_PROGRAM='Wez Term&whoami' dcode -r test123" in output
+
+    def test_resume_hint_drops_term_program_with_control_characters(self) -> None:
+        """Terminal metadata cannot inject control sequences into teardown output.
+
+        The value is dropped rather than stripped: a stripped value would name a
+        terminal the environment never contained.
+        """
+        thread_exists_mock = AsyncMock(return_value=True)
+
+        output = self._render(
+            thread_exists_mock=thread_exists_mock,
+            thread_url=None,
+            term_program="Wez\x1b\nTerm",
+            launch_term_program="Wez\x1b\nTerm",
+            resume_term_program=True,
+        )
+
+        assert "TERM_PROGRAM" not in output
+        assert "\x1b" not in output
+        assert "dcode -r test123" in output
+
+    def _render_on_platform(
+        self,
+        platform: str,
+        *,
+        extra_env: dict[str, str] | None = None,
+    ) -> str:
+        """Render the resume hint as if running on `platform`.
+
+        `patch.dict` only merges, so POSIX markers the developer's own shell
+        exports (`SHELL`, at minimum) are deleted first to make the simulated
+        native Windows environment hermetic.
+        """
+        thread_exists_mock = AsyncMock(return_value=True)
+        buffer = StringIO()
+        console = Console(file=buffer, width=200)
+        invoked_name.cache_clear()
+        env = {
+            INVOKED_AS: "dcode",
+            "TERM_PROGRAM": "vscode",
+            LAUNCH_TERM_PROGRAM: "vscode",
+            RESUME_TERM_PROGRAM: "1",
+            **(extra_env or {}),
+        }
+        with (
+            patch("deepagents_code.sessions.thread_exists", thread_exists_mock),
+            patch(
+                "deepagents_code.config.build_langsmith_thread_url",
+                return_value=None,
+            ),
+            patch("deepagents_code.config_manifest.load_config_toml", return_value={}),
+            patch.object(sys, "platform", platform),
+            patch.dict(os.environ, env),
+        ):
+            for marker in ("SHELL", "MSYSTEM", "WSL_DISTRO_NAME"):
+                if marker not in env:
+                    os.environ.pop(marker, None)
+            _render_teardown_thread_hints(console, "test123", return_code=0)
+        return buffer.getvalue()
+
+    def test_resume_hint_omits_prefix_on_native_windows(self) -> None:
+        """Native `cmd.exe`/PowerShell cannot parse a POSIX `VAR=value` prefix.
+
+        VS Code and WezTerm set `TERM_PROGRAM` on every platform, so its
+        presence under `win32` says nothing about the user's shell.
+        """
+        output = self._render_on_platform("win32")
+
+        assert "TERM_PROGRAM" not in output
+        assert "dcode -r test123" in output
+
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            {"SHELL": "C:\\Program Files\\Git\\bin\\bash.exe"},
+            {"MSYSTEM": "MINGW64"},
+            {"WSL_DISTRO_NAME": "Ubuntu"},
+        ],
+    )
+    def test_resume_hint_keeps_prefix_on_windows_posix_shells(
+        self, marker: dict[str, str]
+    ) -> None:
+        """git-bash/MSYS/WSL expose POSIX markers, so the prefix is valid there."""
+        output = self._render_on_platform("win32", extra_env=marker)
+
+        assert "TERM_PROGRAM=vscode dcode -r test123" in output
 
     def test_prints_langsmith_link_when_available(self) -> None:
         """A configured LangSmith URL is shown alongside the resume hint."""
@@ -2012,11 +2277,16 @@ class TestRenderTeardownThreadHints:
         assert "Resume this thread with:" in output
         thread_exists_mock.assert_awaited_once()
 
-    def test_no_hints_without_checkpoints(self) -> None:
-        """No checkpoint means no link and no resume hint."""
+    @pytest.mark.parametrize("return_code", [0, 1])
+    def test_no_hints_without_checkpoints(self, return_code: int) -> None:
+        """No checkpoint means no link, resume hint, or crash caveat."""
         thread_exists_mock = AsyncMock(return_value=False)
 
-        output = self._render(thread_exists_mock=thread_exists_mock, thread_url=None)
+        output = self._render(
+            thread_exists_mock=thread_exists_mock,
+            thread_url=None,
+            return_code=return_code,
+        )
 
         assert output == ""
         thread_exists_mock.assert_awaited_once()
@@ -2030,16 +2300,202 @@ class TestRenderTeardownThreadHints:
         assert output == ""
         thread_exists_mock.assert_awaited_once()
 
-    def test_resume_hint_omitted_on_error_exit(self) -> None:
-        """The resume hint is only shown on a clean exit (return_code 0)."""
+    def test_error_exit_prints_resume_hint_with_caveat(self) -> None:
+        """A crashed checkpointed thread remains resumable with a safety caveat."""
         thread_exists_mock = AsyncMock(return_value=True)
 
         output = self._render(
             thread_exists_mock=thread_exists_mock, thread_url=None, return_code=1
         )
 
-        assert "Resume this thread with:" not in output
+        assert "Resume this thread with:" in output
+        assert "dcode -r test123" in output
+        assert "Attempting to resume this thread may fail" in output
         thread_exists_mock.assert_awaited_once()
+
+    def test_clean_exit_prints_resume_hint_without_caveat(self) -> None:
+        """Clean teardown output retains the resume hint without a caveat."""
+        thread_exists_mock = AsyncMock(return_value=True)
+
+        output = self._render(
+            thread_exists_mock=thread_exists_mock, thread_url=None, return_code=0
+        )
+
+        assert "Resume this thread with:" in output
+        assert "dcode -r test123" in output
+        assert "Attempting to resume this thread may fail" not in output
+        thread_exists_mock.assert_awaited_once()
+
+
+class TestTeardownHintsOnCrash:
+    """Test crash handling still renders checkpoint-backed resume guidance."""
+
+    def test_runner_crash_prints_resume_hint_and_exits_nonzero(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An unhandled TUI exception renders teardown hints before exiting."""
+        launch = AsyncMock(side_effect=RuntimeError("boom"))
+        thread_exists_mock = AsyncMock(return_value=True)
+        invoked_name.cache_clear()
+
+        with (
+            patch("sys.argv", ["dcode"]),
+            patch("sys.stdin", SimpleNamespace(isatty=lambda: True)),
+            patch("deepagents_code.main._install_termination_signal_handlers"),
+            patch("deepagents_code.main._run_startup_auto_update"),
+            patch("deepagents_code.main._resolve_agent_arg", return_value="agent"),
+            patch(
+                "deepagents_code.main._resolve_interpreter_enabled", return_value=False
+            ),
+            patch("deepagents_code.main._check_mcp_project_trust", return_value=None),
+            patch("deepagents_code.main._check_project_hooks_trust", return_value=None),
+            patch(
+                "deepagents_code.sessions.generate_thread_id", return_value="test123"
+            ),
+            patch("deepagents_code.main.run_textual_cli_async", launch),
+            patch("deepagents_code.sessions.thread_exists", thread_exists_mock),
+            patch(
+                "deepagents_code.config.build_langsmith_thread_url", return_value=None
+            ),
+            patch.dict(os.environ, {INVOKED_AS: "dcode"}),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cli_main()
+
+        assert exc_info.value.code == 1
+        launch.assert_awaited_once()
+        thread_exists_mock.assert_awaited_once_with("test123")
+        output = capsys.readouterr().out
+        flattened = output.replace("\n", "")
+        assert "Application error: boom" in output
+        assert "Resume this thread with:" in output
+        assert "dcode -r test123" in output
+        assert "Attempting to resume this thread may fail" in flattened
+
+    async def test_crash_preserves_final_thread_id(self) -> None:
+        """A crash surfaces the thread the app resolved, not the pre-launch ID.
+
+        On a `-r` launch the caller's `thread_id` local is `None` (resolution
+        is async), and a `/threads` switch never reaches the caller; the crash
+        snapshot is the only place the active thread survives.
+        """
+        result_snapshot = AppResult(return_code=1, thread_id="resolved-thread")
+        msg = "boom"
+
+        async def _run_textual_app_stub(**kwargs: Any) -> AppResult:
+            del kwargs
+            await asyncio.sleep(0)
+            raise TextualAppError(msg, result_snapshot)
+
+        with patch("deepagents_code.app.run_textual_app", new=_run_textual_app_stub):
+            result = await run_textual_cli_async(
+                "agent",
+                thread_id=None,
+                resume_thread="resolved-thread",
+                no_mcp=True,
+            )
+
+        assert result is result_snapshot
+
+    async def test_crash_without_app_state_falls_back_to_launch_thread(
+        self,
+    ) -> None:
+        """A failure before/without app state keeps the launch-time thread ID."""
+        msg = "boom"
+
+        async def _run_textual_app_stub(**kwargs: Any) -> AppResult:
+            del kwargs
+            await asyncio.sleep(0)
+            raise RuntimeError(msg)
+
+        with patch("deepagents_code.app.run_textual_app", new=_run_textual_app_stub):
+            result = await run_textual_cli_async(
+                "agent",
+                thread_id="launch-thread",
+                no_mcp=True,
+            )
+
+        assert result.return_code == 1
+        assert result.thread_id == "launch-thread"
+
+    def test_keyboard_interrupt_prints_hint_with_caveat(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Ctrl+C teardown shows the resume hint with the incomplete-turn caveat."""
+        launch = AsyncMock(side_effect=KeyboardInterrupt)
+        thread_exists_mock = AsyncMock(return_value=True)
+        invoked_name.cache_clear()
+
+        with (
+            patch("sys.argv", ["dcode"]),
+            patch("sys.stdin", SimpleNamespace(isatty=lambda: True)),
+            patch("deepagents_code.main._install_termination_signal_handlers"),
+            patch("deepagents_code.main._run_startup_auto_update"),
+            patch("deepagents_code.main._resolve_agent_arg", return_value="agent"),
+            patch(
+                "deepagents_code.main._resolve_interpreter_enabled", return_value=False
+            ),
+            patch("deepagents_code.main._check_mcp_project_trust", return_value=None),
+            patch("deepagents_code.main._check_project_hooks_trust", return_value=None),
+            patch(
+                "deepagents_code.sessions.generate_thread_id", return_value="test123"
+            ),
+            patch("deepagents_code.main.run_textual_cli_async", launch),
+            patch("deepagents_code.sessions.thread_exists", thread_exists_mock),
+            patch(
+                "deepagents_code.config.build_langsmith_thread_url", return_value=None
+            ),
+            patch.dict(os.environ, {INVOKED_AS: "dcode"}),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cli_main()
+
+        assert exc_info.value.code == 130
+        thread_exists_mock.assert_awaited_once_with("test123")
+        output = capsys.readouterr().out
+        flattened = output.replace("\n", "")
+        assert "Resume this thread with:" in output
+        assert "dcode -r test123" in output
+        assert "Attempting to resume this thread may fail" in flattened
+
+    def test_signal_exit_prints_hint_with_caveat(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A termination-signal SystemExit shows the caveat, not a clean hint."""
+        launch = AsyncMock(side_effect=SystemExit(143))
+        thread_exists_mock = AsyncMock(return_value=True)
+        invoked_name.cache_clear()
+
+        with (
+            patch("sys.argv", ["dcode"]),
+            patch("sys.stdin", SimpleNamespace(isatty=lambda: True)),
+            patch("deepagents_code.main._install_termination_signal_handlers"),
+            patch("deepagents_code.main._run_startup_auto_update"),
+            patch("deepagents_code.main._resolve_agent_arg", return_value="agent"),
+            patch(
+                "deepagents_code.main._resolve_interpreter_enabled", return_value=False
+            ),
+            patch("deepagents_code.main._check_mcp_project_trust", return_value=None),
+            patch("deepagents_code.main._check_project_hooks_trust", return_value=None),
+            patch(
+                "deepagents_code.sessions.generate_thread_id", return_value="test123"
+            ),
+            patch("deepagents_code.main.run_textual_cli_async", launch),
+            patch("deepagents_code.sessions.thread_exists", thread_exists_mock),
+            patch(
+                "deepagents_code.config.build_langsmith_thread_url", return_value=None
+            ),
+            patch.dict(os.environ, {INVOKED_AS: "dcode"}),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cli_main()
+
+        assert exc_info.value.code == 143
+        thread_exists_mock.assert_awaited_once_with("test123")
+        output = capsys.readouterr().out
+        flattened = output.replace("\n", "")
+        assert "Resume this thread with:" in output
+        assert "Attempting to resume this thread may fail" in flattened
 
 
 class TestLangSmithTeardownUrl:
@@ -2363,12 +2819,37 @@ class TestServerCleanupLifecycle:
             patch(
                 "deepagents_code.client.launch.server.emit_preserved_log_notices",
             ) as emit,
-            pytest.raises(RuntimeError, match="boom"),
+            pytest.raises(TextualAppError, match="boom"),
         ):
             await run_textual_app(server_proc=server_proc, thread_id="t-1")  # ty: ignore
 
         server_proc.stop.assert_called_once_with()
         emit.assert_called_once_with()
+
+    async def test_crash_carries_app_state(self) -> None:
+        """A run_async failure wraps the app's final thread ID and return code."""
+        msg = "boom"
+
+        async def _crash_after_switch(self: DeepAgentsApp) -> None:
+            # The app resolved/switched threads before dying (e.g. async `-r`
+            # resolution or `/threads`); the original launch-time ID is stale.
+            self._lc_thread_id = "switched-thread"
+            await asyncio.sleep(0)
+            raise RuntimeError(msg)
+
+        with (
+            patch.object(DeepAgentsApp, "run_async", new=_crash_after_switch),
+            patch(
+                "deepagents_code.client.launch.server.emit_preserved_log_notices",
+            ),
+            pytest.raises(TextualAppError) as exc_info,
+        ):
+            await run_textual_app(thread_id="launch-thread")
+
+        assert exc_info.value.result.thread_id == "switched-thread"
+        # No clean exit was recorded, so the crash snapshot reports failure.
+        assert exc_info.value.result.return_code == 1
+        assert isinstance(exc_info.value.__cause__, RuntimeError)
 
     async def test_deferred_server_proc_stopped_after_app_exits(self) -> None:
         """server_proc set by the background worker must still be cleaned up."""
@@ -4618,6 +5099,163 @@ class TestSelectProjectServersToPersist:
         assert "Choose how to continue" not in rendered
 
     @pytest.mark.usefixtures("_interactive_picker_terminal")
+    def test_deny_first_lists_deny_first_and_still_defaults_to_deny(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`deny_first` reorders the rows without moving the Enter default.
+
+        The default is computed from the deny action's identity, so reversing
+        the list must not hand a bare Enter to the allow option.
+        """
+        from rich.console import Console
+
+        from deepagents_code.main import (
+            _run_trust_action_picker,
+            _TrustAction,
+        )
+
+        captured: dict[str, Any] = {}
+
+        class _FakeApplication:
+            def __class_getitem__(cls, _item: object) -> type["_FakeApplication"]:
+                return cls
+
+            def __init__(self, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+            def run(self) -> _TrustAction:
+                bindings = captured["key_bindings"].bindings
+                holder: dict[str, _TrustAction] = {}
+                event = SimpleNamespace(
+                    app=SimpleNamespace(
+                        exit=lambda *, result: holder.update(value=result)
+                    )
+                )
+                confirm = next(
+                    binding.handler
+                    for binding in bindings
+                    if binding.handler.__name__ == "_confirm"
+                )
+                confirm(event)
+                return holder["value"]
+
+        monkeypatch.setattr("prompt_toolkit.Application", _FakeApplication)
+        result = _run_trust_action_picker(
+            Console(stderr=True),
+            remember_label="Mute until the mismatch changes",
+            allow_label="Continue this session only",
+            deny_label="Abort launch",
+            deny_first=True,
+        )
+
+        assert result is _TrustAction.DENY
+        rendered = "".join(
+            text for _style, text in captured["layout"].container.content.text()
+        )
+        assert rendered.index("Abort launch") < rendered.index(
+            "Mute until the mismatch changes"
+        )
+        assert rendered.index("Mute until the mismatch changes") < rendered.index(
+            "Continue this session only"
+        )
+
+    @pytest.mark.usefixtures("_interactive_picker_terminal")
+    def test_refresh_picker_action_follows_abort(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Moving down once from the safe default selects environment refresh."""
+        from rich.console import Console
+
+        from deepagents_code.main import (
+            _run_trust_action_picker,
+            _TrustAction,
+        )
+
+        captured: dict[str, Any] = {}
+
+        class _FakeApplication:
+            def __class_getitem__(cls, _item: object) -> type["_FakeApplication"]:
+                return cls
+
+            def __init__(self, **kwargs: Any) -> None:
+                captured.update(kwargs)
+
+            def run(self) -> _TrustAction:
+                bindings = captured["key_bindings"].bindings
+                holder: dict[str, _TrustAction] = {}
+                event = SimpleNamespace(
+                    app=SimpleNamespace(
+                        exit=lambda *, result: holder.update(value=result)
+                    )
+                )
+                move_down = next(
+                    binding.handler
+                    for binding in bindings
+                    if binding.handler.__name__ == "_down"
+                )
+                confirm = next(
+                    binding.handler
+                    for binding in bindings
+                    if binding.handler.__name__ == "_confirm"
+                )
+                move_down(event)
+                confirm(event)
+                return holder["value"]
+
+        monkeypatch.setattr("prompt_toolkit.Application", _FakeApplication)
+        result = _run_trust_action_picker(
+            Console(stderr=True),
+            remember_label="Continue and hide until versions change",
+            allow_label="Continue this session only",
+            deny_label="Abort launch",
+            refresh_label="Refresh environment now",
+            deny_first=True,
+        )
+
+        assert result is _TrustAction.REFRESH
+        rendered = "".join(
+            text for _style, text in captured["layout"].container.content.text()
+        )
+        assert rendered.index("Abort launch") < rendered.index(
+            "Refresh environment now"
+        )
+        assert rendered.index("Refresh environment now") < rendered.index(
+            "Continue this session only"
+        )
+        assert rendered.index("Continue this session only") < rendered.index(
+            "Continue and hide until versions change"
+        )
+
+    @pytest.mark.usefixtures("_interactive_picker_terminal")
+    def test_abort_on_deny_maps_picker_deny_to_cancelled(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A picker deny must reach the caller as an abort, not as a decision.
+
+        Without this mapping the dep-floor prompt's "Abort launch" was
+        indistinguishable from "continue", and the launch proceeded.
+        """
+        from deepagents_code.main import (
+            _select_trust_action,
+            _TrustAction,
+            _TrustPromptOutcome,
+        )
+
+        monkeypatch.setattr(
+            "deepagents_code.main._run_trust_action_picker",
+            lambda *_args, **_kwargs: _TrustAction.DENY,
+        )
+
+        assert (
+            _select_trust_action(Console(stderr=True), abort_on_deny=True)
+            is _TrustPromptOutcome.CANCELLED
+        )
+        assert _select_trust_action(Console(stderr=True)) is _TrustAction.DENY
+
+    @pytest.mark.usefixtures("_interactive_picker_terminal")
     def test_action_picker_hides_terminal_cursor(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -4718,6 +5356,28 @@ class TestSelectProjectServersToPersist:
         )
 
         result = _select_trust_action(Console(stderr=True))
+
+        assert result is _TrustPromptOutcome.CANCELLED
+
+    def test_select_action_maps_picker_deny_to_cancelled_when_requested(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A picker's explicit abort choice produces the launch-abort outcome."""
+        from rich.console import Console
+
+        from deepagents_code.main import (
+            _select_trust_action,
+            _TrustAction,
+            _TrustPromptOutcome,
+        )
+
+        monkeypatch.setattr(
+            "deepagents_code.main._run_trust_action_picker",
+            lambda _console, **_kwargs: _TrustAction.DENY,
+        )
+
+        result = _select_trust_action(Console(stderr=True), abort_on_deny=True)
 
         assert result is _TrustPromptOutcome.CANCELLED
 
@@ -5427,6 +6087,30 @@ class TestSelectProjectMcpTrustAction:
         result = _select_trust_action(Console(stderr=True))
 
         assert result is _TrustAction[expected_name]
+
+    @pytest.mark.parametrize("token", ["u", "update", "f", "refresh"])
+    def test_text_fallback_refresh_tokens(
+        self, token: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The dependency-floor fallback accepts update and refresh spellings."""
+        from rich.console import Console
+
+        from deepagents_code.main import (
+            _select_trust_action,
+            _TrustAction,
+        )
+
+        monkeypatch.setattr(
+            "deepagents_code.main._run_trust_action_picker",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr("builtins.input", lambda _prompt="": token)
+
+        result = _select_trust_action(
+            Console(stderr=True), refresh_label="Refresh environment now"
+        )
+
+        assert result is _TrustAction.REFRESH
 
 
 class TestCheckMcpProjectTrustDedupe:

@@ -337,8 +337,8 @@ class _AssistantMessageApp(App[None]):
         yield widget
 
 
-class TestAssistantMessageLinkPointer:
-    """Tests for the pointer cursor shown when hovering markdown links."""
+class TestAssistantMessagePointer:
+    """Tests for pointer shapes over assistant-message content."""
 
     @staticmethod
     def _move_event(
@@ -346,9 +346,10 @@ class TestAssistantMessageLinkPointer:
     ) -> SimpleNamespace:
         """Build a minimal mouse-move-like event exposing the hovered style.
 
-        The handlers only read `event.style.link` and `event.style.meta`, so a
-        namespace is enough; the assertions run against the real `Markdown`
-        widget mounted by `_AssistantMessageApp`.
+        A namespace is enough because the handlers only read `event.style.link`
+        and `event.style.meta`. It cannot validate the hitbox itself, though: it
+        hard-codes the same `offset` key the implementation reads, so the
+        `test_real_hover_*` cases below are what actually pin that behavior.
         """
         return SimpleNamespace(style=SimpleNamespace(link=link, meta=meta or {}))
 
@@ -359,8 +360,7 @@ class TestAssistantMessageLinkPointer:
 
             msg.on_mouse_move(self._move_event(meta={"@click": "link('https://x')"}))  # ty: ignore
 
-            assert msg._markdown is not None
-            assert msg._markdown.styles.pointer == "pointer"
+            assert msg.styles.pointer == "pointer"
 
     async def test_hovering_osc8_link_sets_pointer_cursor(self) -> None:
         """An OSC 8 `Style(link=...)` span also switches the pointer to pointer."""
@@ -369,29 +369,106 @@ class TestAssistantMessageLinkPointer:
 
             msg.on_mouse_move(self._move_event(link="https://example.com"))  # ty: ignore
 
-            assert msg._markdown is not None
-            assert msg._markdown.styles.pointer == "pointer"
+            assert msg.styles.pointer == "pointer"
 
     async def test_hovering_text_sets_text_pointer(self) -> None:
-        """Plain markdown text keeps the text pointer."""
+        """A cell carrying Textual's selection offset uses the text pointer."""
+        async with _AssistantMessageApp().run_test() as pilot:
+            msg = pilot.app.query_one("#assistant", AssistantMessage)
+
+            msg.on_mouse_move(self._move_event(meta={"offset": (0, 0)}))  # ty: ignore
+
+            assert msg.styles.pointer == "text"
+
+    async def test_hovering_blank_space_sets_default_pointer(self) -> None:
+        """A cell without rendered text uses the default pointer."""
         async with _AssistantMessageApp().run_test() as pilot:
             msg = pilot.app.query_one("#assistant", AssistantMessage)
 
             msg.on_mouse_move(self._move_event())  # ty: ignore
 
-            assert msg._markdown is not None
-            assert msg._markdown.styles.pointer == "text"
+            assert msg.styles.pointer == "default"
 
     async def test_leave_resets_pointer(self) -> None:
-        """Leaving the message resets the pointer to text after a link hover."""
+        """Leaving the message resets the pointer after a link hover."""
         async with _AssistantMessageApp().run_test() as pilot:
             msg = pilot.app.query_one("#assistant", AssistantMessage)
             msg.on_mouse_move(self._move_event(link="https://example.com"))  # ty: ignore
 
             msg.on_leave()
 
-            assert msg._markdown is not None
-            assert msg._markdown.styles.pointer == "text"
+            assert msg.styles.pointer == "default"
+
+    async def test_real_hover_limits_text_pointer_to_rendered_cells(self) -> None:
+        """Real mouse routing distinguishes message text from trailing blank space."""
+        async with _AssistantMessageApp().run_test(size=(80, 24)) as pilot:
+            msg = pilot.app.query_one("#assistant", AssistantMessage)
+            await msg.set_content("hello")
+            await msg.write_initial_content()
+            await pilot.pause()
+
+            assert msg.styles.pointer == "default"
+
+            await pilot.hover("#assistant-content", offset=(0, 0))
+            assert msg.styles.pointer == "text"
+
+            # The boundary itself: `hello` ends at column 4, so column 5 is the
+            # first cell an off-by-one in the hitbox would still claim as text.
+            await pilot.hover("#assistant-content", offset=(4, 0))
+            assert msg.styles.pointer == "text"
+
+            await pilot.hover("#assistant-content", offset=(5, 0))
+            assert msg.styles.pointer == "default"
+
+    async def test_real_hover_over_markdown_link_sets_pointer_cursor(self) -> None:
+        """A rendered markdown link really resolves to the hand pointer.
+
+        The fake-event cases above assert that `@click` meta means "link",
+        which is an assumption about what Textual's `Markdown` attaches rather
+        than a fact about rendered output. This drives the real span, so a
+        change in Markdown's link metadata cannot pass silently.
+        """
+        async with _AssistantMessageApp().run_test(size=(80, 24)) as pilot:
+            msg = pilot.app.query_one("#assistant", AssistantMessage)
+            await msg.set_content("see [docs](https://example.com) now")
+            await msg.write_initial_content()
+            await pilot.pause()
+
+            # Renders as `see docs now`, putting the link on columns 4-7.
+            await pilot.hover("#assistant-content", offset=(1, 0))
+            assert msg.styles.pointer == "text"
+
+            await pilot.hover("#assistant-content", offset=(4, 0))
+            assert msg.styles.pointer == "pointer"
+
+            # Back onto plain text without leaving the widget: `on_leave` never
+            # fires here, so only the handler's non-link branch can clear the
+            # hand cursor.
+            await pilot.hover("#assistant-content", offset=(9, 0))
+            assert msg.styles.pointer == "text"
+
+    async def test_real_hover_over_multi_block_content(self) -> None:
+        """Blank inter-block rows read as blank space; fenced code reads as text."""
+        async with _AssistantMessageApp().run_test(size=(60, 24)) as pilot:
+            msg = pilot.app.query_one("#assistant", AssistantMessage)
+            await msg.set_content("para one\n\n```python\nx = 1\n```\n")
+            await msg.write_initial_content()
+            await pilot.pause()
+
+            await pilot.hover("#assistant-content", offset=(0, 0))
+            assert msg.styles.pointer == "text"
+
+            # The margin row separating the paragraph from the fence.
+            await pilot.hover("#assistant-content", offset=(0, 1))
+            assert msg.styles.pointer == "default"
+
+            # Fenced code renders through `MarkdownFence` rather than the prose
+            # path, and sits two columns inside its block.
+            await pilot.hover("#assistant-content", offset=(2, 3))
+            assert msg.styles.pointer == "text"
+
+            await pilot.hover("#assistant-content", offset=(0, 3))
+            assert msg.styles.pointer == "default"
 
     async def test_markdown_open_links_is_disabled(self) -> None:
         """The app handles Markdown links so it can show URL-opened toasts."""
@@ -743,6 +820,14 @@ class TestDiffMessageCredentialRedaction:
         assert all("may contain credentials" not in text for text in texts)
         assert any("print('b')" in text for text in texts)
 
+    def test_app_config_can_hide_file_line_numbers(self) -> None:
+        """The app-level preference removes gutters from file-relative diffs."""
+        diff = "@@ -10 +12 @@\n-old\n+new"
+        texts = self._texts(DiffMessage(diff, file_path="main.py", show_numbers=False))
+        assert "- old" in texts
+        assert "+ new" in texts
+        assert not any(text.lstrip().startswith(("10", "12")) for text in texts)
+
     def test_empty_file_path_renders_diff(self) -> None:
         """An unknown (empty) path renders normally rather than falsely hiding.
 
@@ -916,7 +1001,10 @@ class TestToolCallMessageDuration:
         async with app.run_test() as pilot:
             await pilot.pause()
             app.msg.set_running()
-            app.msg._start_time -= 5  # ty: ignore
+            # 4.9 keeps the faked elapsed off the `.05` rounding boundary: the
+            # wall clock keeps running between the subtraction and
+            # `set_success`, so an exact `-5` can render as `5.1s`.
+            app.msg._start_time -= 4.9  # ty: ignore
             app.msg.set_success("done")
             await pilot.pause()
 
@@ -925,7 +1013,7 @@ class TestToolCallMessageDuration:
             assert status.display is True
             content = status._Static__content  # ty: ignore
             assert isinstance(content, Content)
-            assert content.plain == "Took 5s"
+            assert content.plain == "Took 4.9s"
 
     async def test_execute_shows_fractional_seconds(self) -> None:
         """Sub-minute `execute` runs report tenths — `elapsed` is a float.
@@ -4834,8 +4922,8 @@ class _AppMessageApp(App[None]):
         yield AppMessage("Resumed thread: tid-1", id="app-msg")
 
 
-class TestAppMessageLinkPointer:
-    """Tests for the pointer cursor shown when hovering embedded links."""
+class TestAppMessagePointer:
+    """Tests for pointer shapes over app-message content."""
 
     @staticmethod
     def _move_event(
@@ -4853,14 +4941,23 @@ class TestAppMessageLinkPointer:
 
             assert msg.styles.pointer == "pointer"
 
-    async def test_hovering_text_keeps_text_pointer(self) -> None:
-        """Plain message text keeps the text pointer."""
+    async def test_hovering_text_sets_text_pointer(self) -> None:
+        """A cell carrying Textual's selection offset uses the text pointer."""
+        async with _AppMessageApp().run_test() as pilot:
+            msg = pilot.app.query_one("#app-msg", AppMessage)
+
+            msg.on_mouse_move(self._move_event(meta={"offset": (0, 0)}))  # ty: ignore
+
+            assert msg.styles.pointer == "text"
+
+    async def test_hovering_blank_space_sets_default_pointer(self) -> None:
+        """A cell without rendered text uses the default pointer."""
         async with _AppMessageApp().run_test() as pilot:
             msg = pilot.app.query_one("#app-msg", AppMessage)
 
             msg.on_mouse_move(self._move_event())  # ty: ignore
 
-            assert msg.styles.pointer == "text"
+            assert msg.styles.pointer == "default"
 
     async def test_leave_resets_pointer(self) -> None:
         """Leaving the message resets the pointer after a link hover."""
@@ -4870,7 +4967,7 @@ class TestAppMessageLinkPointer:
 
             msg.on_leave()
 
-            assert msg.styles.pointer == "text"
+            assert msg.styles.pointer == "default"
 
     async def test_link_then_text_resets_pointer_without_leaving(self) -> None:
         """Moving off a link onto plain text resets the pointer without leaving.
@@ -4884,7 +4981,7 @@ class TestAppMessageLinkPointer:
             msg.on_mouse_move(self._move_event(link="https://example.com"))  # ty: ignore
             assert msg.styles.pointer == "pointer"
 
-            msg.on_mouse_move(self._move_event())  # ty: ignore
+            msg.on_mouse_move(self._move_event(meta={"offset": (0, 0)}))  # ty: ignore
 
             assert msg.styles.pointer == "text"
 
@@ -4935,6 +5032,76 @@ class TestAppMessagePointerEventDelivery:
 
             await pilot.hover("#app-msg", offset=(prefix_x, 0))
             assert msg.styles.pointer == "text"
+
+            # Past the end of the rendered line the widget is blank, so the
+            # I-beam must not follow the mouse across the rest of the row.
+            blank_x = len(_LinkedAppMessageApp.PREFIX) + len("tid-123") + 2
+            await pilot.hover("#app-msg", offset=(blank_x, 0))
+            assert msg.styles.pointer == "default"
+
+
+def _pointer_probe_app(widget: Static) -> App[None]:
+    """Wrap a message widget in a bare app so its hover shapes can be probed.
+
+    Args:
+        widget: The message widget to mount, which is given the id `msg`.
+
+    Returns:
+        An app mounting only that widget.
+    """
+    widget.id = "msg"
+
+    class _ProbeApp(App[None]):
+        def compose(self) -> ComposeResult:
+            yield widget
+
+    return _ProbeApp()
+
+
+class TestMessageWidgetsDropTextPointerOverBlankSpace:
+    """Every message widget resolves its pointer per cell, not per widget.
+
+    These widgets used to declare `pointer: text` in CSS, which Textual applies
+    across a widget's whole rectangle — so a short line showed an I-beam over
+    the empty remainder of its row. One real hover on either side of the text
+    covers each widget; the offsets account for the differing border and
+    padding declared in each widget's own `DEFAULT_CSS`.
+    """
+
+    @pytest.mark.parametrize(
+        ("widget", "text_offset", "blank_offset"),
+        [
+            pytest.param(UserMessage("hi"), (2, 0), (10, 0), id="user"),
+            pytest.param(QueuedUserMessage("hi"), (2, 0), (10, 0), id="queued"),
+            # `ErrorMessage` pads vertically, so its body sits on row 1.
+            pytest.param(ErrorMessage("hi"), (2, 1), (15, 1), id="error"),
+            pytest.param(
+                DiffMessage("--- a\n+++ b\n+hi\n", "f.py"),
+                (2, 0),
+                (16, 0),
+                id="diff",
+            ),
+            pytest.param(AppMessage("hi"), (1, 0), (10, 0), id="app"),
+            pytest.param(
+                SummarizationMessage("hi"), (2, 0), (10, 0), id="summarization"
+            ),
+        ],
+    )
+    async def test_text_pointer_stops_at_end_of_rendered_text(
+        self,
+        widget: Static,
+        text_offset: tuple[int, int],
+        blank_offset: tuple[int, int],
+    ) -> None:
+        """Rendered cells get the I-beam; the blank rest of the row does not."""
+        async with _pointer_probe_app(widget).run_test(size=(40, 24)) as pilot:
+            msg = pilot.app.query_one("#msg", Static)
+
+            await pilot.hover("#msg", offset=text_offset)
+            assert msg.styles.pointer == "text"
+
+            await pilot.hover("#msg", offset=blank_offset)
+            assert msg.styles.pointer == "default"
 
 
 class TestMountMessageIdSync:
@@ -5169,6 +5336,16 @@ class TestUserMessageCancelled:
             assert msg.has_class("-cancelled")
 
 
+def _calls(*names: str) -> list[tuple[str, dict]]:
+    """Build argument-less calls, where every call counts for itself.
+
+    With no argument naming a target, nothing can be judged a repeat, so these
+    exercise phrasing and category aggregation without target collapsing. See
+    `TestSummaryTargetCounting` for the target-aware behavior.
+    """
+    return [(name, {}) for name in names]
+
+
 class TestSummarizeToolGroup:
     """Tests for the tool-group summary phrasing."""
 
@@ -5198,13 +5375,437 @@ class TestSummarizeToolGroup:
         """The summary aggregates by category and lowercases trailing verbs."""
         from deepagents_code.tui.widgets.messages import summarize_tool_group
 
-        assert summarize_tool_group(names) == expected
+        assert summarize_tool_group(_calls(*names)) == expected
 
     def test_empty_group_has_fallback(self) -> None:
         """An empty tool list yields a generic fallback rather than crashing."""
         from deepagents_code.tui.widgets.messages import summarize_tool_group
 
         assert summarize_tool_group([]) == "Ran tools"
+
+
+class TestSummaryTargetCounting:
+    """The lead noun counts distinct targets, not calls."""
+
+    @pytest.mark.parametrize(
+        ("calls", "expected"),
+        [
+            # The bug this guards: one file read twice is one file.
+            (
+                [
+                    ("read_file", {"file_path": "a.py"}),
+                    ("read_file", {"file_path": "a.py"}),
+                ],
+                "Read 1 file",
+            ),
+            # Distinct paths are distinct work.
+            (
+                [
+                    ("read_file", {"file_path": "a.py"}),
+                    ("read_file", {"file_path": "b.py"}),
+                ],
+                "Read 2 files",
+            ),
+            # Lexically equal paths collapse; `normpath` needs no filesystem.
+            (
+                [
+                    ("read_file", {"file_path": "./a.py"}),
+                    ("read_file", {"file_path": "a.py"}),
+                ],
+                "Read 1 file",
+            ),
+            (
+                [
+                    ("read_file", {"file_path": "d//a.py"}),
+                    ("read_file", {"file_path": "d/a.py"}),
+                ],
+                "Read 1 file",
+            ),
+            # The middleware anchors relative paths at the virtual root.
+            (
+                [
+                    ("read_file", {"file_path": "a.py"}),
+                    ("read_file", {"file_path": "/a.py"}),
+                ],
+                "Read 1 file",
+            ),
+            # Different canonical paths remain distinct.
+            (
+                [
+                    ("read_file", {"file_path": "a.py"}),
+                    ("read_file", {"file_path": "/repo/a.py"}),
+                ],
+                "Read 2 files",
+            ),
+            # Same path, different category: reading then editing is two acts.
+            (
+                [
+                    ("read_file", {"file_path": "a.py"}),
+                    ("edit_file", {"file_path": "a.py"}),
+                ],
+                "Read 1 file, edited 1 file",
+            ),
+            # `path` is accepted as a fallback spelling, mirroring the tolerance
+            # `_filtered_args` already shows for either key.
+            (
+                [("read_file", {"path": "a.py"}), ("read_file", {"file_path": "a.py"})],
+                "Read 1 file",
+            ),
+            # `file_path` wins when a call carries both spellings.
+            (
+                [
+                    ("read_file", {"file_path": "a.py", "path": "b.py"}),
+                    ("read_file", {"file_path": "a.py"}),
+                ],
+                "Read 1 file",
+            ),
+            # The fallback keeps scanning past a `file_path` that is present but
+            # unusable, which is the backend shape the fallback list exists for.
+            # Stopping at the first key that appears would silently disable it.
+            (
+                [
+                    ("read_file", {"file_path": "", "path": "a.py"}),
+                    ("read_file", {"file_path": "a.py"}),
+                ],
+                "Read 1 file",
+            ),
+            (
+                [
+                    ("read_file", {"file_path": None, "path": "a.py"}),
+                    ("read_file", {"file_path": "a.py"}),
+                ],
+                "Read 1 file",
+            ),
+            # A trailing slash is not a distinct file. This is a collapse, the
+            # direction that must never be wrong, so it is pinned explicitly.
+            (
+                [
+                    ("read_file", {"file_path": "d/a.py/"}),
+                    ("read_file", {"file_path": "d/a.py"}),
+                ],
+                "Read 1 file",
+            ),
+            (
+                [
+                    ("read_file", {"file_path": "d/./a.py"}),
+                    ("read_file", {"file_path": "d/a.py"}),
+                ],
+                "Read 1 file",
+            ),
+            # URLs collapse on exact match.
+            (
+                [
+                    ("fetch_url", {"url": "http://x/y"}),
+                    ("fetch_url", {"url": "http://x/y"}),
+                ],
+                "Fetched 1 URL (2 calls)",
+            ),
+            # A URL is compared exactly, never with path rules: a server can
+            # answer each of these differently, so collapsing would undercount.
+            (
+                [
+                    ("fetch_url", {"url": "http://x/a//b"}),
+                    ("fetch_url", {"url": "http://x/a/b"}),
+                ],
+                "Fetched 2 URLs",
+            ),
+            (
+                [
+                    ("fetch_url", {"url": "http://x/a/"}),
+                    ("fetch_url", {"url": "http://x/a"}),
+                ],
+                "Fetched 2 URLs",
+            ),
+            (
+                [
+                    ("fetch_url", {"url": "http://x/a/../b"}),
+                    ("fetch_url", {"url": "http://x/b"}),
+                ],
+                "Fetched 2 URLs",
+            ),
+            # Attempt-counting categories never collapse: two runs of one
+            # command are genuinely two runs.
+            (
+                [("execute", {"command": "ls"}), ("execute", {"command": "ls"})],
+                "Ran 2 shell commands",
+            ),
+            (
+                [("grep", {"pattern": "x"}), ("grep", {"pattern": "x"})],
+                "Searched for 2 patterns",
+            ),
+            # A listing is a snapshot, not a durable object: a group spans a
+            # whole step, so an intervening write can make the second listing of
+            # one directory show something different.
+            (
+                [("ls", {"path": "/repo"}), ("ls", {"path": "/repo"})],
+                "Listed 2 directories",
+            ),
+            # `web_search` phrases its own repeats, so it never collapses either.
+            (
+                [("web_search", {"query": "x"}), ("web_search", {"query": "x"})],
+                "Searched the web 2 times",
+            ),
+            # A `..` segment disables normalization: resolving it lexically would
+            # merge `d/../a.py` with `a.py`, which differ when `d` is a symlink.
+            (
+                [
+                    ("read_file", {"file_path": "d/../a.py"}),
+                    ("read_file", {"file_path": "a.py"}),
+                ],
+                "Read 2 files",
+            ),
+            # Every mutating category reports repeats, deletes included: a group
+            # spans a step, so delete/write/delete is two real deletions.
+            (
+                [
+                    ("delete", {"file_path": "a.py"}),
+                    ("write_file", {"file_path": "a.py"}),
+                    ("delete", {"file_path": "a.py"}),
+                ],
+                "Deleted 1 file (2 deletions), wrote 1 file",
+            ),
+            # Unidentifiable targets fail open: counting each merely restores the
+            # old count, while collapsing would invent a repeat.
+            ([("read_file", {}), ("read_file", {})], "Read 2 files"),
+            (
+                [("read_file", {"file_path": ""}), ("read_file", {"file_path": None})],
+                "Read 2 files",
+            ),
+            # Empty is rejected before normalizing, which would turn it into "."
+            # and collapse two unknown paths into one.
+            (
+                [("read_file", {"file_path": ""}), ("read_file", {"file_path": ""})],
+                "Read 2 files",
+            ),
+            (
+                [("read_file", {"file_path": ""}), ("read_file", {"file_path": "."})],
+                "Read 2 files",
+            ),
+            # The middleware accepts backslashes as path separators.
+            (
+                [
+                    ("read_file", {"file_path": "a\\b"}),
+                    ("read_file", {"file_path": "a/b"}),
+                ],
+                "Read 1 file",
+            ),
+            (
+                [("read_file", {"file_path": 42}), ("read_file", {"file_path": 42})],
+                "Read 2 files",
+            ),
+        ],
+    )
+    def test_distinct_target_counting(
+        self, calls: list[tuple[str, dict]], expected: str
+    ) -> None:
+        """Repeat targets collapse; distinct and unidentifiable ones do not."""
+        from deepagents_code.tui.widgets.messages import summarize_tool_group
+
+        assert summarize_tool_group(calls) == expected
+
+    def test_repeat_detection_is_scoped_per_category(self) -> None:
+        """One category's targets never mask another's.
+
+        The tally shares a single `seen` set, so identities must be namespaced by
+        category. Without that, `b.py` is already seen from the read when the
+        second edit arrives, and the edits collapse to "edited 1 file".
+        """
+        from deepagents_code.tui.widgets.messages import summarize_tool_group
+
+        calls = [
+            ("read_file", {"file_path": "a.py"}),
+            ("read_file", {"file_path": "b.py"}),
+            ("edit_file", {"file_path": "b.py"}),
+            ("edit_file", {"file_path": "a.py"}),
+        ]
+        assert summarize_tool_group(calls) == "Read 2 files, edited 2 files"
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "a.py",
+            "/a.py",
+            r"a\b",
+            "a/b",
+            "d//a.py",
+            "./a.py",
+            "d/a.py/",
+            "d/./a.py",
+            "/repo/a.py",
+            "//a/b",
+            ".",
+        ],
+    )
+    def test_path_normalization_matches_filesystem_middleware(self, path: str) -> None:
+        r"""Summary identities use the canonical paths executed by file tools.
+
+        Compared against `validate_path` itself rather than against hand-written
+        expectations: the identity only has to be *the middleware's* canonical
+        form, so pinning the two together is what catches drift. Two spellings
+        the middleware resolves to one file must tally as one file, and only the
+        middleware decides which spellings those are.
+        """
+        from deepagents.backends.utils import validate_path
+
+        from deepagents_code.tui.widgets.messages import _normalize_path_target
+
+        assert _normalize_path_target(path) == validate_path(path)
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "d/../a.py",
+            "~",
+            "~/a.py",
+            "C:/a.py",
+            r"C:\a.py",
+        ],
+    )
+    def test_paths_the_middleware_rejects_are_left_alone(self, path: str) -> None:
+        """A path the middleware refuses is never canonicalized.
+
+        Normalizing one would fold a call that could not have run into a valid
+        target's tally. Each is returned verbatim precisely because there is no
+        canonical form to agree with. The middleware rejects more than traversal
+        — `~` and drive prefixes too — so every rejected form is covered here,
+        not just the `..` case.
+        """
+        from deepagents.backends.utils import validate_path
+
+        from deepagents_code.tui.widgets.messages import _normalize_path_target
+
+        with pytest.raises(ValueError):  # noqa: PT011
+            validate_path(path)
+        assert _normalize_path_target(path) == path
+
+    def test_rejected_path_does_not_collapse_into_its_valid_twin(self) -> None:
+        """`~` and `/~` are two different reads, so the group must say two.
+
+        Canonicalizing the rejected spelling would make both identities `/~` and
+        undercount the group — the one error this summary must never make.
+        """
+        from deepagents_code.tui.widgets.messages import summarize_tool_group
+
+        calls = [
+            ("read_file", {"file_path": "~"}),
+            ("read_file", {"file_path": "/~"}),
+        ]
+        assert summarize_tool_group(calls) == "Read 2 files"
+
+    def test_repeat_nouns_require_a_target_arg(self) -> None:
+        """A repeat noun is dead unless its category also names a target.
+
+        `calls` can only exceed `targets` for a category that has a target, so a
+        noun added without one would silently never render.
+        """
+        from deepagents_code.tui.widgets.messages import (
+            _REPEAT_COUNT_NOUNS,
+            _TOOL_SUMMARY_TARGET_ARGS,
+        )
+
+        assert _REPEAT_COUNT_NOUNS.keys() <= _TOOL_SUMMARY_TARGET_ARGS.keys()
+
+    def test_path_compared_categories_all_name_a_target(self) -> None:
+        """Path normalization is unreachable for a category with no target arg."""
+        from deepagents_code.tui.widgets.messages import (
+            _PATH_TARGET_CATEGORIES,
+            _TOOL_SUMMARY_TARGET_ARGS,
+        )
+
+        assert _TOOL_SUMMARY_TARGET_ARGS.keys() >= _PATH_TARGET_CATEGORIES
+
+    def test_category_order_follows_first_call(self) -> None:
+        """Collapsing a repeat does not disturb first-appearance ordering."""
+        from deepagents_code.tui.widgets.messages import summarize_tool_group
+
+        calls = [
+            ("execute", {"command": "ls"}),
+            ("read_file", {"file_path": "a.py"}),
+            ("read_file", {"file_path": "a.py"}),
+        ]
+        assert summarize_tool_group(calls) == "Ran 1 shell command, read 1 file"
+
+    def test_repeated_read_reports_one_file_in_both_tenses(self) -> None:
+        """The user-visible payoff: neither tense claims two files."""
+        from deepagents_code.tui.widgets.messages import summarize_tool_group
+
+        calls = [
+            ("read_file", {"file_path": "a.py"}),
+            ("read_file", {"file_path": "a.py"}),
+        ]
+        assert summarize_tool_group(calls, tense="past") == "Read 1 file"
+        assert summarize_tool_group(calls, tense="present") == "Reading 1 file"
+
+
+class TestRepeatOperationCounts:
+    """Mutations report repeat work on a target; reads collapse silently."""
+
+    @pytest.mark.parametrize(
+        ("calls", "expected"),
+        [
+            # A mutation is an event with its own diff, so three edits of one
+            # file must not read as a single edit.
+            (
+                [("edit_file", {"file_path": "a.py"})] * 3,
+                "Edited 1 file (3 edits)",
+            ),
+            # Both numbers survive when files and edits disagree.
+            (
+                [
+                    ("edit_file", {"file_path": "a.py"}),
+                    ("edit_file", {"file_path": "a.py"}),
+                    ("edit_file", {"file_path": "b.py"}),
+                ],
+                "Edited 2 files (3 edits)",
+            ),
+            # No repeats, no parenthetical.
+            (
+                [
+                    ("edit_file", {"file_path": "a.py"}),
+                    ("edit_file", {"file_path": "b.py"}),
+                ],
+                "Edited 2 files",
+            ),
+            ([("edit_file", {"file_path": "a.py"})], "Edited 1 file"),
+            (
+                [("write_file", {"file_path": "a.py"})] * 2,
+                "Wrote 1 file (2 writes)",
+            ),
+            # Reads repeat for pagination, where the count is noise.
+            ([("read_file", {"file_path": "a.py"})] * 3, "Read 1 file"),
+            # A repeated fetch of one URL is a deliberate re-request, so the
+            # call count stays visible.
+            ([("fetch_url", {"url": "http://x"})] * 2, "Fetched 1 URL (2 calls)"),
+        ],
+    )
+    def test_repeat_counts(self, calls: list[tuple[str, dict]], expected: str) -> None:
+        """Only mutating categories append the operation count."""
+        from deepagents_code.tui.widgets.messages import summarize_tool_group
+
+        assert summarize_tool_group(calls) == expected
+
+    def test_present_tense_keeps_the_parenthetical(self) -> None:
+        """An in-flight burst of edits reports both numbers too."""
+        from deepagents_code.tui.widgets.messages import summarize_tool_group
+
+        calls = [("edit_file", {"file_path": "a.py"})] * 2
+        assert (
+            summarize_tool_group(calls, tense="present") == "Editing 1 file (2 edits)"
+        )
+
+    def test_parenthetical_lowercases_in_trailing_position(self) -> None:
+        """The segment still joins correctly when it is not the lead."""
+        from deepagents_code.tui.widgets.messages import summarize_tool_group
+
+        calls = [
+            ("execute", {"command": "ls"}),
+            ("edit_file", {"file_path": "a.py"}),
+            ("edit_file", {"file_path": "a.py"}),
+        ]
+        assert (
+            summarize_tool_group(calls)
+            == "Ran 1 shell command, edited 1 file (2 edits)"
+        )
 
 
 class _ToolGroupApp(App[None]):
@@ -5264,6 +5865,29 @@ class TestToolGroupSummary:
             assert t1.display is False
             assert t2.display is False
 
+    async def test_repeated_read_of_one_file_counts_once(self) -> None:
+        """A file read twice renders as one file, not two."""
+        from deepagents_code.tui.widgets.messages import ToolGroupSummary
+
+        class _RepeatReadApp(App[None]):
+            def compose(self) -> ComposeResult:
+                t1 = ToolCallMessage("read_file", {"file_path": "a.py"})
+                t1.id = "t1"
+                t2 = ToolCallMessage("read_file", {"file_path": "a.py"})
+                t2.id = "t2"
+                summary = ToolGroupSummary(tools=[t1, t2], collapsible=[t1, t2])
+                summary.id = "summary"
+                yield summary
+                yield t1
+                yield t2
+
+        async with _RepeatReadApp().run_test() as pilot:
+            summary = pilot.app.query_one("#summary", ToolGroupSummary)
+            rendered = summary.render()
+            assert isinstance(rendered, Content)
+            assert "Read 1 file" in rendered.plain
+            assert "2 files" not in rendered.plain
+
     async def test_has_attached_members_tracks_removal(self) -> None:
         """`has_attached_members` flips to False once members are removed."""
         from deepagents_code.tui.widgets.messages import ToolGroupSummary
@@ -5285,11 +5909,13 @@ class TestSummarizeToolGroupPresentTense:
         from deepagents_code.tui.widgets.messages import summarize_tool_group
 
         assert (
-            summarize_tool_group(["execute"], tense="present")
+            summarize_tool_group(_calls("execute"), tense="present")
             == "Running 1 shell command"
         )
         assert (
-            summarize_tool_group(["read_file", "read_file", "grep"], tense="present")
+            summarize_tool_group(
+                _calls("read_file", "read_file", "grep"), tense="present"
+            )
             == "Reading 2 files, searching for 1 pattern"
         )
 
@@ -5302,7 +5928,7 @@ class TestSummarizeLiveToolGroup:
         from deepagents_code.tui.widgets.messages import summarize_live_tool_group
 
         assert (
-            summarize_live_tool_group(["execute", "execute"], ["task"])
+            summarize_live_tool_group(_calls("execute", "execute"), _calls("task"))
             == "Ran 2 shell commands, running 1 agent"
         )
 
@@ -5311,7 +5937,7 @@ class TestSummarizeLiveToolGroup:
         from deepagents_code.tui.widgets.messages import summarize_live_tool_group
 
         assert (
-            summarize_live_tool_group([], ["read_file", "read_file"])
+            summarize_live_tool_group([], _calls("read_file", "read_file"))
             == "Reading 2 files"
         )
 
@@ -5319,13 +5945,38 @@ class TestSummarizeLiveToolGroup:
         """With nothing left running the line is purely past tense."""
         from deepagents_code.tui.widgets.messages import summarize_live_tool_group
 
-        assert summarize_live_tool_group(["execute"], []) == "Ran 1 shell command"
+        assert summarize_live_tool_group(_calls("execute"), []) == "Ran 1 shell command"
 
     def test_empty_returns_blank(self) -> None:
         """No members at all yields an empty string, not a fallback phrase."""
         from deepagents_code.tui.widgets.messages import summarize_live_tool_group
 
         assert summarize_live_tool_group([], []) == ""
+
+    def test_one_target_across_the_split_counts_in_both_halves(self) -> None:
+        """A file whose second read is still running stays visible as reading.
+
+        The two halves are tallied independently on purpose: collapsing across
+        the split would drop the file from the present-tense half and the line
+        would stop reporting the step as reading at all.
+        """
+        from deepagents_code.tui.widgets.messages import summarize_live_tool_group
+
+        one_read = [("read_file", {"file_path": "a.py"})]
+        assert (
+            summarize_live_tool_group(one_read, one_read)
+            == "Read 1 file, reading 1 file"
+        )
+
+    def test_repeats_within_a_half_still_collapse(self) -> None:
+        """Independent tallies do not disable collapsing inside either half."""
+        from deepagents_code.tui.widgets.messages import summarize_live_tool_group
+
+        two_edits = [("edit_file", {"file_path": "a.py"})] * 2
+        assert (
+            summarize_live_tool_group(two_edits, two_edits)
+            == "Edited 1 file (2 edits), editing 1 file (2 edits)"
+        )
 
 
 class _LiveToolGroupApp(App[None]):
@@ -5362,8 +6013,70 @@ class _LiveToolGroupSameCategoryApp(App[None]):
         yield t2
 
 
+class _LiveToolGroupOnePathApp(App[None]):
+    """Live group whose two reads name the same file."""
+
+    def compose(self) -> ComposeResult:
+        from deepagents_code.tui.widgets.messages import ToolGroupSummary
+
+        summary = ToolGroupSummary(live=True)
+        summary.id = "summary"
+        t1 = ToolCallMessage("read_file", {"file_path": "a.py"})
+        t1.id = "t1"
+        t2 = ToolCallMessage("read_file", {"file_path": "a.py"})
+        t2.id = "t2"
+        yield summary
+        yield t1
+        yield t2
+
+
+class _LiveToolGroupTwoEditsApp(App[None]):
+    """Live group whose two edits name the same file."""
+
+    def compose(self) -> ComposeResult:
+        from deepagents_code.tui.widgets.messages import ToolGroupSummary
+
+        summary = ToolGroupSummary(live=True)
+        summary.id = "summary"
+        t1 = ToolCallMessage("edit_file", {"file_path": "a.py"})
+        t1.id = "t1"
+        t2 = ToolCallMessage("edit_file", {"file_path": "a.py"})
+        t2.id = "t2"
+        yield summary
+        yield t1
+        yield t2
+
+
 class TestLiveToolGroupSummary:
     """Eager/live group: collapsed from the start, running -> ran transition."""
+
+    async def test_live_line_reads_targets_not_just_names(self) -> None:
+        """The live path collapses repeats, and re-renders when one finishes.
+
+        Without args reaching the live render path both reads would count as two
+        files; without the target in the cache key the line would keep the stale
+        text once the first read finished.
+        """
+        from deepagents_code.tui.widgets.messages import ToolGroupSummary
+
+        async with _LiveToolGroupOnePathApp().run_test() as pilot:
+            summary = pilot.app.query_one("#summary", ToolGroupSummary)
+            first = pilot.app.query_one("#t1", ToolCallMessage)
+
+            summary.add_member(first)
+            summary.add_member(pilot.app.query_one("#t2", ToolCallMessage))
+            rendered = summary.render()
+            assert isinstance(rendered, Content)
+            assert "Reading 1 file" in rendered.plain
+            assert "2 files" not in rendered.plain
+
+            # One read finishes: the line must rebuild, counting the file in both
+            # halves so the step still reads as reading.
+            first.set_success("done")
+            summary._render_line()
+            rendered = summary.render()
+            assert isinstance(rendered, Content)
+            assert "Read 1 file, reading 1 file" in rendered.plain
 
     async def test_present_tense_while_running_then_past_on_close(self) -> None:
         from deepagents_code.tui.widgets.messages import ToolGroupSummary
@@ -5532,6 +6245,44 @@ class TestLiveToolGroupSummary:
             rendered = summary.render()
             assert isinstance(rendered, Content)
             assert "Read 1 file" in rendered.plain
+
+    async def test_evicting_a_failed_edit_shrinks_the_repeat_count(self) -> None:
+        """An edit that errored is not counted among the edits that landed.
+
+        The repeat parenthetical asserts work reached the tree, so it has to
+        shrink with the group: two edits of one file where one fails must close
+        as "Edited 1 file", never "Edited 1 file (2 edits)".
+
+        Both edits are settled and rendered first so the past-tense line is
+        cached as "(2 edits)" before the failure arrives — a late terminal
+        result is exactly the case `close` exists for. That ordering is what
+        makes the cache reset in `_evict_unfoldable` load-bearing rather than
+        defensive, so the assertion fails if the reset is dropped.
+        """
+        from deepagents_code.tui.widgets.messages import ToolGroupSummary
+
+        async with _LiveToolGroupTwoEditsApp().run_test() as pilot:
+            summary = pilot.app.query_one("#summary", ToolGroupSummary)
+            t1 = pilot.app.query_one("#t1", ToolCallMessage)
+            t2 = pilot.app.query_one("#t2", ToolCallMessage)
+
+            summary.add_member(t1)
+            summary.add_member(t2)
+            t1.set_success("ok")
+            t2.set_success("ok")
+            summary._render_line()
+            cached = summary.render()
+            assert isinstance(cached, Content)
+            assert "(2 edits)" in cached.plain
+
+            t1.set_error("boom")
+            summary.close()
+            await pilot.pause()
+
+            rendered = summary.render()
+            assert isinstance(rendered, Content)
+            assert "Edited 1 file" in rendered.plain
+            assert "2 edits" not in rendered.plain
 
     async def test_close_waits_for_pending_member_terminal_status(self) -> None:
         """A stream boundary must not report a still-pending tool as having run."""
@@ -6161,9 +6912,9 @@ class TestCaveatedRowsLeaveTheGroup:
     """A caveat is carried in the row, so folding the row hides the caveat.
 
     `write_file` and `delete` are groupable, and the collapsed summary is built
-    from tool names alone. Without eviction, deleting a 5,000-line file whose
-    contents could not be read renders as `▸ Wrote 1 file` — indistinguishable
-    from the successful case, which is the exact failure this PR set out to fix.
+    from tool names and arguments, never from tool output. Without eviction,
+    deleting a 5,000-line file whose contents could not be read renders as
+    `▸ Wrote 1 file` — indistinguishable from the successful case.
     """
 
     async def test_a_caveated_row_is_evicted_and_revealed(self) -> None:

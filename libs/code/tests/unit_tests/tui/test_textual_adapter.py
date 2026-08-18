@@ -33,6 +33,7 @@ from deepagents_code._tool_stream import (
     TOOL_OUTPUT_TRUNCATION_MARKER,
     UNRENDERABLE_TOOL_OUTPUT,
 )
+from deepagents_code._tracing import RESUME_TRACE_TAG
 from deepagents_code.approval_mode import (
     APPROVAL_MODE_NAMESPACE,
     ApprovalMode,
@@ -66,6 +67,7 @@ from deepagents_code.tui.textual_adapter import (
     _handle_interrupt_cleanup,
     _interrupt_owned_tool_rows,
     _is_auto_mode_classifier_chunk,
+    _is_renderable_auto_mode_event,
     _is_summarization_chunk,
     _read_mentioned_file,
     _session_cost_pricing_ok,
@@ -1518,6 +1520,22 @@ class TestIsAutoModeClassifierChunk:
         assert _is_auto_mode_classifier_chunk({"lc_source": "summarization"}) is False
 
 
+class TestIsRenderableAutoModeEvent:
+    """Tests for standalone Auto control-state notice filtering."""
+
+    @pytest.mark.parametrize("event", ["fallback", "warning"])
+    def test_accepts_control_state_notice(self, event: str) -> None:
+        payload = {"type": "auto_mode", "event": event, "reason": "state changed"}
+
+        assert _is_renderable_auto_mode_event(payload, is_main_agent=True) is True
+
+    @pytest.mark.parametrize("event", ["denial", "unavailable"])
+    def test_rejects_tool_outcome_event(self, event: str) -> None:
+        payload = {"type": "auto_mode", "event": event, "reason": "tool was denied"}
+
+        assert _is_renderable_auto_mode_event(payload, is_main_agent=True) is False
+
+
 class TestFormatRubricEvent:
     """Tests for rubric custom-stream event formatting."""
 
@@ -2164,12 +2182,18 @@ class TestExecuteTaskTextualAutoApproveInput:
     ) -> None:
         """Choosing "auto-approve all" mid-turn flips the resuming stream's context.
 
-        The PR's headline behavior: iteration 1 interrupts for approval, the
-        user picks `auto_approve_all`, and the per-iteration context refresh
-        re-reads `session_state.auto_approve` so iteration 2 (the resume)
-        carries `auto_approve=True`. Guards against hoisting the refresh out of
-        the stream loop (which would leave the first-iteration value frozen and
-        keep interrupting the rest of the turn).
+        Iteration 1 interrupts for approval, the user picks `auto_approve_all`,
+        and the per-iteration context refresh re-reads
+        `session_state.auto_approve` so iteration 2 (the resume) carries
+        `auto_approve=True`. Guards against hoisting the refresh out of the
+        stream loop (which would leave the first-iteration value frozen and keep
+        interrupting the rest of the turn).
+
+        Because it is the one test that really drives two stream rounds through
+        `execute_task_textual`, it also owns the TUI call site's resume-trace
+        coverage: the initial round untagged, the resume tagged, and the turn
+        grouping keys identical across both. Keep those assertions here unless
+        they move to a test that also runs two rounds.
 
         Parametrized over an async and a sync `on_auto_approve_enabled` callback
         to cover the `Awaitable[None] | None` union the adapter awaits only when
@@ -2254,6 +2278,17 @@ class TestExecuteTaskTextualAutoApproveInput:
         # Two stream iterations: the initial turn and the resume after the
         # decision. The flag must flip between them, not stay frozen.
         assert len(agent.contexts) == 2
+        initial_config, resume_config = agent.configs
+        assert RESUME_TRACE_TAG not in initial_config.get("tags", [])
+        assert RESUME_TRACE_TAG in resume_config["tags"]
+        initial_metadata = initial_config["metadata"]
+        resume_metadata = resume_config["metadata"]
+        assert initial_metadata["thread_id"] == "thread-1"
+        assert initial_metadata["turn_id"]
+        assert initial_metadata["turn_number"] == 1
+        assert resume_metadata["thread_id"] == initial_metadata["thread_id"]
+        assert resume_metadata["turn_id"] == initial_metadata["turn_id"]
+        assert resume_metadata["turn_number"] == initial_metadata["turn_number"]
         assert agent.contexts[0]["approval_mode"] == "manual"
         assert agent.contexts[1]["approval_mode"] == "auto"
         assert agent.contexts[0]["auto_approve"] is False
@@ -3153,7 +3188,12 @@ class TestExecuteTaskTextualFileOpDiffs:
         return mounted
 
     @staticmethod
-    async def _run_write(target: Path, content: str) -> list[object]:
+    async def _run_write(
+        target: Path,
+        content: str,
+        *,
+        show_diff_line_numbers: bool = True,
+    ) -> list[object]:
         """Run a tracked `write_file` and return the widgets it mounted.
 
         Returns:
@@ -3184,6 +3224,7 @@ class TestExecuteTaskTextualFileOpDiffs:
                 mount_message=mount_message,
                 update_status=_noop_status,
                 request_approval=_mock_approval,
+                show_diff_line_numbers=show_diff_line_numbers,
             ),
         )
         return mounted
@@ -3279,6 +3320,24 @@ class TestExecuteTaskTextualFileOpDiffs:
         tool = next(m for m in mounted if isinstance(m, ToolCallMessage))
         assert tool._status == "success"
         assert tool.display is True, "a write_file row was hidden behind its diff"
+
+    async def test_diff_line_number_preference_reaches_live_messages(
+        self, tmp_path: Path
+    ) -> None:
+        """The adapter carries the app preference into mounted diff messages."""
+        target = tmp_path / "a.py"
+        target.write_text("value = 2\n", encoding="utf-8")
+
+        read = _PhasedRead(pre_image=lambda _path: ("value = 1\n", None))
+        with patch("deepagents_code.file_ops._read_with_reason", side_effect=read):
+            mounted = await self._run_write(
+                target,
+                "value = 2\n",
+                show_diff_line_numbers=False,
+            )
+
+        diff = next(message for message in mounted if isinstance(message, DiffMessage))
+        assert diff._show_numbers is False
 
     async def test_a_write_file_caveat_is_kept_out_of_its_group(
         self, tmp_path: Path
