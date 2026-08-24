@@ -1070,6 +1070,15 @@ class FilesystemState(AgentState):
     """Files in the filesystem. Uses DeltaChannel with snapshots every ~50 pregel steps to bound read depth."""
 
 
+def _uses_state_backend(backend: BackendProtocol) -> bool:
+    """Return whether a backend stores any files in agent state."""
+    if isinstance(backend, StateBackend):
+        return True
+    if not isinstance(backend, CompositeBackend):
+        return False
+    return _uses_state_backend(backend.default) or any(_uses_state_backend(route) for route in backend.routes.values())
+
+
 GREP_GLOB_DESCRIPTION = (
     "Glob pattern (NOT regex) limiting which files are searched (e.g. '*.py', "
     "'*.ts'). A pattern without '/' matches the file name at any depth; a pattern "
@@ -1202,11 +1211,11 @@ class GrepSchema(BaseModel):
 class ExecuteSchema(BaseModel):
     """Input schema for the `execute` tool."""
 
-    command: str = Field(description="Command to execute in the backend-configured shell and working directory.")
+    command: str = Field(description="Shell command to execute in the sandbox environment.")
 
     timeout: int | None = Field(
         default=None,
-        description="Optional timeout in seconds for this command. Overrides the default timeout. Use 0 for no-timeout execution on backends that support it.",
+        description="Optional timeout in seconds for this command. Overrides the default timeout.",
     )
 
 
@@ -1302,14 +1311,12 @@ _EXECUTE_GLOB_SEARCH_GUIDANCE = "You MUST avoid using shell find for searches. I
 _EXECUTE_GLOB_BAD_EXAMPLE = "\n    - execute(command=\"find . -name '*.py'\")  # Use glob tool instead"
 _EXECUTE_GREP_BAD_EXAMPLE = "\n    - execute(command=\"grep -r 'pattern' .\")  # Use grep tool instead"
 
-_EXECUTE_TOOL_DESCRIPTION_TEMPLATE = """Executes a command in the backend-configured shell and working directory, returning combined stdout/stderr with the exit code (truncated if very large).
+_EXECUTE_TOOL_DESCRIPTION_TEMPLATE = """Executes a shell command in an isolated sandbox and returns combined stdout/stderr with the exit code (truncated if very large).
 
 Usage:
-- Prefer paths relative to the configured working directory.
-- Use shell-native absolute path syntax only when a relative project path is unsuitable.
-- Quote paths containing spaces with syntax supported by the configured shell.
-- Chain commands only with separators supported by the configured shell; avoid newlines except inside quoted strings.
-- Use the optional timeout to override the default (0 disables it on backends that support that).
+- Quote paths containing spaces (e.g. cd "/path/with spaces").
+- Chain commands with ';' or '&&' (use '&&' when a command depends on the previous); do not use newlines except inside quoted strings.
+- Use absolute paths and avoid `cd` so the working directory stays stable; use the optional timeout to override the default.
 - {search_guidance}Use read_file rather than cat/head/tail.{glob_bad_example}{grep_bad_example}
 
 Only available on backends implementing SandboxBackendProtocol; otherwise it returns an error."""
@@ -1645,7 +1652,7 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
         ```
     """
 
-    state_schema = FilesystemState
+    state_schema: type[FilesystemState]
 
     def __init__(
         self,
@@ -1716,6 +1723,10 @@ class FilesystemMiddleware(AgentMiddleware[FilesystemState, ContextT, ResponseT]
                 "CompositeBackend(...), or another BackendProtocol instance instead."
             )
             raise TypeError(msg)
+        self.state_schema = cast(
+            "type[FilesystemState]",
+            FilesystemState if _uses_state_backend(self.backend) else AgentState,
+        )
         if _permissions and supports_execution(self.backend) and not _all_paths_scoped_to_routes(_permissions, self.backend):
             msg = (
                 "FilesystemMiddleware does not yet support permissions with backends that "

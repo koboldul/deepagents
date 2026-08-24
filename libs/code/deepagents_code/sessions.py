@@ -1599,7 +1599,8 @@ async def list_threads_command(
             the default.
         sort_by: Sort field — `"updated"` or `"created"`.
 
-            When `None`, reads from config (`~/.deepagents/config.toml`).
+            When `None`, reads the merged managed and user config
+            (`managed_config.toml` over `~/.deepagents/config.toml`).
         branch: Only show threads from this git branch.
         cwd: Only show threads whose stored `cwd` metadata equals this path
             (exact string match — no normalization or prefix matching). When
@@ -1608,7 +1609,8 @@ async def list_threads_command(
         verbose: When `True`, show all columns (branch, created, prompt).
         relative: Show timestamps as relative time (e.g., '5m ago').
 
-            When `None`, reads from config (`~/.deepagents/config.toml`).
+            When `None`, reads the merged managed and user config
+            (`managed_config.toml` over `~/.deepagents/config.toml`).
         output_format: Output format — `'text'` (Rich) or `'json'`.
     """
     from deepagents_code.model_config import (
