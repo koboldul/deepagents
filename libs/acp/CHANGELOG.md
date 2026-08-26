@@ -2,6 +2,13 @@
 
 # Changelog
 
+## [0.0.11](https://github.com/koboldul/deepagents/compare/deepagents-acp==0.0.10...deepagents-acp==0.0.11) (2026-08-26)
+
+
+### Features
+
+* **acp:** support persistent session loading ([#5365](https://github.com/koboldul/deepagents/issues/5365)) ([aaefb1e](https://github.com/koboldul/deepagents/commit/aaefb1eea1652abf370b5ac699be8307aee979e5))
+
 ## [0.0.10](https://github.com/langchain-ai/deepagents/compare/deepagents-acp==0.0.9...deepagents-acp==0.0.10) (2026-08-12)
 
 ### Features
