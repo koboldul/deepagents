@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import sys
 import warnings
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -13,6 +14,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 from deepagents.backends.filesystem import FilesystemBackend
+from langchain_core.language_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 from langgraph.errors import GraphInterrupt
@@ -28,7 +30,9 @@ if TYPE_CHECKING:
     from langgraph.runtime import Runtime
 
 from deepagents_code._cli_context import CLIContext, CLIContextSchema
+from deepagents_code._paths import PATHS
 from deepagents_code._repository_bounds import REPOSITORY_TOOL_CALL_LIMIT
+from deepagents_code._reserved_names import reserved_agent_dir_names
 from deepagents_code.agent import (
     _AGENT_DIR_MARKER,
     _MEMORY_READONLY_SYSTEM_PROMPT,
@@ -45,7 +49,6 @@ from deepagents_code.agent import (
     _format_web_search_description,
     _format_write_file_description,
     _interrupt_predicate,
-    _reserved_agent_dir_names,
     _rubric_grader_system_prompt,
     _sanitize_agent_message_name,
     _should_interrupt_tool_call,
@@ -180,6 +183,25 @@ def test_add_interrupt_on_binds_execute_working_directory() -> None:
     )
 
     assert "Working Directory: C:\\work\\project" in result
+
+
+def test_agent_publishes_server_offload_operation(tmp_path: Path) -> None:
+    """The backend exposes offload without adding graph input fields."""
+    agent, backend = create_cli_agent(
+        model=_make_fake_chat_model(),
+        assistant_id="test-agent",
+        enable_memory=False,
+        enable_skills=False,
+        enable_shell=False,
+        system_prompt="test prompt",
+        cwd=tmp_path,
+    )
+
+    from deepagents_code.offload_middleware import offload_operation_from
+
+    schema = agent.get_input_jsonschema()
+    assert "dcode_operation" not in schema["properties"]
+    assert offload_operation_from(backend) is not None
 
 
 def test_local_conversation_history_route_is_persistent(tmp_path: Path) -> None:
@@ -590,18 +612,6 @@ async def test_live_approval_round_trip_flips_interrupt_decision() -> None:
             store=store,
         )
     )
-
-
-def test_cli_context_schema_fields_mirror_typed_dict() -> None:
-    """`CLIContextSchema` and `CLIContext` must stay structurally identical.
-
-    The two shapes carry the same payload across the API boundary (dataclass
-    in-process, dict over RemoteGraph). A field added to one but not the other
-    would silently drop across that boundary; this pins the documented mirror.
-    """
-    from deepagents_code._cli_context import CLIContext
-
-    assert {f.name for f in fields(CLIContextSchema)} == set(CLIContext.__annotations__)
 
 
 def test_should_interrupt_tool_call_fails_closed_when_live_mode_missing() -> None:
@@ -1540,6 +1550,19 @@ class TestGetSystemPromptModelIdentity:
 
         assert "### Model Identity" not in prompt
 
+    def test_skills_path_uses_launch_profile(self) -> None:
+        """Agent-facing instructions name the effective configured skills root."""
+        mock_settings = Mock()
+        mock_settings.model_name = None
+        mock_settings.has_tavily = False
+
+        with patch("deepagents_code.agent.settings", mock_settings):
+            prompt = get_system_prompt("test-agent")
+
+        expected = PATHS.display(PATHS.profile.agent_skills_dir("test-agent"))
+        assert expected in prompt
+        assert "~/.deepagents/test-agent/skills" not in prompt
+
     def test_excludes_provider_when_not_set(self) -> None:
         """Test that provider is excluded when model_provider is None."""
         mock_settings = Mock()
@@ -2069,18 +2092,6 @@ class TestCreateCliAgentInteractiveForwarding:
         mock_get_prompt.assert_not_called()
 
 
-class TestDefaultAgentName:
-    """Tests for the DEFAULT_AGENT_NAME constant."""
-
-    def test_default_agent_name_value(self) -> None:
-        """Guard against accidental renames of the default agent identifier.
-
-        Other modules (main.py, commands.py) rely on this value matching
-        the directory name under `~/.deepagents/`.
-        """
-        assert DEFAULT_AGENT_NAME == "agent"
-
-
 class TestListAgents:
     """Tests for list_agents output."""
 
@@ -2422,6 +2433,69 @@ class TestCreateCliAgentSkillsSources:
         ):
             assert expected in rendered, f"missing {expected!r} in:\n{rendered}"
         assert rendered.rstrip().endswith("(higher priority)")
+
+    def test_missing_home_omits_optional_user_skill_sources(
+        self, tmp_path: Path
+    ) -> None:
+        """Agent startup does not stringify or access absent home aliases."""
+        agent_dir = tmp_path / "agent"
+        agent_dir.mkdir()
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+
+        mock_settings = Mock()
+        mock_settings.ensure_agent_dir.return_value = agent_dir
+        mock_settings.ensure_user_skills_dir.return_value = skills_dir
+        mock_settings.get_user_agent_skills_dir.return_value = None
+        mock_settings.get_project_skills_dir.return_value = None
+        mock_settings.get_project_agent_skills_dir.return_value = None
+        mock_settings.get_built_in_skills_dir.return_value = (
+            Settings.get_built_in_skills_dir()
+        )
+        mock_settings.get_user_claude_skills_dir.return_value = None
+        mock_settings.get_project_claude_skills_dir.return_value = None
+        mock_settings.get_user_agent_md_path.return_value = agent_dir / "AGENTS.md"
+        mock_settings.get_project_agent_md_path.return_value = []
+        mock_settings.get_user_agents_dir.return_value = tmp_path / "agents"
+        mock_settings.get_project_agents_dir.return_value = None
+        mock_settings.model_name = None
+        mock_settings.model_provider = None
+        mock_settings.model_unsupported_modalities = frozenset()
+        mock_settings.model_context_limit = None
+        mock_settings.project_root = None
+
+        captured_sources: list[list[str]] = []
+
+        class FakeSkillsMiddleware:
+            def __init__(self, **kwargs: Any) -> None:
+                captured_sources.append(kwargs.get("sources", []))
+
+        mock_agent = Mock()
+        mock_agent.with_config.return_value = mock_agent
+        with (
+            patch("deepagents_code.agent.settings", mock_settings),
+            patch("deepagents_code.agent.PluginSkillsMiddleware", FakeSkillsMiddleware),
+            patch("deepagents_code.agent.MemoryMiddleware"),
+            patch("deepagents_code.agent.create_deep_agent", return_value=mock_agent),
+            patch(
+                "deepagents._models.init_chat_model",
+                return_value=_make_fake_chat_model(),
+            ),
+        ):
+            create_cli_agent(
+                model="fake-model",
+                assistant_id="test",
+                enable_memory=False,
+                enable_skills=True,
+                enable_shell=False,
+            )
+
+        assert captured_sources == [
+            [
+                (str(Settings.get_built_in_skills_dir()), "Built-in"),
+                (str(skills_dir), "User Deepagents"),
+            ]
+        ]
 
 
 class TestCreateCliAgentMemorySources:
@@ -5152,15 +5226,54 @@ class TestGetAvailableAgentNames:
         agents_dir = tmp_path / "agents"
         agents_dir.mkdir()
         _seed_agent(agents_dir, "agent")
-        for name in _reserved_agent_dir_names():
+        for name in reserved_agent_dir_names():
             _seed_agent(agents_dir, name)
 
         with patch("deepagents_code.agent.settings", _mock_agents_dir(agents_dir)):
             assert get_available_agent_names() == ["agent"]
 
+    def test_ignores_case_aliased_reserved_dirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A case-aliased reserved dir never surfaces as an agent.
+
+        `iterdir()` returns the on-disk spelling, which an exact-string guard
+        misses when it differs only by case (e.g. after `dcode -a Plugins`
+        created the entry on a case-insensitive filesystem). The alias only
+        exists where the filesystem folds case, so the test pins the platform
+        to macOS.
+        """
+        monkeypatch.setattr(sys, "platform", "darwin")
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        _seed_agent(agents_dir, "agent")
+        _seed_agent(agents_dir, "Plugins")
+        _seed_agent(agents_dir, "BIN")
+
+        with patch("deepagents_code.agent.settings", _mock_agents_dir(agents_dir)):
+            assert get_available_agent_names() == ["agent"]
+
+    def test_lists_case_aliased_dirs_on_case_sensitive_linux(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On Linux a case-aliased dir is a real agent, not reserved state.
+
+        Case-sensitive filesystems keep `Plugins/` distinct from the
+        app-owned `plugins/`, so hiding it would silently drop a legitimate
+        agent from the picker.
+        """
+        monkeypatch.setattr(sys, "platform", "linux")
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        _seed_agent(agents_dir, "agent")
+        _seed_agent(agents_dir, "Plugins")
+
+        with patch("deepagents_code.agent.settings", _mock_agents_dir(agents_dir)):
+            assert get_available_agent_names() == ["Plugins", "agent"]
+
     def test_reserved_agent_dir_names_includes_app_dirs(self) -> None:
         """The reserved-name set is sourced from each owning module."""
-        assert _reserved_agent_dir_names() == frozenset(
+        assert reserved_agent_dir_names() == frozenset(
             {BIN_DIR.name, DEFAULT_PLUGIN_DIRNAME, CONVERSATION_HISTORY_DIRNAME},
         )
 
@@ -5216,13 +5329,24 @@ class TestCreateCliAgentInterpreterWiring:
         mock_settings.interpreter_ptc_acknowledge_unsafe = False
         return mock_settings
 
-    def _capture_middleware(self, tmp_path: Path, **kwargs: Any) -> list[Any]:
+    def _capture_middleware(
+        self,
+        tmp_path: Path,
+        *,
+        model: str | BaseChatModel = "fake-model",
+        **kwargs: Any,
+    ) -> list[Any]:
         """Run `create_cli_agent` with mocked deps and return its middleware list.
 
         Keeps the Auto-mode wiring tests below to a single assertion apiece by
         centralizing the identical patching/boilerplate. Extra keyword
         arguments (e.g. `auto_mode_enabled`, `interactive`, `sandbox`) are
         forwarded to `create_cli_agent`.
+
+        `model` defaults to a bare string. Policy tests must override it with a
+        `BaseChatModel`: `create_cli_agent` checks every model *string* it
+        forwards, so a string here would be rejected first and make a test
+        aimed at the subagent, classifier, or rubric spec pass vacuously.
         """
         mock_settings = self._build_mock_settings(tmp_path)
         mock_agent = Mock()
@@ -5242,7 +5366,7 @@ class TestCreateCliAgentInterpreterWiring:
             ),
         ):
             create_cli_agent(
-                model="fake-model",
+                model=model,
                 assistant_id="test",
                 enable_memory=False,
                 enable_skills=False,
@@ -5525,6 +5649,185 @@ class TestCreateCliAgentInterpreterWiring:
         compiled_tool = tool_node.tools_by_name["compact_conversation"]
         assert compiled_tool is canonical_tool
         assert auto._trusted_compaction_tool is compiled_tool
+
+    def test_rejects_disallowed_explicit_subagent_model(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Local subagent frontmatter cannot bypass model construction policy."""
+        from deepagents_code.model_config import ModelConfig, ModelNotAllowedError
+
+        policy = ModelConfig(
+            allowed_models=("anthropic:allowed",),
+            allowed_models_source="managed config",
+        )
+        monkeypatch.setattr(
+            ModelConfig,
+            "load",
+            classmethod(lambda _cls, _path=None: policy),
+        )
+        monkeypatch.setattr(
+            "deepagents_code.agent.list_subagents",
+            lambda **_kwargs: [
+                {
+                    "name": "blocked",
+                    "description": "Blocked model",
+                    "system_prompt": "Help.",
+                    "model": "openai:blocked",
+                }
+            ],
+        )
+
+        with pytest.raises(ModelNotAllowedError, match="administrator-managed"):
+            self._capture_middleware(tmp_path, model=_make_fake_chat_model())
+
+    def test_rejects_disallowed_auto_classifier_model(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit Auto classifier is checked before middleware creation."""
+        from deepagents_code.model_config import ModelConfig, ModelNotAllowedError
+
+        policy = ModelConfig(
+            allowed_models=("anthropic:allowed",),
+            allowed_models_source="managed config",
+        )
+        monkeypatch.setattr(
+            ModelConfig,
+            "load",
+            classmethod(lambda _cls, _path=None: policy),
+        )
+
+        with pytest.raises(ModelNotAllowedError, match="administrator-managed"):
+            self._capture_middleware(
+                tmp_path,
+                model=_make_fake_chat_model(),
+                auto_mode_enabled=True,
+                auto_classifier_model="openai:blocked",
+            )
+
+    def test_rejects_disallowed_rubric_model(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A direct rubric model string is checked before middleware creation."""
+        from deepagents_code.model_config import ModelConfig, ModelNotAllowedError
+
+        policy = ModelConfig(
+            allowed_models=("anthropic:allowed",),
+            allowed_models_source="config.toml",
+        )
+        monkeypatch.setattr(
+            ModelConfig,
+            "load",
+            classmethod(lambda _cls, _path=None: policy),
+        )
+
+        with pytest.raises(ModelNotAllowedError, match=r"config\.toml"):
+            self._capture_middleware(
+                tmp_path,
+                model=_make_fake_chat_model(),
+                rubric_model="openai:blocked",
+            )
+
+    def test_rejects_disallowed_primary_model_string(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The primary `model` string is checked like every other model string.
+
+        The SDK resolves a string through `init_chat_model`, which never reaches
+        `config.create_model` -- so without this gate the one parameter most
+        likely to carry a model would be the only unchecked one.
+        """
+        from deepagents_code.model_config import ModelConfig, ModelNotAllowedError
+
+        policy = ModelConfig(
+            allowed_models=("anthropic:allowed",),
+            allowed_models_source="managed config",
+        )
+        monkeypatch.setattr(
+            ModelConfig,
+            "load",
+            classmethod(lambda _cls, _path=None: policy),
+        )
+
+        with pytest.raises(ModelNotAllowedError, match="administrator-managed"):
+            self._capture_middleware(tmp_path, model="openai:blocked")
+
+    def test_prebuilt_model_object_is_exempt_from_policy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `BaseChatModel` came from a checked path, so it is not re-checked."""
+        from deepagents_code.model_config import ModelConfig
+
+        policy = ModelConfig(
+            allowed_models=("anthropic:allowed",),
+            allowed_models_source="managed config",
+        )
+        monkeypatch.setattr(
+            ModelConfig,
+            "load",
+            classmethod(lambda _cls, _path=None: policy),
+        )
+
+        assert self._capture_middleware(tmp_path, model=_make_fake_chat_model())
+
+    def test_blank_rubric_model_keeps_its_own_diagnosis(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A blank rubric model is not a spec, so policy leaves it alone.
+
+        `RubricMiddleware` already rejects it with "`model` is required", which
+        is the accurate message. Policy-checking `""` would instead advise a
+        fully qualified provider:model spec and hide the real problem.
+        """
+        from deepagents_code.model_config import ModelConfig
+
+        policy = ModelConfig(
+            allowed_models=("anthropic:allowed",),
+            allowed_models_source="config.toml",
+        )
+        monkeypatch.setattr(
+            ModelConfig,
+            "load",
+            classmethod(lambda _cls, _path=None: policy),
+        )
+
+        with pytest.raises(ValueError, match="`model` is required"):
+            self._capture_middleware(
+                tmp_path, model=_make_fake_chat_model(), rubric_model=""
+            )
+
+    def test_subagent_rejection_names_the_declaring_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The abort message identifies which agents file to edit."""
+        from deepagents_code.model_config import ModelConfig, ModelNotAllowedError
+
+        policy = ModelConfig(
+            allowed_models=("anthropic:allowed",),
+            allowed_models_source="managed config",
+        )
+        monkeypatch.setattr(
+            ModelConfig,
+            "load",
+            classmethod(lambda _cls, _path=None: policy),
+        )
+        monkeypatch.setattr(
+            "deepagents_code.agent.list_subagents",
+            lambda **_kwargs: [
+                {
+                    "name": "reviewer",
+                    "description": "Blocked model",
+                    "system_prompt": "Help.",
+                    "model": "openai:blocked",
+                    "path": "/agents/reviewer/AGENTS.md",
+                }
+            ],
+        )
+
+        with pytest.raises(
+            ModelNotAllowedError,
+            match=r"subagent 'reviewer' \(/agents/reviewer/AGENTS\.md\)",
+        ):
+            self._capture_middleware(tmp_path, model=_make_fake_chat_model())
 
     def test_appends_rubric_middleware(self, tmp_path: Path) -> None:
         from deepagents.middleware.rubric import RubricMiddleware

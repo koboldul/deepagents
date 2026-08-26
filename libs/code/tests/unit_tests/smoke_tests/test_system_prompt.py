@@ -19,6 +19,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import Field
 
+from deepagents_code._paths import PATHS
 from deepagents_code.agent import create_cli_agent
 from deepagents_code.config import Settings
 from deepagents_code.offload import _ArtifactsStorage
@@ -212,6 +213,8 @@ def test_system_prompt_snapshot(
         built_in_skills_dir.as_posix(),
         "<built_in_skills_dir>",
     )
+    actual = actual.replace(PATHS.profile.root.as_posix(), "<deepagents_home>")
+    actual = actual.replace(str(PATHS.profile.root), "<deepagents_home>")
     actual = actual.replace("<tmp_path>\\\\", "<tmp_path>/")
     actual = actual.replace("<tmp_path>\\", "<tmp_path>/")
 

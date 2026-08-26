@@ -8,7 +8,7 @@ Regenerate this file with `make commands-catalog` after changing command names,
 aliases, descriptions, visibility, or hidden-command metadata.
 
 
-## Public (40)
+## Public (42)
 
 | Command | Aliases | Description |
 | --- | --- | --- |
@@ -19,6 +19,7 @@ aliases, descriptions, visibility, or hidden-command metadata.
 | `/changelog` |  | Open the changelog in a browser |
 | `/clear` |  | Clear the chat and start a new thread |
 | `/context` |  | Show current context window usage |
+| `/context-doctor` |  | Audit what a session injects and its estimated token cost |
 | `/copy` |  | Copy the latest assistant message to clipboard |
 | `/cost` |  | Show estimated thread cost |
 | `/docs` |  | Open the docs |
@@ -36,6 +37,7 @@ aliases, descriptions, visibility, or hidden-command metadata.
 | `/notifications` |  | Review notifications and configure warning settings |
 | `/offload` | `/compact` | Summarize and offload older messages to free context |
 | `/plugins` |  | Manage plugins |
+| `/prompts` |  | Search and reuse a previous prompt |
 | `/quit` | `/q` | Exit app |
 | `/reload` |  | Reload environment and config |
 | `/remember` |  | Save useful context to memory or skills |

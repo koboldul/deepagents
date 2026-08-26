@@ -9,7 +9,7 @@ import os
 import re
 import shutil
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, cast
 
@@ -50,7 +50,12 @@ from langchain.agents.middleware import (
     HumanInTheLoopMiddleware,
     InterruptOnConfig,
 )
-from langchain.agents.middleware.types import AgentMiddleware, ToolCallRequest
+from langchain.agents.middleware.types import (
+    AgentMiddleware,
+    ToolCallRequest,
+    TracePolicy,
+    omit_payload,
+)
 from langchain.tools import (
     BaseTool,
     ToolRuntime,  # LangChain inspects this annotation for runtime injection.
@@ -64,12 +69,14 @@ from deepagents_code._glm_5p2_profile import (
     _ensure_glm_5p2_profile_registered,
     _GlmTerminalStallRecovery,
 )
+from deepagents_code._paths import PATHS
 from deepagents_code._repository_bounds import (
     REPOSITORY_GREP_MATCH_LIMIT,
     REPOSITORY_TOOL_CALL_LIMIT,
     REPOSITORY_TOOL_NAMES,
     RepositoryBounds,
 )
+from deepagents_code._reserved_names import is_reserved_agent_dir_name
 from deepagents_code.approval_mode import (
     ApprovalMode,
     aread_approval_mode_from_store,
@@ -101,7 +108,11 @@ from deepagents_code.offload import (
     _artifacts_root,
     _offload_fallback_root,
 )
-from deepagents_code.offload_middleware import _create_cli_compaction_middleware
+from deepagents_code.offload_middleware import (
+    OffloadOperation,
+    _create_cli_compaction_middleware,
+    attach_offload_operation,
+)
 from deepagents_code.plugins.adapters.skills_middleware import PluginSkillsMiddleware
 from deepagents_code.reliable_rubric import ReliableRubricMiddleware
 from deepagents_code.subagents import list_subagents
@@ -827,6 +838,9 @@ class ShellAllowListMiddleware(AgentMiddleware):
     interrupt/resume cycle that fragments traces.
     """
 
+    trace_policy = TracePolicy(process_inputs=omit_payload)
+    """Omit hook inputs from traces by default; set a `TracePolicy` to override."""
+
     def __init__(self, allow_list: list[str]) -> None:
         """Initialize with the shell allow-list to validate commands against.
 
@@ -1177,31 +1191,6 @@ and surface that directory as a selectable agent.
 """
 
 
-@functools.lru_cache(maxsize=1)
-def _reserved_agent_dir_names() -> frozenset[str]:
-    """Return non-agent directory names reserved by the app under `~/.deepagents/`.
-
-    These directories are created by the app for its own use and must never
-    appear in the agent picker — even if they contain an `AGENTS.md` file
-    (e.g. after `dcode -a plugins` stamps the marker via memory setup):
-
-    - `bin/` holds the managed `rg` binary (`managed_tools.BIN_DIR`).
-    - `plugins/` holds installed plugin state (`plugins.store`).
-    - `conversation_history/` holds offloaded per-thread archives (`offload`).
-
-    Each name is derived from its owning module so it stays a single source of
-    truth rather than being hardcoded here. The result is cached since the
-    reserved set is constant for the process.
-    """
-    from deepagents_code.managed_tools import BIN_DIR
-    from deepagents_code.offload import CONVERSATION_HISTORY_DIRNAME
-    from deepagents_code.plugins.store import DEFAULT_PLUGIN_DIRNAME
-
-    return frozenset(
-        {BIN_DIR.name, DEFAULT_PLUGIN_DIRNAME, CONVERSATION_HISTORY_DIRNAME},
-    )
-
-
 def _is_agent_dir_entry(entry: Path) -> bool:
     """Return whether a `~/.deepagents/` entry should be listed as an agent.
 
@@ -1219,7 +1208,7 @@ def _is_agent_dir_entry(entry: Path) -> bool:
     `OSError` from `is_dir`/`is_symlink`/`is_file` propagates so callers can
     log with the failing entry's name as context.
     """
-    if entry.name.startswith(".") or entry.name in _reserved_agent_dir_names():
+    if entry.name.startswith(".") or is_reserved_agent_dir_name(entry.name):
         return False
     if entry.is_symlink() or not entry.is_dir():
         return False
@@ -1285,10 +1274,13 @@ def list_agents(*, output_format: OutputFormat = "text") -> None:
 
             write_json("list", [])
             return
+        from rich.markup import escape as escape_markup
+
+        agents_display = escape_markup(PATHS.display(agents_dir))
         console.print("[yellow]No agents found.[/yellow]")
         console.print(
-            "[dim]Agents will be created in ~/.deepagents/ "
-            "when you first use them.[/dim]",
+            f"[dim]Agents will be created in {agents_display} when you first "
+            "use them.[/dim]",
             style=theme.MUTED,
         )
         return
@@ -1558,7 +1550,7 @@ def get_system_prompt(
     prompt_dir = Path(__file__).parent
     template = (prompt_dir / "system_prompt.md").read_text(encoding="utf-8")
 
-    skills_path = f"~/.deepagents/{assistant_id}/skills"
+    skills_path = PATHS.display(PATHS.profile.agent_skills_dir(assistant_id))
 
     if interactive:
         mode_description = "an interactive TUI on the user's computer"
@@ -2052,6 +2044,9 @@ class AsyncApprovalHITLMiddleware(HumanInTheLoopMiddleware[Any, Any, Any]):
     cannot forge an autonomous mode.
     """
 
+    trace_policy = TracePolicy(process_inputs=omit_payload)
+    """Omit hook inputs from traces by default; set a `TracePolicy` to override."""
+
     # Report the stock middleware name so the SDK dedups us into the single HITL
     # slot rather than appending a second stock HITL alongside us. This pairs
     # with the explicit `interrupt_on = {}` on subagent specs in
@@ -2278,6 +2273,68 @@ def _apply_inherited_pythonpath(env: dict[str, str]) -> None:
         env["PYTHONPATH"] = inherited
 
 
+def get_skill_sources(
+    assistant_id: str = DEFAULT_AGENT_NAME,
+    project_context: ProjectContext | None = None,
+) -> list[CodeSkillSource]:
+    """Return ordered skill sources for PluginSkillsMiddleware and audit tooling.
+
+    Lowest to highest precedence:
+    built-in -> plugins -> user .deepagents -> user .agents
+    -> project .deepagents -> project .agents
+    -> user .claude (experimental) -> project .claude (experimental)
+
+    Args:
+        assistant_id: Agent identifier for user skill directories.
+        project_context: Project context for resolving project skill directories.
+
+    Returns:
+        Ordered list of CodeSkillSource entries.
+    """
+    skills_dir = settings.ensure_user_skills_dir(assistant_id)
+    user_agent_skills_dir = settings.get_user_agent_skills_dir()
+    project_skills_dir = (
+        project_context.project_skills_dir()
+        if project_context is not None
+        else settings.get_project_skills_dir()
+    )
+    project_agent_skills_dir = (
+        project_context.project_agent_skills_dir()
+        if project_context is not None
+        else settings.get_project_agent_skills_dir()
+    )
+    sources: list[CodeSkillSource] = [
+        (str(settings.get_built_in_skills_dir()), "Built-in"),
+    ]
+    try:
+        from deepagents_code.plugins import discover_plugins
+        from deepagents_code.plugins.adapters.skills import plugin_skill_sources
+
+        plugin_result = discover_plugins()
+        if plugin_result.warnings:
+            logger.warning("Plugin discovery warnings: %s", plugin_result.warnings)
+        sources.extend(plugin_skill_sources(plugin_result.plugins))
+    except Exception:
+        logger.warning("Could not discover plugin skills", exc_info=True)
+    sources.append((str(skills_dir), "User Deepagents"))
+    if user_agent_skills_dir is not None:
+        sources.append((str(user_agent_skills_dir), "User Agents"))
+    if project_skills_dir:
+        sources.append((str(project_skills_dir), "Project Deepagents"))
+    if project_agent_skills_dir:
+        sources.append((str(project_agent_skills_dir), "Project Agents"))
+
+    # Experimental: Claude Code skill directories
+    user_claude_skills_dir = settings.get_user_claude_skills_dir()
+    if user_claude_skills_dir is not None and user_claude_skills_dir.exists():
+        sources.append((str(user_claude_skills_dir), "User Claude"))
+    project_claude_skills_dir = settings.get_project_claude_skills_dir()
+    if project_claude_skills_dir:
+        sources.append((str(project_claude_skills_dir), "Project Claude"))
+
+    return sources
+
+
 def create_cli_agent(
     model: str | BaseChatModel,
     assistant_id: str,
@@ -2311,6 +2368,7 @@ def create_cli_agent(
     async_subagents: list[AsyncSubAgent] | None = None,
     goal_criteria_tools: Sequence[BaseTool | Callable[..., Any]] | None = None,
     rubric_grader_tools: Sequence[BaseTool | Callable[..., Any]] | None = None,
+    enforce_model_policy: bool = True,
 ) -> tuple[Pregel[Any, Any, Any, Any], CompositeBackend]:
     """Create a CLI-configured agent with flexible options.
 
@@ -2459,6 +2517,11 @@ def create_cli_agent(
         rubric_grader_tools: External read-only context tools available to rubric
             grading for verifying work completed in MCP-backed or web-accessible
             systems.
+        enforce_model_policy: Check every model string against `models.allowed`.
+            Pass `False` **only** from callers that compile a graph they never
+            invoke (tool enumeration), so a blocked subagent model degrades the
+            listing rather than raising. Any caller that can run the graph must
+            leave this `True`.
 
     Returns:
         2-tuple of `(agent_graph, backend)`
@@ -2473,7 +2536,13 @@ def create_cli_agent(
             non-`None` `sandbox`, when `settings.interpreter_ptc` contains
             unknown tool names, or when `interpreter_ptc="all"` is used
             without `auto_approve` or `interpreter_ptc_acknowledge_unsafe`.
-    """
+        ModelNotAllowedError: When `model`, `auto_classifier_model`,
+            `rubric_model`, or a subagent's frontmatter `model` is a string
+            outside the effective `models.allowed` policy. Model *strings* are
+            checked here because the SDK resolves them through
+            `init_chat_model`, bypassing `config.create_model`; a prebuilt
+            `BaseChatModel` came from a path that already checked.
+    """  # noqa: DOC502 - propagates from `ModelConfig.require_model_allowed`
     tools = tools or []
     mcp_tools = tuple(mcp_tools or ())
     if auto_mode_enabled and sandbox is not None:
@@ -2503,25 +2572,6 @@ def create_cli_agent(
             # Create empty file for user customizations
             # Base instructions are loaded fresh from get_system_prompt()
             agent_md.touch()
-
-    # Skills directories (if enabled)
-    skills_dir = None
-    user_agent_skills_dir = None
-    project_skills_dir = None
-    project_agent_skills_dir = None
-    if enable_skills:
-        skills_dir = settings.ensure_user_skills_dir(assistant_id)
-        user_agent_skills_dir = settings.get_user_agent_skills_dir()
-        project_skills_dir = (
-            project_context.project_skills_dir()
-            if project_context is not None
-            else settings.get_project_skills_dir()
-        )
-        project_agent_skills_dir = (
-            project_context.project_agent_skills_dir()
-            if project_context is not None
-            else settings.get_project_agent_skills_dir()
-        )
 
     # Load custom subagents from filesystem
     custom_subagents: list[SubAgent | CompiledSubAgent] = []
@@ -2611,6 +2661,33 @@ def create_cli_agent(
             )
         return middleware
 
+    from deepagents_code._cli_context import INHERIT_CLASSIFIER_MODEL
+    from deepagents_code.model_config import ModelConfig
+
+    # Every model *string* this function forwards is checked here, because the
+    # SDK resolves strings through `init_chat_model` without passing through
+    # `create_model` -- the gate in `config.create_model` never sees them. A
+    # `BaseChatModel` was already built by a checked path, so it is exempt.
+    model_policy = ModelConfig.load()
+    if not enforce_model_policy:
+        # Read-only enumeration (`dcode tools list`, `/tools`) compiles a graph
+        # with a placeholder model purely to read its bound tool node. Nothing
+        # is ever invoked, so a subagent whose frontmatter names a blocked model
+        # must not turn listing tools into a crash. Runtime construction always
+        # enforces; this flag exists only for callers that never execute.
+        model_policy = replace(
+            model_policy, allowed_models=None, allowed_models_source=None
+        )
+    if isinstance(model, str):
+        model_policy.require_model_allowed(model)
+    if (
+        isinstance(auto_classifier_model, str)
+        and auto_classifier_model.strip()
+        # The sentinel means "reuse the runtime model", which the check above
+        # already covered; it is not a spec and would never match a policy.
+        and auto_classifier_model != INHERIT_CLASSIFIER_MODEL
+    ):
+        model_policy.require_model_allowed(auto_classifier_model.strip())
     for subagent_meta in list_subagents(
         user_agents_dir=user_agents_dir,
         project_agents_dir=project_agents_dir,
@@ -2626,6 +2703,19 @@ def create_cli_agent(
             "system_prompt": subagent_meta["system_prompt"],
         }
         if model_spec:
+            # Name the declaring file: this raise aborts the whole CLI launch,
+            # and across a dozen `agents/*.md` files the model alone is not
+            # enough to find the one to edit.
+            declared_in = subagent_meta.get("path")
+            name = subagent_meta["name"]
+            model_policy.require_model_allowed(
+                model_spec,
+                context=(
+                    f"subagent {name!r} ({declared_in})"
+                    if declared_in
+                    else f"subagent {name!r}"
+                ),
+            )
             subagent["model"] = model_spec
         subagent_middleware = _subagent_cli_middleware(
             has_explicit_model=has_explicit_model,
@@ -2688,8 +2778,9 @@ def create_cli_agent(
     # `ReliableRubricMiddleware`: otherwise the grading agent's spend lands in
     # the next turn's checkpoint, or is lost on a session's final turn.
     # The CLI reads these channels back from `state_values` on thread resume.
-    # Goal tools: exposes the read-only `get_goal`/`get_rubric` tools and the
-    # constrained `update_goal` tool, and maintains goal-state notices.
+    # Goal tools: exposes the constrained write-side `update_goal` tool and
+    # maintains goal-state notices that carry the objective and acceptance
+    # criteria while they are live, so the model needs no goal/rubric read tool.
     from deepagents_code.cost_tracking import CostTrackingMiddleware
     from deepagents_code.goal_tools import GoalToolsMiddleware
     from deepagents_code.resume_state import ResumeStateMiddleware
@@ -2746,47 +2837,10 @@ def create_cli_agent(
 
     # Add skills middleware
     if enable_skills:
-        # Lowest to highest precedence:
-        # built-in -> plugins -> user .deepagents -> user .agents
-        # -> project .deepagents -> project .agents
-        # -> user .claude (experimental) -> project .claude (experimental)
-        # Plugin skills are namespaced as `{plugin_id}:{skill_name}` to avoid
-        # collisions between plugins and user/project skills.
-        sources: list[CodeSkillSource] = [
-            (str(settings.get_built_in_skills_dir()), "Built-in"),
-        ]
-        try:
-            from deepagents_code.plugins import discover_plugins
-            from deepagents_code.plugins.adapters.skills import plugin_skill_sources
-
-            plugin_result = discover_plugins()
-            if plugin_result.warnings:
-                logger.warning("Plugin discovery warnings: %s", plugin_result.warnings)
-            sources.extend(plugin_skill_sources(plugin_result.plugins))
-        except Exception:
-            logger.warning("Could not discover plugin skills", exc_info=True)
-        sources.extend(
-            [
-                (str(skills_dir), "User Deepagents"),
-                (str(user_agent_skills_dir), "User Agents"),
-            ]
+        sources = get_skill_sources(
+            assistant_id=assistant_id,
+            project_context=project_context,
         )
-        if project_skills_dir:
-            sources.append((str(project_skills_dir), "Project Deepagents"))
-        if project_agent_skills_dir:
-            sources.append((str(project_agent_skills_dir), "Project Agents"))
-
-        # Experimental: Claude Code skill directories
-        user_claude_skills_dir = settings.get_user_claude_skills_dir()
-        if user_claude_skills_dir.exists():
-            sources.append((str(user_claude_skills_dir), "User Claude"))
-        project_claude_skills_dir = settings.get_project_claude_skills_dir()
-        if project_claude_skills_dir:
-            sources.append((str(project_claude_skills_dir), "Project Claude"))
-
-        # `PluginSkillsMiddleware` namespaces plugin skills before dedup while
-        # behaving like the SDK middleware when no plugin namespaces are
-        # present, so it is safe to use for all skill sources.
         agent_middleware.append(
             PluginSkillsMiddleware(
                 backend=FilesystemBackend(virtual_mode=False),
@@ -2994,7 +3048,7 @@ def create_cli_agent(
         )
         # An explicit argument wins; otherwise the env var / `config.toml`
         # preference is read here, where agent construction already runs off the
-        # blockbuster-guarded server loop (see `server_graph._make_graph`).
+        # blockbuster-guarded server loop (see `server_graph._make_graphs`).
         classifier_model = (
             auto_classifier_model
             if auto_classifier_model is not None
@@ -3026,7 +3080,16 @@ def create_cli_agent(
     from deepagents_code.hooks.server_middleware import ServerHooksMiddleware
 
     hooks_cwd = Path(effective_cwd) if effective_cwd is not None else Path.cwd()
-    agent_middleware.append(ServerHooksMiddleware(cwd=hooks_cwd, mcp_tools=mcp_tools))
+    server_hooks_middleware = ServerHooksMiddleware(cwd=hooks_cwd, mcp_tools=mcp_tools)
+    agent_middleware.append(server_hooks_middleware)
+
+    # Publish the server operation on the backend shared with `server_graph`.
+    # The custom HTTP route owns checkpoint access and persistence, while this
+    # object retains the exact compaction and hook instances used by the agent.
+    attach_offload_operation(
+        composite_backend,
+        OffloadOperation(compaction_middleware, server_hooks_middleware),
+    )
 
     if fs_tools is not None:
         # `fs_tools` is an explicit allowlist here (`--allow-fs-tools all` and an
@@ -3165,6 +3228,15 @@ def create_cli_agent(
                 )
             )
         )
+
+    # Checked unconditionally, unlike the middleware below: a rubric model the
+    # policy blocks is a misconfiguration worth reporting at launch, not at the
+    # first invocation that happens to supply a rubric. A blank string is
+    # skipped because it is not a spec -- `RubricMiddleware` rejects it a few
+    # lines below with "`model` is required", which is the accurate diagnosis;
+    # a policy check here would instead advise a fully qualified spec.
+    if isinstance(rubric_model, str) and rubric_model.strip():
+        model_policy.require_model_allowed(rubric_model)
 
     # Rubric-driven self-evaluation. The middleware is a no-op until a
     # `rubric` is supplied on invocation state, so installing it is safe.

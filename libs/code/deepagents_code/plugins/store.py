@@ -13,6 +13,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Never
 
+from deepagents_code._constants import DEFAULT_PLUGIN_DIRNAME
 from deepagents_code.plugins.models import (
     InstalledPluginEntry,
     MarketplaceRecord,
@@ -34,13 +35,6 @@ _INSTALL_CACHE_DIGEST_LENGTH = 16
 SUPPORTED_MARKETPLACE_SOURCE_TYPES: frozenset[MarketplaceSourceType] = frozenset(
     {"directory", "file", "github", "git", "url"}
 )
-
-DEFAULT_PLUGIN_DIRNAME = "plugins"
-"""Default directory name for plugin storage under `~/.deepagents/`.
-
-Not an agent profile. The `/agent` picker reserves this name in addition to
-requiring an `AGENTS.md` marker, so it is never listed as a selectable agent.
-"""
 
 
 class PluginStateError(OSError):
