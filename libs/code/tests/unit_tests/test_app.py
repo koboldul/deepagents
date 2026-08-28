@@ -102,7 +102,7 @@ from deepagents_code.cold_cache import (
     PromptCachePolicy,
     RewarmEstimate,
 )
-from deepagents_code.config import runtime_state
+from deepagents_code.config import get_glyphs, runtime_state
 from deepagents_code.event_bus import ExternalEvent
 from deepagents_code.goal_state_limits import (
     GOAL_APPLICATION_CHAR_LIMIT,
@@ -11305,7 +11305,10 @@ class TestGoalCommand:
             await pilot.pause()
 
             rendered = "\n".join(str(w._content) for w in app.query(AppMessage))
-            assert "Grader: openai:gpt-5.1 · max iterations: 12" in rendered
+            assert (
+                f"Grader: openai:gpt-5.1 {get_glyphs().separator} max iterations: 12"
+                in rendered
+            )
 
     async def test_goal_show_grader_line_reports_defaults(self) -> None:
         """The grader line should spell out defaults when the grader is unset."""
@@ -11324,7 +11327,8 @@ class TestGoalCommand:
 
             rendered = "\n".join(str(w._content) for w in app.query(AppMessage))
             assert (
-                "Grader: openai:gpt-5.5 · max iterations: 3 (SDK default)" in rendered
+                f"Grader: openai:gpt-5.5 {get_glyphs().separator} "
+                "max iterations: 3 (SDK default)" in rendered
             )
 
     def test_grader_display_follows_per_turn_model_override(self) -> None:
@@ -27102,6 +27106,23 @@ class TestDeferredActions:
             assert len(app._pending_messages) == 1
             assert app._pending_messages[0].text == "/auto model openai:gpt-5.5-mini"
 
+    async def test_summarization_model_opens_selector_while_busy(self) -> None:
+        app = DeepAgentsApp(agent=MagicMock())
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._agent_running = True
+
+            with patch.object(
+                app,
+                "_show_summarization_model_selector",
+                new_callable=AsyncMock,
+            ) as show_selector:
+                app.post_message(ChatInput.Submitted("/summarization-model", "command"))
+                await pilot.pause()
+
+            show_selector.assert_awaited_once()
+            assert len(app._pending_messages) == 0
+
     async def test_side_effect_free_bypasses_queue(self) -> None:
         """SIDE_EFFECT_FREE commands bypass the queue."""
         app = DeepAgentsApp()
@@ -37419,7 +37440,8 @@ class TestFormatMcpServerChanges:
 
         assert _format_mcp_server_changes(previous, current) == (
             "MCP server changes:\n"
-            "  - Status changed: notion (unauthenticated → disabled)"
+            f"  - Status changed: notion (unauthenticated "
+            f"{get_glyphs().arrow_right} disabled)"
         )
 
     def test_reports_config_errors_separately_from_loaded_servers(self) -> None:
@@ -37564,7 +37586,8 @@ class TestFormatMcpServerChanges:
         current = [MCPServerInfo(name="notion", transport="http")]
 
         assert _format_mcp_server_changes(previous, current) == (
-            "MCP server changes:\n  - Reconfigured: notion (stdio → http)"
+            f"MCP server changes:\n  - Reconfigured: notion "
+            f"(stdio {get_glyphs().arrow_right} http)"
         )
 
     def test_reports_a_tool_count_change_under_an_unchanged_name(self) -> None:
@@ -37580,7 +37603,8 @@ class TestFormatMcpServerChanges:
         current = [MCPServerInfo(name="notion", transport="stdio", tools=_tools(3))]
 
         assert _format_mcp_server_changes(previous, current) == (
-            "MCP server changes:\n  - Reconfigured: notion (1 → 3 tools)"
+            f"MCP server changes:\n  - Reconfigured: notion "
+            f"(1 {get_glyphs().arrow_right} 3 tools)"
         )
 
     def test_missing_baseline_does_not_call_a_broken_server_loaded(self) -> None:
