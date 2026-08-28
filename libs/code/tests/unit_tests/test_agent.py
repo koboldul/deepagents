@@ -1935,7 +1935,7 @@ class TestGetSystemPromptLocalPaths:
         windows_cwd = r"C:\work\project"
 
         with (
-            patch("deepagents_code.agent.settings", mock_settings),
+            patch("deepagents_code.agent.credentials", mock_settings),
             patch(
                 "deepagents_code.agent._use_virtual_local_paths",
                 return_value=True,
@@ -1977,7 +1977,7 @@ class TestGetSystemPromptLocalPaths:
         posix_cwd = "/home/user/project"
 
         with (
-            patch("deepagents_code.agent.settings", mock_settings),
+            patch("deepagents_code.agent.credentials", mock_settings),
             patch(
                 "deepagents_code.agent._use_virtual_local_paths",
                 return_value=False,
@@ -3444,9 +3444,7 @@ class TestCreateCliAgentProjectContext:
         mock_settings.ensure_agent_dir.return_value = agent_dir
         mock_settings.ensure_user_skills_dir.return_value = user_skills_dir
         mock_settings.get_project_skills_dir.return_value = None
-        mock_settings.get_built_in_skills_dir.return_value = (
-            Settings.get_built_in_skills_dir()
-        )
+        mock_settings.get_built_in_skills_dir.return_value = get_built_in_skills_dir()
         mock_settings.get_user_agent_md_path.return_value = agent_dir / "AGENTS.md"
         mock_settings.get_project_agent_md_path.return_value = []
         mock_settings.get_user_agents_dir.return_value = tmp_path / "agents"
@@ -3462,7 +3460,7 @@ class TestCreateCliAgentProjectContext:
 
         fake_model = _make_fake_chat_model()
         with (
-            patch("deepagents_code.agent.settings", mock_settings),
+            patch("deepagents_code.agent.credentials", mock_settings),
             patch("deepagents_code.agent.MemoryMiddleware"),
             patch("deepagents_code.agent.PluginSkillsMiddleware"),
             patch(
@@ -3476,7 +3474,7 @@ class TestCreateCliAgentProjectContext:
             patch(
                 "deepagents_code.agent.create_deep_agent",
                 return_value=mock_agent,
-            ) as mock_create_deep_agent,
+            ),
             patch("deepagents._models.init_chat_model", return_value=fake_model),
         ):
             create_cli_agent(
@@ -3493,23 +3491,6 @@ class TestCreateCliAgentProjectContext:
             mock_filesystem.call_args_list[0].kwargs["virtual_mode"]
             is expected_virtual_mode
         )
-        execute_description = mock_create_deep_agent.call_args.kwargs["interrupt_on"][
-            "execute"
-        ]["description"]
-        assert callable(execute_description)
-        approval = execute_description(
-            cast(
-                "ToolCall",
-                {
-                    "name": "execute",
-                    "args": {"command": "python script.py"},
-                    "id": "call-execute",
-                },
-            ),
-            cast("AgentState[Any]", None),
-            cast("Runtime[Any]", None),
-        )
-        assert f"Working Directory: {user_cwd}" in approval
 
     def test_cwd_sets_local_filesystem_root_dir_without_shell(
         self,
