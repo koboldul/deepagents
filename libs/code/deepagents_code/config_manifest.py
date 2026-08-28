@@ -3,11 +3,11 @@
 This module is the single source of truth for the configuration *surface*: the
 set of options, their types, typed defaults, env-var names, and `config.toml`
 locations. The typed defaults for config-file-only options (notably the
-`[interpreter]` section) live here as module constants, and `Settings` derives
-its dataclass defaults from them — so a default is defined in exactly one place.
+`[interpreter]` section) live here as module constants, so a default is defined
+in exactly one place.
 
 Resolution runs through the shared `ConfigResolver` (see
-`configuration.resolver`): the runtime (`Settings.from_environment`) reads the
+`configuration.resolver`): the runtime (`Credentials.from_environment`) reads the
 shared process resolver and the `config` CLI command builds one from the
 generation it snapshots, so introspection can never drift from what the app
 actually reads. Resolution precedence mirrors the loaders: managed TOML beats
@@ -39,7 +39,16 @@ import os
 from dataclasses import dataclass
 from enum import Enum, StrEnum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Literal, get_args
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    NotRequired,
+    TypedDict,
+    Unpack,
+    get_args,
+    overload,
+)
 
 from typing_extensions import TypeIs
 
@@ -47,6 +56,7 @@ from deepagents_code import _env_vars
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
+    from pathlib import Path
 
     from deepagents_code.configuration.resolver import ConfigResolver, ResolvedValue
 
@@ -90,20 +100,11 @@ effectively remove it. A resolved value above the ceiling is rejected and falls
 through to the next layer / default.
 """
 
-RECURSION_LIMIT_DEFAULT = 2000
-"""Default LangGraph `recursion_limit` for the main agent.
-
-Single source of truth shared by the `runtime.recursion_limit` option, the
-`config.config` runnable-config default, and `resolve_recursion_limit`. Raised
-above the LangGraph/SDK default (`25`) to accommodate deeply nested agent graphs
-in long-running sessions without hitting `GRAPH_RECURSION_LIMIT`.
-"""
-
 RECURSION_LIMIT_FLOOR = 25
-"""Smallest accepted `recursion_limit`; matches the LangGraph default ceiling.
+"""Smallest `recursion_limit` accepted from managed config, the env var, or TOML.
 
-A value below this would break otherwise-valid runs, so a resolved value under
-the floor is rejected and falls through to the next layer / default.
+Lower values are rejected and resolution falls through to the next layer. The
+`--recursion-limit` flag is exempt and accepts any value `>= 1`.
 """
 
 RECURSION_LIMIT_CEILING = 100_000
@@ -113,6 +114,9 @@ Bounds the graph step budget so a mistyped or hostile override cannot request
 effectively unbounded traversal. A resolved value above the ceiling is rejected
 and falls through to the next layer / default.
 """
+
+_LANGGRAPH_DEFAULT_RECURSION_LIMIT_ENV = "LANGGRAPH_DEFAULT_RECURSION_LIMIT"
+"""Upstream recursion default inherited when no Deep Agents override wins."""
 
 COMPACT_ON_RESUME_THRESHOLD_DEFAULT = 400_000
 """Context size above which a resumed thread is offered compaction.
@@ -157,7 +161,7 @@ class OptionKind(Enum):
     `BOOL_MODE_DEFAULT`, `BOOL_PRESENCE`, `INT`, `NON_NEGATIVE_INT`, `FLOAT`,
     `STR`, and `NON_EMPTY_STR`) are coerced by the source providers;
     `option_accepts_toml` is the public seam over that same coercion.
-    `LOG_LEVEL_DELEGATE`, `SHELL_LIST_DELEGATE`,
+    `LOG_LEVEL_DELEGATE`, `SHELL_LIST_DELEGATE`, `EXTENSION_TRUST_DELEGATE`,
     `SKILLS_DIRS_DELEGATE`, `PTC_DELEGATE`, and `STARTUP_MODE_DELEGATE` defer to
     bespoke parsers (their semantics — dynamic debug fallback, colon-split Path
     resolution, comma + `recommended`/`all` sentinels, and the PTC/startup-mode
@@ -195,6 +199,9 @@ class OptionKind(Enum):
 
     MODEL_LIST_DELEGATE = "model_list"
     """Validates a list of `provider:model` specs and `provider:*` wildcards."""
+
+    EXTENSION_TRUST_DELEGATE = "extension_trust"
+    """Validates the `ask`, `always`, and `never` extension trust policies."""
 
     LOG_LEVEL_DELEGATE = "log_level"
     """Validates log levels and resolves the default from debug mode."""
@@ -239,6 +246,7 @@ _KIND_TYPE_LABEL: dict[OptionKind, str] = {
     OptionKind.STR: "str",
     OptionKind.NON_EMPTY_STR: "non-empty str",
     OptionKind.MODEL_LIST_DELEGATE: "list[provider:model]",
+    OptionKind.EXTENSION_TRUST_DELEGATE: "str",
     OptionKind.LOG_LEVEL_DELEGATE: "str",
     OptionKind.SHELL_LIST_DELEGATE: "list[str]",
     OptionKind.SKILLS_DIRS_DELEGATE: "list[path]",
@@ -266,7 +274,11 @@ _KIND_DEFAULT_TYPES: dict[OptionKind, tuple[type, ...]] = {
     OptionKind.BOOL_PRESENCE: (bool,),
     OptionKind.INT: (int,),
     OptionKind.NON_NEGATIVE_INT: (int,),
-    OptionKind.FLOAT: (int, float),
+    # An int default would be returned verbatim by the default provider even
+    # though the overloads promise ConfigOption[float] and resolution-time
+    # readers (e.g. `_is_valid_auto_classifier_timeout`) reject bare ints, so
+    # accept float only.
+    OptionKind.FLOAT: (float,),
     OptionKind.STR: (str,),
     OptionKind.NON_EMPTY_STR: (str,),
     OptionKind.CURSOR_STYLE_DELEGATE: (str,),
@@ -323,9 +335,68 @@ class CliSpec:
         return self.dest or self.flag.removeprefix("--").replace("-", "_")
 
 
+# --- Constructor typing ------------------------------------------------------
+# `ConfigOption[T]` binds `T` to the value a caller gets back from
+# `ConfigResolver.get`. `T` cannot be inferred from `default` alone: an option
+# with no default would infer nothing, and a literal default infers `Literal[5]`
+# rather than `int`. So the mapping from `kind` to value type -- the same
+# mapping `_KIND_DEFAULT_TYPES` enforces at runtime -- is spelled once as
+# `__new__` overloads below. Manifest entries stay plain `ConfigOption(...)`
+# literals and pick up their `T` from the `kind` they already declare.
+
+
+class _CommonFields(TypedDict):
+    """Every `ConfigOption` field except `kind` and `default`.
+
+    The overloads discriminate on `kind`/`default` and forward the rest
+    unchanged, so this exists only to keep the other fields spelled once.
+    """
+
+    key: str
+    group: str
+    summary: str
+    env_var: NotRequired[str | None]
+    fallback_env_vars: NotRequired[tuple[str, ...]]
+    toml_keys: NotRequired[tuple[str, ...] | None]
+    invert_toml_bool: NotRequired[bool]
+    cli_flag: NotRequired[str | None]
+    cli: NotRequired[CliSpec | None]
+    redacted: NotRequired[bool]
+    settings_field: NotRequired[str | None]
+    dependency_module: NotRequired[str | None]
+    install_extra: NotRequired[str | None]
+    provider: NotRequired[str | None]
+    empty_env_is_false: NotRequired[bool]
+    merge_strategy: NotRequired[MergeStrategy]
+
+
+type _IntKind = Literal[OptionKind.INT, OptionKind.NON_NEGATIVE_INT]
+type _BoolKind = Literal[OptionKind.BOOL, OptionKind.BOOL_PRESENCE]
+type _StrKind = Literal[
+    OptionKind.STR,
+    OptionKind.NON_EMPTY_STR,
+    OptionKind.CURSOR_STYLE_DELEGATE,
+    OptionKind.EXTENSION_TRUST_DELEGATE,
+    OptionKind.STARTUP_MODE_DELEGATE,
+]
+# Kinds whose default is synthesized by `ranked_default_value` rather than
+# declared: resolution always yields a value, so `T` is not optional.
+type _SynthesizedStrKind = Literal[
+    OptionKind.LOG_LEVEL_DELEGATE, OptionKind.THEME_DELEGATE
+]
+
+
 @dataclass(frozen=True)
-class ConfigOption:
-    """One user-tunable configuration option and where it can be set."""
+class ConfigOption[T]:
+    """One user-tunable configuration option and where it can be set.
+
+    `T` is the type `ConfigResolver.get` yields for this option. It is not
+    supplied by hand: the `__new__` overloads below derive it from `kind`, so a
+    manifest entry is a plain `ConfigOption(...)` literal and its value type
+    follows from the `kind` it already declares. `T` includes `None` exactly
+    when resolution can produce `None` -- an option with no declared default
+    whose kind does not synthesize one.
+    """
 
     key: str
     """Canonical dotted identifier used by `config get`.
@@ -342,8 +413,15 @@ class ConfigOption:
     kind: OptionKind
     """How env/TOML values are coerced to a typed value."""
 
-    default: Any = None
-    """Typed default value, or `None` when there is no static default."""
+    default: T | None = None
+    """Typed default value, or `None` when there is no static default.
+
+    Declaring one is what removes `None` from `T`: `_resolve` falls back to
+    this field when no provider supplies a value, so an option without a
+    default resolves to `None` and its `T` says so. The `__new__` overloads
+    encode that, and `__post_init__` re-checks the value against `kind` for
+    options built dynamically.
+    """
 
     env_var: str | None = None
     """Primary environment variable name the loader reads, or `None`.
@@ -381,12 +459,6 @@ class ConfigOption:
     logging heuristic when written to stdout.
     """
 
-    settings_field: str | None = None
-    """Name of the `Settings` attribute this option backs, or `None`.
-
-    `None` means the option is read elsewhere inline or is descriptive.
-    """
-
     dependency_module: str | None = None
     """Import module required to use the option, or `None`.
 
@@ -412,13 +484,138 @@ class ConfigOption:
     merge_strategy: MergeStrategy = MergeStrategy.REPLACE
     """How provider values compose after each tier has coerced its own input."""
 
+    # Each kind group gets a pair of overloads: one for a declared default
+    # (`T` is the value type) and one for none (`T` gains `| None`, because
+    # `_resolve` falls back to `default`). Spelling `default: None = None`
+    # explicitly in the second of each pair is load-bearing -- omitting it lets
+    # a wrong-typed default match the no-default overload instead of failing.
+    # Kinds whose default is synthesized, and delegate kinds that forbid a
+    # declared default, get a single overload each.
+
+    @overload
+    def __new__(
+        cls, *, kind: _IntKind, default: int, **rest: Unpack[_CommonFields]
+    ) -> ConfigOption[int]: ...
+    @overload
+    def __new__(
+        cls, *, kind: _IntKind, default: None = None, **rest: Unpack[_CommonFields]
+    ) -> ConfigOption[int | None]: ...
+    @overload
+    def __new__(
+        cls, *, kind: _BoolKind, default: bool, **rest: Unpack[_CommonFields]
+    ) -> ConfigOption[bool]: ...
+    @overload
+    def __new__(
+        cls, *, kind: _BoolKind, default: None = None, **rest: Unpack[_CommonFields]
+    ) -> ConfigOption[bool | None]: ...
+    @overload
+    def __new__(
+        cls,
+        *,
+        kind: Literal[OptionKind.FLOAT],
+        default: float,
+        **rest: Unpack[_CommonFields],
+    ) -> ConfigOption[float]: ...
+    @overload
+    def __new__(
+        cls,
+        *,
+        kind: Literal[OptionKind.FLOAT],
+        default: None = None,
+        **rest: Unpack[_CommonFields],
+    ) -> ConfigOption[float | None]: ...
+    @overload
+    def __new__(
+        cls, *, kind: _StrKind, default: str, **rest: Unpack[_CommonFields]
+    ) -> ConfigOption[str]: ...
+    @overload
+    def __new__(
+        cls, *, kind: _StrKind, default: None = None, **rest: Unpack[_CommonFields]
+    ) -> ConfigOption[str | None]: ...
+    @overload
+    def __new__(
+        cls,
+        *,
+        kind: Literal[OptionKind.BOOL_MODE_DEFAULT],
+        default: None = None,
+        **rest: Unpack[_CommonFields],
+    ) -> ConfigOption[bool]: ...
+    @overload
+    def __new__(
+        cls,
+        *,
+        kind: _SynthesizedStrKind,
+        default: None = None,
+        **rest: Unpack[_CommonFields],
+    ) -> ConfigOption[str]: ...
+    @overload
+    def __new__(
+        cls,
+        *,
+        kind: Literal[OptionKind.MODEL_LIST_DELEGATE],
+        default: None = None,
+        **rest: Unpack[_CommonFields],
+    ) -> ConfigOption[tuple[str, ...] | None]: ...
+    @overload
+    def __new__(
+        cls,
+        *,
+        kind: Literal[OptionKind.SHELL_LIST_DELEGATE],
+        default: None = None,
+        **rest: Unpack[_CommonFields],
+    ) -> ConfigOption[list[str] | None]: ...
+    @overload
+    def __new__(
+        cls,
+        *,
+        kind: Literal[OptionKind.SKILLS_DIRS_DELEGATE],
+        default: None = None,
+        **rest: Unpack[_CommonFields],
+    ) -> ConfigOption[list[Path] | None]: ...
+    # `list[str]` stays in the resolved value type but not in `default`:
+    # `__post_init__` rejects mutable defaults, so a list default would type-check
+    # here yet raise TypeError at construction.
+    @overload
+    def __new__(
+        cls,
+        *,
+        kind: Literal[OptionKind.PTC_DELEGATE],
+        default: str | bool,
+        **rest: Unpack[_CommonFields],
+    ) -> ConfigOption[str | bool | list[str]]: ...
+    @overload
+    def __new__(
+        cls,
+        *,
+        kind: Literal[OptionKind.PTC_DELEGATE],
+        default: None = None,
+        **rest: Unpack[_CommonFields],
+    ) -> ConfigOption[str | bool | list[str] | None]: ...
+    @overload
+    def __new__(
+        cls,
+        *,
+        kind: Literal[OptionKind.STRUCTURED],
+        default: None = None,
+        **rest: Unpack[_CommonFields],
+    ) -> ConfigOption[Mapping[str, Any] | list[Any] | None]: ...
+
+    def __new__(cls, **kwargs: object) -> ConfigOption[Any]:
+        """Construct an option whose `T` the overloads derived from `kind`.
+
+        Returns:
+            A new, uninitialized instance; the dataclass `__init__` fills it.
+        """
+        del kwargs
+        return super().__new__(cls)
+
     def __post_init__(self) -> None:
         """Reject a `default` that contradicts `kind` at construction time.
 
         The manifest is a hand-edited literal table with `default: Any`, so a
         mistyped default (an `INT` option defaulting to a `str`) or a mutable
         one would otherwise slip through to runtime — a wrong-typed default
-        feeds `Settings` unchecked, and a mutable default is shared by reference
+        feeds consumers unchecked, and a mutable default is shared by reference
         through the `get_config_options` `lru_cache` and returned verbatim by
         the resolver's default provider. Catching it here fails the import (and
         the test suite).
@@ -495,10 +692,18 @@ class ConfigOption:
                 f"{self.kind.value}"
             )
             raise TypeError(msg)
-        if self.kind is OptionKind.NON_NEGATIVE_INT and default < 0:
+        if (
+            self.kind is OptionKind.NON_NEGATIVE_INT
+            and isinstance(default, int)
+            and default < 0
+        ):
             msg = f"{self.key}: default {default!r} must be >= 0"
             raise TypeError(msg)
-        if self.kind is OptionKind.NON_EMPTY_STR and not default.strip():
+        if (
+            self.kind is OptionKind.NON_EMPTY_STR
+            and isinstance(default, str)
+            and not default.strip()
+        ):
             msg = f"{self.key}: default must not be blank"
             raise TypeError(msg)
 
@@ -616,7 +821,7 @@ def reset_source_diagnostics() -> None:
 
 
 def _coerce_toml(
-    option: ConfigOption, raw: object, *, source: str = "config.toml"
+    option: ConfigOption[object], raw: object, *, source: str = "config.toml"
 ) -> object:
     """Delegate TOML coercion to the provider boundary.
 
@@ -704,7 +909,7 @@ def _resolver_for_option_sources(
 
 
 def _resolve_option(
-    option: ConfigOption,
+    option: ConfigOption[object],
     *,
     toml_data: dict[str, Any] | None = None,
     managed_toml_data: dict[str, Any] | None = None,
@@ -726,7 +931,7 @@ def _resolve_option(
 
 
 def _resolve_option_without_managed(
-    option: ConfigOption,
+    option: ConfigOption[object],
     *,
     toml_data: dict[str, Any] | None,
 ) -> ResolvedValue[object]:
@@ -778,7 +983,7 @@ def _ranked_source(resolved: ResolvedValue[object]) -> str:
 
 
 def _warn_cli_flag_masked(
-    option: ConfigOption, resolved: ResolvedValue[object], cli_value: object
+    option: ConfigOption[object], resolved: ResolvedValue[object], cli_value: object
 ) -> None:
     """Tell the user a flag they passed lost to a stronger config tier.
 
@@ -802,7 +1007,7 @@ def _warn_cli_flag_masked(
     )
 
 
-def _cli_supplied_flag(option: ConfigOption, cli_value: object) -> str:
+def _cli_supplied_flag(option: ConfigOption[object], cli_value: object) -> str:
     """Return the single flag that produced `cli_value`.
 
     An option bound to several flags derives its value from the flag spelling
@@ -827,7 +1032,7 @@ def _cli_supplied_flag(option: ConfigOption, cli_value: object) -> str:
     return spec.flag
 
 
-def _cli_display_flags(option: ConfigOption) -> str:
+def _cli_display_flags(option: ConfigOption[object]) -> str:
     """Return the flag spelling to show the user for this option.
 
     Returns:
@@ -836,7 +1041,7 @@ def _cli_display_flags(option: ConfigOption) -> str:
     return option.cli.display_flags if option.cli else option.cli_flag or option.key
 
 
-def _warn_cli_value_rejected(option: ConfigOption, reason: str) -> None:
+def _warn_cli_value_rejected(option: ConfigOption[object], reason: str) -> None:
     """Tell the user the value they passed on a flag was rejected.
 
     A rejected CLI value falls through to the next tier, so without this the
@@ -898,7 +1103,7 @@ def _print_cli_warning(warning_key: tuple[str, str], message: str) -> None:
 
 
 def _emit_ranked_diagnostics(
-    option: ConfigOption,
+    option: ConfigOption[object],
     resolved: ResolvedValue[object],
     *,
     warn_masked_cli: bool = True,
@@ -1523,7 +1728,7 @@ def resolve_startup_mode_with_source(
 
 
 def option_accepts_toml(
-    option: ConfigOption, value: object, *, source: str = "config.toml"
+    option: ConfigOption[object], value: object, *, source: str = "config.toml"
 ) -> bool:
     """Return whether `value` has the type `option` declares for TOML.
 
@@ -1542,7 +1747,11 @@ def option_accepts_toml(
 
 
 def is_valid_recursion_limit(value: object) -> TypeIs[int]:
-    """Return whether `value` is an accepted main-agent `recursion_limit`.
+    """Return whether `value` is in bounds for a managed, env, or TOML tier.
+
+    The `--recursion-limit` flag does not go through this predicate: it uses the
+    looser `_is_valid_cli_recursion_limit` (`>= 1`), so a CLI value this function
+    rejects is still honored.
 
     Narrows so callers need no `cast`. `bool` is rejected at runtime but is a
     subclass of `int`, so the negative branch is not narrowed for it -- no
@@ -1560,18 +1769,25 @@ def _is_valid_cli_recursion_limit(value: object) -> TypeIs[int]:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
+def _inherited_langgraph_recursion_limit() -> int | None:
+    """Return LangGraph's environment default when one is configured."""
+    raw = os.environ.get(_LANGGRAPH_DEFAULT_RECURSION_LIMIT_ENV)
+    return int(raw) if raw is not None else None
+
+
 def resolve_recursion_limit(
     *,
     toml_data: dict[str, Any] | None = None,
     managed_toml_data: dict[str, Any] | None = None,
-) -> int:
+) -> int | None:
     """Resolve the effective main-agent `recursion_limit`.
 
     Resolves `runtime.recursion_limit` through the standard managed → CLI → env →
-    `config.toml` → default precedence. Explicit CLI values retain the
-    documented `>= 1` contract. Other out-of-range values (below
-    `RECURSION_LIMIT_FLOOR` or above `RECURSION_LIMIT_CEILING`) are discarded
-    with a logged warning and the next lower-precedence layer is tried.
+    `config.toml` precedence, then inherits LangGraph's environment default when
+    no Deep Agents override wins. Explicit CLI values retain the documented
+    `>= 1` contract. Other out-of-range values (below `RECURSION_LIMIT_FLOOR` or
+    above `RECURSION_LIMIT_CEILING`) are discarded with a logged warning and the
+    next lower-precedence layer is tried.
 
     Managed values remain subject to the launch-time managed-health gate.
 
@@ -1582,14 +1798,14 @@ def resolve_recursion_limit(
             described in `_resolve_option`.
 
     Returns:
-        The resolved recursion limit. CLI values are positive; values from all
-            other tiers are within
-            `[RECURSION_LIMIT_FLOOR, RECURSION_LIMIT_CEILING]`.
+        The resolved recursion limit, or `None` when nothing valid is configured.
+            CLI values are `>= 1`; Deep Agents managed, env, and TOML values are
+            within `[RECURSION_LIMIT_FLOOR, RECURSION_LIMIT_CEILING]`.
     """
     data = toml_data
     option = get_option("runtime.recursion_limit")
     if option is None:
-        return RECURSION_LIMIT_DEFAULT
+        return None
 
     resolver = _resolver_for_option_sources(
         toml_data=data,
@@ -1629,15 +1845,6 @@ def resolve_recursion_limit(
         )
         excluded.update(rejected_ranks)
 
-    if settled is None and source != "default":
-        logger.warning(
-            "Ignoring %s recursion_limit %r (expected int in [%d, %d]); using %d",
-            source,
-            value,
-            RECURSION_LIMIT_FLOOR,
-            RECURSION_LIMIT_CEILING,
-            RECURSION_LIMIT_DEFAULT,
-        )
     # Emitted once the loop settles, against the first resolution: only now is
     # it known whether the flag actually lost. `resolved` here is the winning
     # tier, so the masked CLI entry is not on it -- the first resolution is the
@@ -1648,7 +1855,9 @@ def resolve_recursion_limit(
         and CLI_RANK in first_resolved.masked_ranks
     ):
         _emit_ranked_diagnostics(option, first_resolved)
-    return RECURSION_LIMIT_DEFAULT if settled is None else settled
+    if settled is not None:
+        return settled
+    return _inherited_langgraph_recursion_limit()
 
 
 # --- Option definitions -----------------------------------------------------
@@ -1765,24 +1974,13 @@ def is_provider_package_installed(provider: str) -> bool:
         return False
 
 
-# Credentials that back a `Settings` field, keyed by canonical env var.
-_CREDENTIAL_SETTINGS_FIELD: dict[str, str] = {
-    "OPENAI_API_KEY": "openai_api_key",
-    "ANTHROPIC_API_KEY": "anthropic_api_key",
-    "GOOGLE_API_KEY": "google_api_key",
-    "NVIDIA_API_KEY": "nvidia_api_key",
-    "TAVILY_API_KEY": "tavily_api_key",
-    "GOOGLE_CLOUD_PROJECT": "google_cloud_project",
-}
-
-
 def _is_secret_env(name: str) -> bool:
     """Return whether a credential env var name carries secret material."""
     upper = name.upper()
     return any(marker in upper for marker in _SECRET_NAME_MARKERS)
 
 
-def _credential_options() -> tuple[ConfigOption, ...]:
+def _credential_options() -> tuple[ConfigOption[object], ...]:
     """Build credential options from the canonical provider/key registries.
 
     Generating these from `PROVIDER_API_KEY_ENV` (rather than hand-listing
@@ -1795,7 +1993,7 @@ def _credential_options() -> tuple[ConfigOption, ...]:
     """
     from deepagents_code.model_config import PROVIDER_API_KEY_ENV
 
-    options: list[ConfigOption] = []
+    options: list[ConfigOption[object]] = []
     sources = {**PROVIDER_API_KEY_ENV, **_EXTRA_CREDENTIAL_ENV}
     for name, env_var in sorted(sources.items()):
         redacted = _is_secret_env(env_var)
@@ -1814,7 +2012,6 @@ def _credential_options() -> tuple[ConfigOption, ...]:
                 env_var=env_var,
                 redacted=redacted,
                 provider=name,
-                settings_field=_CREDENTIAL_SETTINGS_FIELD.get(env_var),
                 dependency_module=dependency[0] if dependency else None,
                 install_extra=dependency[1] if dependency else None,
             )
@@ -1825,7 +2022,7 @@ def _credential_options() -> tuple[ConfigOption, ...]:
 # Options with a static (non-credential) definition, grouped by domain. The
 # drift test asserts every `DEEPAGENTS_CODE_*` constant in `_env_vars` appears
 # here (or in `NON_OPTION_ENV_VARS`).
-_STATIC_OPTIONS: tuple[ConfigOption, ...] = (
+_STATIC_OPTIONS: tuple[ConfigOption[object], ...] = (
     # --- Credentials ----------------------------------------------------
     ConfigOption(
         key="credentials.google_cloud_location",
@@ -1833,7 +2030,6 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         summary="Google Cloud region for Anthropic models on Vertex AI.",
         kind=OptionKind.NON_EMPTY_STR,
         env_var="GOOGLE_CLOUD_LOCATION",
-        settings_field="google_cloud_location",
     ),
     # --- Display / UI ---------------------------------------------------
     ConfigOption(
@@ -1959,6 +2155,17 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         kind=OptionKind.BOOL,
         default=True,
         toml_keys=("ui", "show_diff_line_numbers"),
+    ),
+    ConfigOption(
+        key="display.show_reasoning",
+        group="Display",
+        summary="Show provider-visible reasoning in local output (off by default).",
+        kind=OptionKind.BOOL,
+        default=False,
+        env_var=_env_vars.SHOW_REASONING,
+        toml_keys=("ui", "show_reasoning"),
+        cli_flag="--show-reasoning",
+        cli=CliSpec("--show-reasoning"),
     ),
     ConfigOption(
         key="display.show_scrollbar",
@@ -2087,6 +2294,18 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         toml_keys=("models", "recent"),
     ),
     ConfigOption(
+        key="models.summarization_default",
+        group="Models",
+        summary=(
+            "Default model spec ('provider:model') used for context-compaction "
+            "summaries; unset reuses the main agent model."
+        ),
+        kind=OptionKind.STR,
+        toml_keys=("models", "summarization_default"),
+        cli_flag="--summarization-model",
+        cli=CliSpec("--summarization-model"),
+    ),
+    ConfigOption(
         key="models.auto_classifier",
         group="Models",
         summary=(
@@ -2131,8 +2350,8 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         key="retries.max_retries",
         group="Models",
         summary=(
-            "Default provider retry count; override per provider with "
-            "`[retries.<provider>]`."
+            "Retries after a failed model request; `0` disables them. Override "
+            "per provider with `[retries.<provider>]`."
         ),
         kind=OptionKind.NON_NEGATIVE_INT,
         toml_keys=("retries", "max_retries"),
@@ -2204,7 +2423,6 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         default=LANGSMITH_PROJECT_DEFAULT,
         env_var=_env_vars.LANGSMITH_PROJECT,
         fallback_env_vars=("LANGSMITH_PROJECT",),
-        settings_field="deepagents_langchain_project",
     ),
     ConfigOption(
         key="tracing.langsmith_redact",
@@ -2246,7 +2464,6 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         toml_keys=("shell", "allow_list"),
         cli_flag="--shell-allow-list",
         cli=CliSpec("--shell-allow-list"),
-        settings_field="shell_allow_list",
     ),
     ConfigOption(
         key="skills.extra_allowed_dirs",
@@ -2258,7 +2475,6 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         kind=OptionKind.SKILLS_DIRS_DELEGATE,
         env_var=_env_vars.EXTRA_SKILLS_DIRS,
         toml_keys=("skills", "extra_allowed_dirs"),
-        settings_field="extra_skills_dirs",
     ),
     ConfigOption(
         key="models.ollama_discovery",
@@ -2330,6 +2546,32 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         kind=OptionKind.STR,
         env_var=_env_vars.EXTERNAL_EVENT_SOCKET_PATH,
     ),
+    # --- Extensions -----------------------------------------------------
+    ConfigOption(
+        key="extensions.enabled",
+        group="Extensions",
+        summary="Enable loading Python extensions.",
+        kind=OptionKind.BOOL,
+        default=True,
+        env_var=_env_vars.EXTENSIONS,
+        toml_keys=("extensions", "enabled"),
+    ),
+    ConfigOption(
+        key="extensions.trust",
+        group="Extensions",
+        summary="Default project extension trust policy.",
+        kind=OptionKind.EXTENSION_TRUST_DELEGATE,
+        default="ask",
+        env_var=_env_vars.EXTENSIONS_TRUST,
+        toml_keys=("extensions", "trust"),
+    ),
+    ConfigOption(
+        key="extensions.extra_paths",
+        group="Extensions",
+        summary="Additional user-authorized Python extension files or directories.",
+        kind=OptionKind.STRUCTURED,
+        toml_keys=("extensions", "extra_paths"),
+    ),
     # --- Goals ----------------------------------------------------------
     ConfigOption(
         key="goals.auto_accept_criteria",
@@ -2350,7 +2592,6 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         toml_keys=("interpreter", "enable_interpreter"),
         cli_flag="--interpreter",
         cli=CliSpec("--interpreter"),
-        settings_field="enable_interpreter",
     ),
     ConfigOption(
         key="interpreter.timeout_seconds",
@@ -2359,7 +2600,6 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         kind=OptionKind.FLOAT,
         default=INTERPRETER_TIMEOUT_SECONDS_DEFAULT,
         toml_keys=("interpreter", "timeout_seconds"),
-        settings_field="interpreter_timeout_seconds",
     ),
     ConfigOption(
         key="interpreter.memory_limit_mb",
@@ -2368,7 +2608,6 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         kind=OptionKind.INT,
         default=INTERPRETER_MEMORY_LIMIT_MB_DEFAULT,
         toml_keys=("interpreter", "memory_limit_mb"),
-        settings_field="interpreter_memory_limit_mb",
     ),
     ConfigOption(
         key="interpreter.max_ptc_calls",
@@ -2377,7 +2616,6 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         kind=OptionKind.INT,
         default=INTERPRETER_MAX_PTC_CALLS_DEFAULT,
         toml_keys=("interpreter", "max_ptc_calls"),
-        settings_field="interpreter_max_ptc_calls",
     ),
     ConfigOption(
         key="interpreter.max_result_chars",
@@ -2386,7 +2624,6 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         kind=OptionKind.INT,
         default=INTERPRETER_MAX_RESULT_CHARS_DEFAULT,
         toml_keys=("interpreter", "max_result_chars"),
-        settings_field="interpreter_max_result_chars",
     ),
     ConfigOption(
         key="interpreter.ptc",
@@ -2397,7 +2634,6 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         toml_keys=("interpreter", "ptc"),
         cli_flag="--interpreter-tools",
         cli=CliSpec("--interpreter-tools"),
-        settings_field="interpreter_ptc",
     ),
     ConfigOption(
         key="interpreter.ptc_acknowledge_unsafe",
@@ -2406,7 +2642,6 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         kind=OptionKind.BOOL,
         default=INTERPRETER_PTC_ACKNOWLEDGE_UNSAFE_DEFAULT,
         toml_keys=("interpreter", "ptc_acknowledge_unsafe"),
-        settings_field="interpreter_ptc_acknowledge_unsafe",
     ),
     # --- Threads (config.toml-only; structured column table excepted) ---
     ConfigOption(
@@ -2635,7 +2870,6 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         group="Runtime",
         summary="Main agent LangGraph recursion_limit (graph step budget).",
         kind=OptionKind.INT,
-        default=RECURSION_LIMIT_DEFAULT,
         env_var=_env_vars.RECURSION_LIMIT,
         toml_keys=("runtime", "recursion_limit"),
         cli_flag="--recursion-limit",
@@ -2730,12 +2964,21 @@ _STATIC_OPTIONS: tuple[ConfigOption, ...] = (
         env_var=_env_vars.DEBUG,
     ),
     ConfigOption(
+        key="debug.directory",
+        group="Debug",
+        summary="Directory for per-thread debug log files.",
+        kind=OptionKind.STR,
+        default="/tmp/deepagents_debug",  # noqa: S108  # documents the app default, not a write target
+        env_var=_env_vars.DEBUG_DIRECTORY,
+        toml_keys=("debug", "directory"),
+    ),
+    ConfigOption(
         key="debug.file",
         group="Debug",
-        summary="Path for the debug log file.",
+        summary="Deprecated debug log file override; its parent directory is used.",
         kind=OptionKind.STR,
-        default="/tmp/deepagents_debug.log",  # noqa: S108  # documents the app default, not a write target
         env_var=_env_vars.DEBUG_FILE,
+        toml_keys=("debug", "file"),
     ),
     ConfigOption(
         key="debug.log_level",
@@ -2833,7 +3076,7 @@ NON_OPTION_ENV_VARS: frozenset[str] = frozenset(
 
 
 @lru_cache(maxsize=1)
-def get_config_options() -> tuple[ConfigOption, ...]:
+def get_config_options() -> tuple[ConfigOption[object], ...]:
     """Return every option, credentials-first then by domain group.
 
     Cached: provider credentials are generated once from `PROVIDER_API_KEY_ENV`
@@ -2846,7 +3089,7 @@ def get_config_options() -> tuple[ConfigOption, ...]:
     return _credential_options() + _STATIC_OPTIONS
 
 
-def get_option(key: str) -> ConfigOption | None:
+def get_option(key: str) -> ConfigOption[object] | None:
     """Return the manifest entry for `key`, or `None` when unknown."""
     return _options_by_key().get(key)
 
@@ -2856,7 +3099,7 @@ def option_keys() -> tuple[str, ...]:
     return tuple(opt.key for opt in get_config_options())
 
 
-def options_with_key_prefix(prefix: str) -> tuple[ConfigOption, ...]:
+def options_with_key_prefix(prefix: str) -> tuple[ConfigOption[object], ...]:
     """Return every option whose key sits under the dotted `prefix` section.
 
     Matching is exact on segment boundaries: `credentials` matches
@@ -2886,16 +3129,16 @@ def options_with_key_prefix(prefix: str) -> tuple[ConfigOption, ...]:
 
 
 @lru_cache(maxsize=1)
-def _options_by_key() -> dict[str, ConfigOption]:
+def _options_by_key() -> dict[str, ConfigOption[object]]:
     return {opt.key: opt for opt in get_config_options()}
 
 
 @lru_cache(maxsize=1)
-def _options_by_toml_path() -> dict[tuple[str, ...], ConfigOption]:
+def _options_by_toml_path() -> dict[tuple[str, ...], ConfigOption[object]]:
     return {opt.toml_keys: opt for opt in get_config_options() if opt.toml_keys}
 
 
-def option_for_toml_path(path: tuple[str, ...]) -> ConfigOption | None:
+def option_for_toml_path(path: tuple[str, ...]) -> ConfigOption[object] | None:
     """Return the manifest entry that owns a TOML path, or `None` when unknown.
 
     Indexed rather than scanned: the merge validates every managed leaf, and a
@@ -2910,7 +3153,7 @@ def option_for_toml_path(path: tuple[str, ...]) -> ConfigOption | None:
     return _options_by_toml_path().get(path)
 
 
-def iter_groups(options: Iterable[ConfigOption]) -> list[str]:
+def iter_groups(options: Iterable[ConfigOption[object]]) -> list[str]:
     """Return group names from `options` in first-seen order."""
     groups: list[str] = []
     for opt in options:

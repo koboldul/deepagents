@@ -20,7 +20,7 @@ import time
 import tomllib
 import warnings
 from collections.abc import Iterator, Mapping, Sequence  # noqa: TC003
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from itertools import starmap
 from pathlib import Path
 from typing import TextIO
@@ -38,6 +38,7 @@ from deepagents_code.update_check import (
     CACHE_TTL,
     INSTALLED_STALE_NOTICE_DAYS,
     DependencyChange,
+    ExtraInstallOutcome,
     InstallMethod,
     ShadowedDcode,
     ToolRequirementIntrospectionError,
@@ -3544,7 +3545,11 @@ class TestUpdateLogs:
                 return_value="uv",
             ),
             patch(
-                "deepagents_code.extras_info.installed_extra_names",
+                "deepagents_code.update_check._uv_tool_receipt_data",
+                return_value={},
+            ),
+            patch(
+                "deepagents_code.update_check._uv_tool_selected_extras",
                 return_value=frozenset({"litellm", "openai"}),
             ),
             patch(
@@ -3764,7 +3769,11 @@ class TestUpdateLogs:
                 return_value="uv",
             ),
             patch(
-                "deepagents_code.extras_info.installed_extra_names",
+                "deepagents_code.update_check._uv_tool_receipt_data",
+                return_value={},
+            ),
+            patch(
+                "deepagents_code.update_check._uv_tool_selected_extras",
                 return_value=frozenset({"quickjs", "nvidia"}),
             ),
             patch(
@@ -3971,6 +3980,83 @@ class TestUpdateLogs:
         assert success is True
         assert installed == "1.2.0"
 
+    async def test_perform_upgrade_rejects_stale_successful_install(
+        self, cache_file
+    ) -> None:
+        """A successful installer exit is not success when the app stays stale."""
+        cache_file.write_text(
+            json.dumps({"release_prerelease_pins": {"1.1.0": []}}),
+            encoding="utf-8",
+        )
+        with (
+            patch("deepagents_code.update_check.__version__", "1.0.0"),
+            patch(
+                "deepagents_code.update_check.detect_install_method",
+                return_value="uv",
+            ),
+            patch(
+                "deepagents_code.extras_info.installed_extra_names",
+                return_value=frozenset(),
+            ),
+            patch(
+                "deepagents_code.update_check._uv_tool_python",
+                return_value=None,
+            ),
+            patch(
+                "deepagents_code.update_check._uv_tool_with_packages",
+                return_value=(),
+            ),
+            patch(
+                "deepagents_code.update_check._run_install_subprocess",
+                new_callable=AsyncMock,
+                return_value=(True, "Updated dependencies only"),
+            ),
+            patch(
+                "deepagents_code.update_check.read_installed_distribution_version",
+                return_value="1.0.0",
+            ),
+        ):
+            success, output, installed = await perform_upgrade(target_version="1.1.0")
+
+        assert success is False
+        assert installed is None
+        assert output == (
+            "v1.1.0 is still propagating to the package index; "
+            "dcode remains on v1.0.0. Try again in a few minutes."
+        )
+
+    async def test_perform_upgrade_brew_skips_running_prefix_readback(
+        self, cache_file
+    ) -> None:
+        """Homebrew's running process cannot verify the newly relinked Cellar."""
+        cache_file.write_text(
+            json.dumps({"release_prerelease_pins": {"1.1.0": []}}),
+            encoding="utf-8",
+        )
+        with (
+            patch(
+                "deepagents_code.update_check.detect_install_method",
+                return_value="brew",
+            ),
+            patch(
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value="/opt/brew",
+            ),
+            patch(
+                "deepagents_code.update_check._run_install_subprocess",
+                new_callable=AsyncMock,
+                return_value=(True, ""),
+            ),
+            patch(
+                "deepagents_code.update_check.read_installed_distribution_version",
+            ) as readback_mock,
+        ):
+            success, _output, installed = await perform_upgrade(target_version="1.1.0")
+
+        assert success is True
+        assert installed == "1.1.0"
+        readback_mock.assert_not_called()
+
     async def test_perform_upgrade_falls_back_to_target_when_readback_fails(
         self, cache_file
     ) -> None:
@@ -4153,7 +4239,7 @@ class TestUpdateLogs:
         _write_uv_receipt(tmp_path, '{ name = "deepagents-code" }')
         monkeypatch.setattr("sys.prefix", str(tmp_path))
         with patch(
-            "deepagents_code.extras_info.installed_extra_names",
+            "deepagents_code.update_check._uv_tool_selected_extras",
             return_value=frozenset({"quickjs", "nvidia"}),
         ):
             assert (
@@ -4281,7 +4367,11 @@ class TestUpdateLogs:
         monkeypatch.setattr("sys.prefix", str(tmp_path))
         with (
             patch(
-                "deepagents_code.extras_info.installed_extra_names",
+                "deepagents_code.update_check._uv_tool_receipt_data",
+                return_value={},
+            ),
+            patch(
+                "deepagents_code.update_check._uv_tool_selected_extras",
                 return_value=frozenset({"not a valid extra"}),
             ),
             pytest.raises(ExtrasIntrospectionError),
@@ -4294,23 +4384,45 @@ class TestUpdateLogs:
         """Dry-run planning resolves against the running tool environment."""
         _write_uv_receipt(
             tmp_path,
-            '{ name = "deepagents-code" }, { name = "langchain-custom" }',
+            (
+                '{ name = "deepagents-code", extras = ["quickjs"] }, '
+                '{ name = "langchain-custom" }'
+            ),
         )
+        monkeypatch.setattr("sys.prefix", str(tmp_path))
+        assert dependency_refresh_dry_run_command(
+            version="1.2.3",
+            include_prereleases=True,
+            python="/opt/Dcode Python/bin/python",
+        ) == (
+            "uv --no-config pip install --dry-run --python "
+            f"{_shell_arg('/opt/Dcode Python/bin/python')} -U "
+            f"{_shell_arg('deepagents-code[quickjs]==1.2.3')} langchain-custom "
+            "--prerelease allow"
+        )
+
+    def test_dependency_refresh_dry_run_ignores_phantom_metadata_extras(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Base dependencies must not add unselected extras to the preview."""
+        _write_uv_receipt(tmp_path, '{ name = "deepagents-code" }')
         monkeypatch.setattr("sys.prefix", str(tmp_path))
         with patch(
             "deepagents_code.extras_info.installed_extra_names",
-            return_value=frozenset({"quickjs"}),
+            return_value=frozenset({"media", "nvidia"}),
         ):
-            assert dependency_refresh_dry_run_command(
+            command = dependency_refresh_dry_run_command(
                 version="1.2.3",
                 include_prereleases=True,
                 python="/opt/Dcode Python/bin/python",
-            ) == (
-                f"uv --no-config pip install --dry-run --python "
-                f"{_shell_arg('/opt/Dcode Python/bin/python')} -U "
-                f"{_shell_arg('deepagents-code[quickjs]==1.2.3')} langchain-custom "
-                "--prerelease allow"
             )
+
+        assert command == (
+            f"uv --no-config pip install --dry-run --python "
+            f"{_shell_arg('/opt/Dcode Python/bin/python')} -U "
+            f"{_shell_arg('deepagents-code==1.2.3')}"
+            " --prerelease allow"
+        )
 
     async def test_perform_dependency_refresh_dry_run_uses_pinned_uv_pip_command(
         self,
@@ -4326,7 +4438,11 @@ class TestUpdateLogs:
                 return_value=_test_executable(),
             ),
             patch(
-                "deepagents_code.extras_info.installed_extra_names",
+                "deepagents_code.update_check._uv_tool_receipt_data",
+                return_value={},
+            ),
+            patch(
+                "deepagents_code.update_check._uv_tool_selected_extras",
                 return_value=frozenset(),
             ),
             patch(
@@ -4369,7 +4485,11 @@ class TestUpdateLogs:
                 return_value=_test_executable(),
             ),
             patch(
-                "deepagents_code.extras_info.installed_extra_names",
+                "deepagents_code.update_check._uv_tool_receipt_data",
+                return_value={},
+            ),
+            patch(
+                "deepagents_code.update_check._uv_tool_selected_extras",
                 return_value=frozenset(),
             ),
             patch(
@@ -4856,7 +4976,7 @@ class TestUpgradeInstallCommand:
         _write_uv_receipt(tmp_path, '{ name = "deepagents-code" }')
         monkeypatch.setattr("sys.prefix", str(tmp_path))
         with patch(
-            "deepagents_code.extras_info.installed_extra_names",
+            "deepagents_code.update_check._uv_tool_selected_extras",
             return_value=frozenset({"openai"}),
         ):
             assert upgrade_install_command(
@@ -4873,7 +4993,7 @@ class TestUpgradeInstallCommand:
         _write_uv_receipt(tmp_path, '{ name = "deepagents-code" }')
         monkeypatch.setattr("sys.prefix", str(tmp_path))
         with patch(
-            "deepagents_code.extras_info.installed_extra_names",
+            "deepagents_code.update_check._uv_tool_selected_extras",
             return_value=frozenset({"quickjs", "nvidia"}),
         ):
             assert upgrade_install_command(include_prereleases=True) == (
@@ -4988,7 +5108,11 @@ class TestUpgradeInstallCommand:
         monkeypatch.setattr("sys.prefix", str(tmp_path))
         with (
             patch(
-                "deepagents_code.extras_info.installed_extra_names",
+                "deepagents_code.update_check._uv_tool_receipt_data",
+                return_value={},
+            ),
+            patch(
+                "deepagents_code.update_check._uv_tool_selected_extras",
                 side_effect=ExtrasIntrospectionError("metadata unreadable"),
             ),
             pytest.raises(ExtrasIntrospectionError),
@@ -5011,7 +5135,11 @@ class TestUpgradeInstallCommand:
         monkeypatch.setattr("sys.prefix", str(tmp_path))
         with (
             patch(
-                "deepagents_code.extras_info.installed_extra_names",
+                "deepagents_code.update_check._uv_tool_receipt_data",
+                return_value={},
+            ),
+            patch(
+                "deepagents_code.update_check._uv_tool_selected_extras",
                 return_value=frozenset({"not a valid extra"}),
             ),
             pytest.raises(ExtrasIntrospectionError),
@@ -5220,17 +5348,11 @@ class TestInstallExtraCommand:
         """UV recovery guidance matches the automatic context-preserving install."""
         _write_uv_receipt(
             tmp_path,
-            '{ name = "deepagents-code" }, { name = "langchain-custom" }',
+            '{ name = "deepagents-code", extras = ["nvidia"] }, '
+            '{ name = "langchain-custom" }',
             python="/opt/Python 3.13/bin/python",
         )
-        _write_dist_info(tmp_path, "definitely-present-dcode-test-nvidia")
-        _write_dist_info(
-            tmp_path,
-            "deepagents-code",
-            requires=('definitely-present-dcode-test-nvidia; extra == "nvidia"',),
-        )
         monkeypatch.setattr("sys.prefix", str(tmp_path))
-        monkeypatch.syspath_prepend(str(tmp_path))
         monkeypatch.setattr(
             "deepagents_code.update_check.detect_install_method", lambda: "uv"
         )
@@ -5260,18 +5382,22 @@ class TestInstallExtraCommand:
             "curl -LsSf https://langch.in/dcode | DEEPAGENTS_CODE_EXTRAS=quickjs bash"
         )
 
-    def test_uv_install_extra_command_refuses_invalid_metadata(
+    def test_uv_install_extra_command_refuses_invalid_receipt_extras(
         self, tmp_path, monkeypatch
     ) -> None:
-        """Malformed optional-dependency metadata must not drop existing extras."""
-        _write_dist_info(
-            tmp_path,
-            "deepagents-code",
-            requires=("not a valid requirement ; ;",),
-        )
-        monkeypatch.syspath_prepend(str(tmp_path))
+        """A malformed receipt must not drop selected extras.
 
-        with pytest.raises(ExtrasIntrospectionError, match="Could not parse"):
+        The selected set drives the rebuilt requirement, so an unreadable
+        receipt has to fail closed rather than silently reinstall a plain
+        `deepagents-code` and deselect everything the user asked for.
+        """
+        _write_uv_receipt(
+            tmp_path,
+            '{ name = "deepagents-code", extras = ["not a valid extra"] }',
+        )
+        monkeypatch.setattr("sys.prefix", str(tmp_path))
+
+        with pytest.raises(ToolRequirementIntrospectionError, match="invalid extras"):
             _install_extra_uv_tool_command(
                 "quickjs", distribution_name="deepagents-code"
             )
@@ -5279,21 +5405,10 @@ class TestInstallExtraCommand:
     def test_uv_install_extra_command_preserves_installed_extras(
         self, tmp_path, monkeypatch
     ) -> None:
-        """Installing a new extra keeps already-installed extras selected."""
-        _write_uv_receipt(tmp_path, '{ name = "deepagents-code" }')
-        _write_dist_info(tmp_path, "definitely-present-dcode-test-nvidia")
-        _write_dist_info(
-            tmp_path,
-            "deepagents-code",
-            requires=(
-                'definitely-present-dcode-test-nvidia; extra == "nvidia"',
-                'definitely-absent-dcode-test-baseten-xyz; extra == "baseten"',
-            ),
-        )
+        """Installing a new extra keeps already-selected extras selected."""
+        _write_uv_receipt(tmp_path, '{ name = "deepagents-code", extras = ["nvidia"] }')
         monkeypatch.setattr("sys.prefix", str(tmp_path))
-        monkeypatch.syspath_prepend(str(tmp_path))
 
-        assert installed_extra_names("deepagents-code") == {"nvidia"}
         assert _install_extra_uv_tool_command(
             "baseten", distribution_name="deepagents-code"
         ) == (
@@ -5305,16 +5420,9 @@ class TestInstallExtraCommand:
     def test_uv_install_extra_command_dedupes_existing_extra(
         self, tmp_path, monkeypatch
     ) -> None:
-        """Installing an already-present extra does not duplicate it."""
-        _write_uv_receipt(tmp_path, '{ name = "deepagents-code" }')
-        _write_dist_info(tmp_path, "definitely-present-dcode-test-nvidia")
-        _write_dist_info(
-            tmp_path,
-            "deepagents-code",
-            requires=('definitely-present-dcode-test-nvidia; extra == "nvidia"',),
-        )
+        """Installing an already-selected extra does not duplicate it."""
+        _write_uv_receipt(tmp_path, '{ name = "deepagents-code", extras = ["nvidia"] }')
         monkeypatch.setattr("sys.prefix", str(tmp_path))
-        monkeypatch.syspath_prepend(str(tmp_path))
 
         assert _install_extra_uv_tool_command(
             "nvidia", distribution_name="deepagents-code"
@@ -5324,30 +5432,27 @@ class TestInstallExtraCommand:
             "--prerelease allow"
         )
 
-    def test_uv_install_extra_command_drops_composite_extras(
+    def test_uv_install_extra_command_preserves_composite_extras(
         self, tmp_path, monkeypatch
     ) -> None:
-        """Composite extras are not echoed back into uv reinstall commands."""
-        _write_uv_receipt(tmp_path, '{ name = "deepagents-code" }')
-        _write_dist_info(tmp_path, "definitely-present-dcode-test-nvidia")
-        _write_dist_info(tmp_path, "definitely-present-dcode-test-openai")
-        _write_dist_info(
+        """A composite extra selected in the receipt survives the reinstall.
+
+        `installed_extra_names` filtered composites out because build backends
+        flatten them in metadata. The receipt records the requirement as the user
+        wrote it, so `all-providers` must be echoed back — dropping it would
+        deselect every provider it expands to.
+        """
+        _write_uv_receipt(
             tmp_path,
-            "deepagents-code",
-            requires=(
-                'definitely-present-dcode-test-nvidia; extra == "nvidia"',
-                'definitely-present-dcode-test-openai; extra == "all-providers"',
-            ),
+            '{ name = "deepagents-code", extras = ["all-providers"] }',
         )
         monkeypatch.setattr("sys.prefix", str(tmp_path))
-        monkeypatch.syspath_prepend(str(tmp_path))
 
-        assert installed_extra_names("deepagents-code") == {"nvidia"}
         assert _install_extra_uv_tool_command(
-            "baseten", distribution_name="deepagents-code"
+            "daytona", distribution_name="deepagents-code"
         ) == (
             "uv --no-config tool install --reinstall -U "
-            f"{_shell_arg(f'deepagents-code[baseten,nvidia]=={__version__}')} "
+            f"{_shell_arg(f'deepagents-code[all-providers,daytona]=={__version__}')} "
             "--prerelease allow"
         )
 
@@ -5357,17 +5462,11 @@ class TestInstallExtraCommand:
         """Installing an extra preserves the uv tool interpreter and `--with` deps."""
         _write_uv_receipt(
             tmp_path,
-            '{ name = "deepagents-code" }, { name = "langchain-custom" }',
+            '{ name = "deepagents-code", extras = ["nvidia"] }, '
+            '{ name = "langchain-custom" }',
             python="/opt/Python 3.13/bin/python",
         )
-        _write_dist_info(tmp_path, "definitely-present-dcode-test-nvidia")
-        _write_dist_info(
-            tmp_path,
-            "deepagents-code",
-            requires=('definitely-present-dcode-test-nvidia; extra == "nvidia"',),
-        )
         monkeypatch.setattr("sys.prefix", str(tmp_path))
-        monkeypatch.syspath_prepend(str(tmp_path))
 
         command = _install_extra_uv_tool_command(
             "baseten", distribution_name="deepagents-code"
@@ -5496,21 +5595,10 @@ class TestInstallPackageCommand:
         )
 
     def test_preserves_installed_extras(self, tmp_path, monkeypatch) -> None:
-        """Adding a package keeps already-installed extras selected."""
-        _write_uv_receipt(tmp_path, '{ name = "deepagents-code" }')
-        _write_dist_info(tmp_path, "definitely-present-dcode-test-nvidia")
-        _write_dist_info(
-            tmp_path,
-            "deepagents-code",
-            requires=(
-                'definitely-present-dcode-test-nvidia; extra == "nvidia"',
-                'definitely-absent-dcode-test-baseten-xyz; extra == "baseten"',
-            ),
-        )
+        """Adding a package keeps already-selected extras selected."""
+        _write_uv_receipt(tmp_path, '{ name = "deepagents-code", extras = ["nvidia"] }')
         monkeypatch.setattr("sys.prefix", str(tmp_path))
-        monkeypatch.syspath_prepend(str(tmp_path))
 
-        assert installed_extra_names("deepagents-code") == {"nvidia"}
         assert install_package_command(
             "langchain-custom", distribution_name="deepagents-code"
         ) == (
@@ -5526,17 +5614,11 @@ class TestInstallPackageCommand:
         """Adding a package keeps uv receipt interpreter and `--with` packages."""
         _write_uv_receipt(
             tmp_path,
-            '{ name = "deepagents-code" }, { name = "langchain-first" }',
+            '{ name = "deepagents-code", extras = ["nvidia"] }, '
+            '{ name = "langchain-first" }',
             python="/opt/Python 3.13/bin/python",
         )
-        _write_dist_info(tmp_path, "definitely-present-dcode-test-nvidia")
-        _write_dist_info(
-            tmp_path,
-            "deepagents-code",
-            requires=('definitely-present-dcode-test-nvidia; extra == "nvidia"',),
-        )
         monkeypatch.setattr("sys.prefix", str(tmp_path))
-        monkeypatch.syspath_prepend(str(tmp_path))
 
         command = install_package_command(
             "langchain-second", distribution_name="deepagents-code"
@@ -5666,23 +5748,26 @@ class TestInstallPackageCommand:
                 "langchain-new", distribution_name="deepagents-code"
             )
 
-    def test_refuses_missing_distribution(self) -> None:
-        """Reinstalls must not drop extras when metadata is unavailable."""
-        with pytest.raises(ExtrasIntrospectionError, match="cannot preserve"):
+    def test_refuses_missing_receipt(self, tmp_path, monkeypatch) -> None:
+        """Reinstalls must not drop extras when the receipt is unavailable."""
+        monkeypatch.setattr("sys.prefix", str(tmp_path))
+
+        with pytest.raises(
+            ToolRequirementIntrospectionError, match="receipt not found"
+        ):
             install_package_command(
-                "langchain-custom", distribution_name="missing-dcode-test"
+                "langchain-custom", distribution_name="deepagents-code"
             )
 
-    def test_refuses_invalid_metadata(self, tmp_path, monkeypatch) -> None:
-        """Malformed optional-dependency metadata must not drop existing extras."""
-        _write_dist_info(
+    def test_refuses_invalid_receipt_extras(self, tmp_path, monkeypatch) -> None:
+        """A malformed receipt must not drop selected extras."""
+        _write_uv_receipt(
             tmp_path,
-            "deepagents-code",
-            requires=("not a valid requirement ; ;",),
+            '{ name = "deepagents-code", extras = ["not a valid extra"] }',
         )
-        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setattr("sys.prefix", str(tmp_path))
 
-        with pytest.raises(ExtrasIntrospectionError, match="Could not parse"):
+        with pytest.raises(ToolRequirementIntrospectionError, match="invalid extras"):
             install_package_command(
                 "langchain-custom", distribution_name="deepagents-code"
             )
@@ -5706,7 +5791,7 @@ class TestPerformInstallExtra:
             "deepagents_code.update_check.detect_install_method",
             return_value="unknown",
         ):
-            success, output = await perform_install_extra("quickjs")
+            success, output, _safe = await perform_install_extra("quickjs")
         assert success is False
         assert "Editable install" in output
         assert "uv tool install --editable" in output
@@ -5718,7 +5803,7 @@ class TestPerformInstallExtra:
             "deepagents_code.update_check.detect_install_method",
             return_value="brew",
         ):
-            success, output = await perform_install_extra("quickjs")
+            success, output, _safe = await perform_install_extra("quickjs")
         assert success is False
         assert "Homebrew" in output
 
@@ -5728,7 +5813,7 @@ class TestPerformInstallExtra:
             "deepagents_code.update_check.detect_install_method",
             return_value="other",
         ):
-            success, output = await perform_install_extra("quickjs")
+            success, output, _safe = await perform_install_extra("quickjs")
         assert success is False
         assert "Unsupported install method" in output
 
@@ -5760,7 +5845,7 @@ class TestPerformInstallExtra:
             "deepagents_code.update_check.detect_install_method",
             return_value=method,
         ):
-            success, output = await perform_install_extra("quickjs")
+            success, output, _safe = await perform_install_extra("quickjs")
         assert success is False
         assert needle in output
         assert "ToolRequirementIntrospectionError" not in output
@@ -5772,7 +5857,9 @@ class TestPerformInstallExtra:
         with patch(
             "deepagents_code.update_check.detect_install_method",
         ) as detect:
-            success, output = await perform_install_extra("quickjs']; echo nope; '")
+            success, output, _safe = await perform_install_extra(
+                "quickjs']; echo nope; '"
+            )
         assert success is False
         assert "Invalid extra name" in output
         detect.assert_not_called()
@@ -5796,9 +5883,85 @@ class TestPerformInstallExtra:
                 return_value=_python_argv("print('ok')"),
             ),
         ):
-            success, output = await perform_install_extra("quickjs", log_path=log_path)
+            success, output, _safe = await perform_install_extra(
+                "quickjs", log_path=log_path
+            )
         assert success is True
         assert output == "ok"
+
+    async def test_lock_wraps_command_generation_and_subprocess(self) -> None:
+        """Receipt inspection and the rebuild share one lock hold."""
+        events: list[str] = []
+
+        @contextmanager
+        def lock() -> Iterator[bool]:
+            events.append("acquire")
+            try:
+                yield True
+            finally:
+                events.append("release")
+
+        def command(_extra: str) -> tuple[str, ...]:
+            events.append("command")
+            return ("uv", "tool", "install", "safe-command")
+
+        def run_subprocess(*_args: object, **_kwargs: object) -> tuple[bool, str]:
+            events.append("run")
+            return True, "installed"
+
+        run = AsyncMock(side_effect=run_subprocess)
+        with (
+            patch(
+                "deepagents_code.update_check.detect_install_method",
+                return_value="uv",
+            ),
+            patch(
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value="/usr/bin/uv",
+            ),
+            patch("deepagents_code.update_check.update_install_lock", lock),
+            patch(
+                "deepagents_code.update_check._install_extra_uv_tool_argv",
+                side_effect=command,
+            ),
+            patch("deepagents_code.update_check._run_install_subprocess", run),
+        ):
+            success, output, _safe = await perform_install_extra("quickjs")
+
+        assert (success, output) == (True, "installed")
+        assert events == ["acquire", "command", "run", "release"]
+
+    async def test_contended_lock_skips_receipt_read_and_subprocess(self) -> None:
+        """A concurrent mutation wins before this install reads the receipt."""
+        command = MagicMock()
+        run = AsyncMock()
+        with (
+            patch(
+                "deepagents_code.update_check.detect_install_method",
+                return_value="uv",
+            ),
+            patch(
+                "deepagents_code.update_check.shutil.which",
+                return_value="/usr/bin/uv",
+            ),
+            patch(
+                "deepagents_code.update_check.update_install_lock",
+                return_value=nullcontext(False),
+            ),
+            patch(
+                "deepagents_code.update_check._install_extra_uv_tool_command",
+                command,
+            ),
+            patch("deepagents_code.update_check._run_install_subprocess", run),
+        ):
+            outcome = await perform_install_extra("quickjs")
+
+        assert isinstance(outcome, ExtraInstallOutcome)
+        assert outcome.success is False
+        assert "already running" in outcome.output
+        assert outcome.manual_recovery_safe is False
+        command.assert_not_called()
+        run.assert_not_awaited()
 
     async def test_uv_receipt_failure_is_reported(self, tmp_path, monkeypatch) -> None:
         """A malformed uv receipt is reported instead of dropping install context."""
@@ -5818,7 +5981,7 @@ class TestPerformInstallExtra:
                 return_value=frozenset(),
             ),
         ):
-            success, output = await perform_install_extra("quickjs")
+            success, output, _safe = await perform_install_extra("quickjs")
         assert success is False
         assert "ToolRequirementIntrospectionError" in output
         assert "non-table requirement" in output
@@ -5835,7 +5998,7 @@ class TestPerformInstallExtra:
                 return_value=None,
             ),
         ):
-            success, output = await perform_install_extra("quickjs")
+            success, output, _safe = await perform_install_extra("quickjs")
         assert success is False
         assert "uv" in output
         assert "not found" in output
@@ -5957,6 +6120,75 @@ class TestPerformInstallPackage:
         assert success is True
         assert output == "ok"
 
+    async def test_lock_wraps_command_generation_and_subprocess(self) -> None:
+        """Receipt inspection and the package rebuild share one lock hold."""
+        events: list[str] = []
+
+        @contextmanager
+        def lock() -> Iterator[bool]:
+            events.append("acquire")
+            try:
+                yield True
+            finally:
+                events.append("release")
+
+        def command(_package: str) -> tuple[str, ...]:
+            events.append("command")
+            return ("uv", "tool", "install", "safe-command")
+
+        def run_subprocess(*_args: object, **_kwargs: object) -> tuple[bool, str]:
+            events.append("run")
+            return True, "installed"
+
+        run = AsyncMock(side_effect=run_subprocess)
+        with (
+            patch(
+                "deepagents_code.update_check.detect_install_method",
+                return_value="uv",
+            ),
+            patch(
+                "deepagents_code.update_check._resolve_trusted_path_executable",
+                return_value="/usr/bin/uv",
+            ),
+            patch("deepagents_code.update_check.update_install_lock", lock),
+            patch(
+                "deepagents_code.update_check._install_package_argv",
+                side_effect=command,
+            ),
+            patch("deepagents_code.update_check._run_install_subprocess", run),
+        ):
+            success, output = await perform_install_package("langchain-custom")
+
+        assert (success, output) == (True, "installed")
+        assert events == ["acquire", "command", "run", "release"]
+
+    async def test_contended_lock_skips_receipt_read_and_subprocess(self) -> None:
+        """A concurrent mutation wins before this install reads the receipt."""
+        command = MagicMock()
+        run = AsyncMock()
+        with (
+            patch(
+                "deepagents_code.update_check.detect_install_method",
+                return_value="uv",
+            ),
+            patch(
+                "deepagents_code.update_check.shutil.which",
+                return_value="/usr/bin/uv",
+            ),
+            patch(
+                "deepagents_code.update_check.update_install_lock",
+                return_value=nullcontext(False),
+            ),
+            patch("deepagents_code.update_check.install_package_command", command),
+            patch("deepagents_code.update_check._run_install_subprocess", run),
+        ):
+            success, output = await perform_install_package("langchain-custom")
+
+        assert success is False
+        assert "already running" in output
+        command.assert_not_called()
+        run.assert_not_awaited()
+
     async def test_uv_missing_returns_actionable_error(self) -> None:
         """When `uv` is not on PATH, surface a clear error before exec."""
         with (
@@ -5994,7 +6226,11 @@ class TestPerformInstallPackage:
                 return_value=_test_executable(),
             ),
             patch(
-                "deepagents_code.extras_info.installed_extra_names",
+                "deepagents_code.update_check._uv_tool_receipt_data",
+                return_value={},
+            ),
+            patch(
+                "deepagents_code.update_check._uv_tool_selected_extras",
                 side_effect=ExtrasIntrospectionError("metadata unreadable"),
             ),
             caplog.at_level(logging.WARNING, logger="deepagents_code.update_check"),
@@ -6323,7 +6559,9 @@ class TestRunInstallSubprocessFailureModes:
                 return_value=_python_argv("import time; time.sleep(5)"),
             ),
         ):
-            success, output = await perform_install_extra("quickjs", log_path=log_path)
+            success, output, _safe = await perform_install_extra(
+                "quickjs", log_path=log_path
+            )
         assert success is False
         assert "timed out" in output
 
@@ -6736,7 +6974,9 @@ class TestRunInstallSubprocessFailureModes:
             ),
             patch("deepagents_code.update_check.os.killpg", wraps=os.killpg) as killpg,
         ):
-            success, output = await perform_install_extra("quickjs", log_path=log_path)
+            success, output, _safe = await perform_install_extra(
+                "quickjs", log_path=log_path
+            )
         assert success is False
         assert "timed out" in output
         killpg.assert_called_once()
@@ -7020,7 +7260,9 @@ class TestRunInstallSubprocessFailureModes:
             ),
             patch("asyncio.create_subprocess_exec", side_effect=_raise),
         ):
-            success, output = await perform_install_extra("quickjs", log_path=log_path)
+            success, output, _safe = await perform_install_extra(
+                "quickjs", log_path=log_path
+            )
         assert success is False
         assert "FileNotFoundError" in output
         assert "No such file" in output
@@ -7130,7 +7372,9 @@ class TestRunInstallSubprocessFailureModes:
                 ),
             ),
         ):
-            success, output = await perform_install_extra("quickjs", log_path=log_path)
+            success, output, _safe = await perform_install_extra(
+                "quickjs", log_path=log_path
+            )
         assert success is False
         assert "boom" in output
 

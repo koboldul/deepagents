@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
+from ipaddress import ip_address
 from typing import TYPE_CHECKING, Any, Literal, cast
 from weakref import WeakValueDictionary
 
@@ -69,6 +72,114 @@ _active_operations: dict[_OperationKey, asyncio.Task[object]] = {}
 _operation_outcomes: OrderedDict[_OperationKey, _OperationOutcome] = OrderedDict()
 _MAX_OPERATION_OUTCOMES = 1024
 """Bound completed/cancelled ids retained to close request/cancel races."""
+_TRACE_FLUSH_TIMEOUT = 2.0
+"""Seconds allowed for the shutdown trace flush."""
+_TRACE_FLUSH_POLL_INTERVAL = 0.05
+"""Seconds between completion checks while the daemon flush thread runs."""
+
+
+def _run_trace_flush(done: threading.Event, failures: list[BaseException]) -> None:
+    """Flush existing LangSmith tracers and record completion for the event loop."""
+    try:
+        from langchain_core.tracers.langchain import wait_for_all_tracers
+
+        wait_for_all_tracers()
+    except BaseException as exc:  # noqa: BLE001  # telemetry cannot break shutdown
+        failures.append(exc)
+    finally:
+        done.set()
+
+
+async def _flush_traces() -> None:
+    """Flush the child process's existing LangSmith tracing client.
+
+    `wait_for_all_tracers` does not construct a client when tracing is off. It
+    has no timeout, so it runs on an unjoined daemon thread and this coroutine
+    abandons the wait at `_TRACE_FLUSH_TIMEOUT`. Polling a `threading.Event`
+    avoids scheduling a late completion onto an event loop that may be closed.
+
+    This runs before LangGraph's own lifespan teardown, because an
+    `AsyncExitStack` unwinds last-entered first. Traces emitted while the
+    runtime cancels in-flight runs are therefore still lost. Covering those
+    would need a second flush after the runtime is down.
+    """
+    done = threading.Event()
+    failures: list[BaseException] = []
+    thread = threading.Thread(
+        target=_run_trace_flush,
+        args=(done, failures),
+        daemon=True,
+        name="langsmith-shutdown-flush",
+    )
+    try:
+        thread.start()
+    except Exception:
+        logger.exception("Failed to start the LangSmith shutdown flush")
+        return
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _TRACE_FLUSH_TIMEOUT
+    while not done.is_set():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.warning(
+                "LangSmith trace flush exceeded %.1fs; some traces may be lost",
+                _TRACE_FLUSH_TIMEOUT,
+            )
+            return
+        await asyncio.sleep(min(_TRACE_FLUSH_POLL_INTERVAL, remaining))
+
+    if failures:
+        failure = failures[0]
+        logger.error(
+            "Failed to flush LangSmith traces during shutdown",
+            exc_info=(type(failure), failure, failure.__traceback__),
+        )
+
+
+@asynccontextmanager
+async def _lifespan(_app: Starlette) -> AsyncIterator[None]:
+    """Flush buffered traces once the server stops serving.
+
+    `Client` registers an `atexit` handler that only closes its session, never
+    flushes, so without this hook anything still queued when dcode signals the
+    server is lost. The flush is in a `finally` so it also runs when the app
+    body raises -- the crash case where the buffered traces matter most.
+
+    Args:
+        _app: The Starlette app, required by the lifespan protocol.
+
+    Yields:
+        Control for the lifetime of the application.
+    """
+    try:
+        yield
+    finally:
+        try:
+            from deepagents_code.extensions.runtime import shutdown_server_extensions
+
+            await shutdown_server_extensions()
+        finally:
+            await _flush_traces()
+
+
+def _extensions(request: Request) -> JSONResponse:
+    """Return extension provenance only to a loopback client."""
+    from deepagents_code._env_vars import EXPERIMENTAL, is_env_truthy
+
+    if not is_env_truthy(EXPERIMENTAL):
+        return JSONResponse({"detail": "Not found"}, status_code=404)
+    host = request.client.host if request.client is not None else ""
+    try:
+        loopback = ip_address(host).is_loopback
+    except ValueError:
+        loopback = host == "localhost"
+    if not loopback:
+        return JSONResponse({"detail": "Not found"}, status_code=404)
+    from deepagents_code.extensions.runtime import server_extension_report
+
+    return JSONResponse(server_extension_report())
+
 
 # One client for the process. `get_client` builds a fresh `httpx.AsyncClient`
 # (with its own connection pool) per call and exposes no close hook we own, so
@@ -167,6 +278,7 @@ class _OffloadIndeterminateError(RuntimeError):
 _CONTEXT_STR_OR_NONE_FIELDS = (
     "model",
     "classifier_model",
+    "summarization_model",
     "approval_mode",
     "thread_id",
     "hooks_snapshot_id",
@@ -210,9 +322,11 @@ server accepts connections from any local process, so the request's model
 selection must not extend to its network plumbing.
 
 A backstop, not the primary control. `_checkpoint_model_context` discards the
-request's `model` and `model_params` outright and substitutes the checkpointed
-values, so a client-supplied endpoint cannot reach `create_model` even without
-this filter. It is kept for the case that control cannot cover: a future path
+request's `model`, `model_params`, and `summarization_model` outright, and
+substitutes checkpointed values for the first two, so a client-supplied
+endpoint cannot reach `create_model` even without this filter. Every spec the
+operation resolves is server-sourced; no client string reaches a model
+constructor. It is kept for the case that control cannot cover: a future path
 that resolves a model before, or instead of, reading the checkpoint. Treat a
 warning from here as a client sending params it should not, not as a breach.
 
@@ -387,11 +501,19 @@ def _checkpoint_model_context(
     """Replace request model selection with server-checkpointed values.
 
     The client still supplies hook and profile context, but it cannot choose
-    the model's outbound transport for this server-owned operation. Successful
-    agent turns checkpoint the resolved model spec and the runtime overrides
-    they actually used, so those values preserve trusted launch/model-switch
-    settings such as a private `base_url` without accepting an arbitrary
-    offload request's endpoint override.
+    which model runs -- or its outbound transport -- for this server-owned
+    operation. Successful agent turns checkpoint the resolved model spec and
+    the runtime overrides they actually used, so those values preserve trusted
+    launch/model-switch settings such as a private `base_url` without accepting
+    an arbitrary offload request's endpoint override.
+
+    `summarization_model` is dropped for the same reason and has no checkpoint
+    to restore from, so the operation falls back to the server's own launch
+    configuration (`--summarization-model` / `[models].summarization_default`).
+    A bare spec cannot carry an endpoint, but it can still name a provider the
+    server holds credentials for, which would send conversation history
+    somewhere the thread's owner never chose. A mid-session
+    `/summarization-model` override therefore does not apply to `/offload`.
 
     Args:
         context: Validated request context.
@@ -405,6 +527,7 @@ def _checkpoint_model_context(
     trusted = dict(context)
     trusted.pop("model", None)
     trusted.pop("model_params", None)
+    trusted.pop("summarization_model", None)
     model = state.get("_model_spec")
     params = state.get("_model_params")
     if isinstance(model, str) and model:
@@ -917,6 +1040,7 @@ async def cancel_offload(request: Request) -> JSONResponse:
 
 
 app = Starlette(
+    lifespan=_lifespan,
     routes=[
         Route(
             "/dcode/threads/{thread_id:str}/offload",
@@ -928,5 +1052,6 @@ app = Starlette(
             cancel_offload,
             methods=["POST"],
         ),
-    ]
+        Route("/extensions", _extensions, methods=["GET"]),
+    ],
 )

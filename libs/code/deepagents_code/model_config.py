@@ -879,6 +879,70 @@ Providers not listed here fall through to the config-file check or the langchain
 registry fallback.
 """
 
+RETRY_PARAM_BY_PROVIDER: dict[str, str | None] = {
+    "anthropic": "max_retries",
+    "azure_openai": "max_retries",
+    "baseten": "max_retries",
+    "bedrock": "max_retries",
+    "deepseek": "max_retries",
+    "fireworks": "max_retries",
+    "google_anthropic_vertex": "max_retries",
+    "google_genai": "max_retries",
+    "google_vertexai": "max_retries",
+    "groq": "max_retries",
+    "litellm": "max_retries",
+    "meta": "max_retries",
+    "mistralai": "max_retries",
+    "openai": "max_retries",
+    "openai_codex": "max_retries",
+    "openrouter": "max_retries",
+    "perplexity": "max_retries",
+    "together": "max_retries",
+    "xai": "max_retries",
+    # `None` means "checked, and this integration has no retry-count kwarg" --
+    # distinct from a provider absent from the table, which means dcode does
+    # not know. Only the absent case warrants the "SDK retries stay active"
+    # warning: a `None` provider has no SDK retry loop to multiply, so warning
+    # about it told the user to set `[retries.<provider>].param` to a kwarg
+    # their integration would drop.
+    #
+    # `cohere` is deliberately NOT listed here: `langchain_cohere`'s `BaseCohere`
+    # appears to expose `max_retries`, so it likely belongs above with a kwarg
+    # name rather than here. Left absent until someone can check it against an
+    # installed `langchain_cohere` -- absent warns, which is noisy but honest,
+    # whereas a wrong `None` would silently leave its SDK retries running.
+    "huggingface": None,
+    "ibm": None,
+    "nvidia": None,
+    "ollama": None,
+}
+"""Constructor kwargs used to disable provider-owned retry loops.
+
+dcode's model-node middleware owns the retry budget, so integrations with a
+known retry-count parameter receive their provider-specific disable value at
+construction time. A `None` value records an integration reported to
+have no retry-count parameter. Providers absent from this mapping are unknown
+to dcode and must declare one with `[retries.<provider>].param` in
+`config.toml`.
+
+A kwarg name is verified against that integration's chat model constructor,
+never inferred from the provider name. The `None` entries are the weaker claim:
+none of those packages is installed in this repo, so they rest on the
+integrations' own documentation. Re-check one before relying on it.
+"""
+
+RETRY_DISABLE_VALUE_BY_PROVIDER: dict[str, int] = {"google_genai": 1}
+"""Non-zero provider-specific values that disable SDK retries.
+
+`google-genai` counts *total attempts*, not retries. Before 1.68.0 it read zero
+as unset and restored its own five-attempt default; from 1.68.0 on it coerces
+zero to one (`_api_client._retry_args`), so zero and one now behave alike. One is
+sent because it disables retries on both, and it is the only value that means
+"the initial request only" on every version.
+
+Other registered providers count retries, so zero disables them.
+"""
+
 LANGSMITH_SERVICE = "langsmith"
 """Service name for LangSmith tracing in `SERVICE_API_KEY_ENV`.
 
@@ -937,42 +1001,6 @@ the full `openai` API, so mirroring every openai model would surface specs the
 backend rejects at call time.
 """
 
-
-RETRY_PARAM_BY_PROVIDER: dict[str, str] = {
-    "anthropic": "max_retries",
-    "azure_openai": "max_retries",
-    "baseten": "max_retries",
-    "bedrock": "max_retries",
-    "deepseek": "max_retries",
-    "fireworks": "max_retries",
-    "google_anthropic_vertex": "max_retries",
-    "google_genai": "max_retries",
-    "google_vertexai": "max_retries",
-    "groq": "max_retries",
-    "litellm": "max_retries",
-    "meta": "max_retries",
-    "mistralai": "max_retries",
-    "openai": "max_retries",
-    "openrouter": "max_retries",
-    "perplexity": "max_retries",
-    "together": "max_retries",
-    "xai": "max_retries",
-}
-"""Maps a provider to the constructor kwarg that sets its retry count.
-
-The value is the kwarg name to pass to the provider's chat model constructor.
-It is uniformly `max_retries` for every provider listed today, but this is a
-`dict` rather than a `set` of providers because retry-kwarg names diverge across
-the ecosystem -- some integrations expose a differently named kwarg -- and the
-value column lets a future provider register its own name without restructuring
-callers.
-
-Membership is verified against each provider's chat model constructor (e.g.
-`ChatGoogleGenerativeAI` exposes `max_retries`, not `retries`), not inferred
-from naming. Providers absent from this map either lack an integer retry-count
-kwarg or are not yet wired as a credential-resolvable provider in this module;
-a `[retries]` config for them is ignored with a warning by `_resolve_retry_kwargs`.
-"""
 
 PROVIDER_BASE_URL_ENV: dict[str, tuple[str, ...]] = {
     # Each tuple lists every base-URL env var the provider's LangChain
@@ -3044,7 +3072,7 @@ def _resolve_models_section(
 
 
 def _resolve_model_file_option(
-    option: ConfigOption,
+    option: ConfigOption[object],
     sources: ConfigSources,
     *,
     user_data: Mapping[str, Any],
@@ -3130,6 +3158,16 @@ class ModelConfig:
     Not the resolution path — a `DEEPAGENTS_CODE_AUTO_CLASSIFIER_MODEL` export
     or `--auto-classifier-model` flag outranks this value at launch, so it may
     differ from the classifier Auto actually reviews with.
+    """
+
+    summarization_default_model: str | None = None
+    """The default summary model from `[models].summarization_default`.
+
+    Not the resolution path -- `--summarization-model` outranks this value at
+    launch, so it may differ from the model summaries are actually generated
+    with. Stored unvalidated: `_validate` only warns when the spec omits a
+    `provider:` prefix, because `create_model`'s provider auto-detection makes
+    a bare name legitimate.
     """
 
     allowed_models: tuple[str, ...] | None = None
@@ -3313,6 +3351,7 @@ class ModelConfig:
             option_keys = (
                 "models.default",
                 "models.recent",
+                "models.summarization_default",
                 "models.auto_classifier",
                 "models.providers",
             )
@@ -3322,7 +3361,7 @@ class ModelConfig:
                 raise RuntimeError(msg)
             resolved = {
                 key: _resolve_model_file_option(
-                    cast("ConfigOption", option),
+                    cast("ConfigOption[object]", option),
                     sources,
                     user_data=user_data,
                 )[0]
@@ -3357,6 +3396,12 @@ class ModelConfig:
                 recent_model=_toml_model_spec(
                     resolved["models.recent"],
                     key="recent",
+                    path=config_path,
+                    source_label=source_label,
+                ),
+                summarization_default_model=_toml_model_spec(
+                    resolved["models.summarization_default"],
+                    key="summarization_default",
                     path=config_path,
                     source_label=source_label,
                 ),
@@ -3402,29 +3447,29 @@ class ModelConfig:
         Issues warnings for invalid configurations but does not raise exceptions,
         allowing the app to continue with potentially degraded functionality.
         """
-        # Warn if default_model is set but doesn't use provider:model format
-        if self.default_model and ":" not in self.default_model:
-            logger.warning(
-                "default_model '%s' should use provider:model format "
-                "(e.g., 'anthropic:claude-sonnet-4-5')",
-                self.default_model,
-            )
-
-        # Warn if recent_model is set but doesn't use provider:model format
-        if self.recent_model and ":" not in self.recent_model:
-            logger.warning(
-                "recent_model '%s' should use provider:model format "
-                "(e.g., 'anthropic:claude-sonnet-4-5')",
-                self.recent_model,
-            )
-
-        # Warn if auto_classifier_model is set but doesn't use provider:model format
-        if self.auto_classifier_model and ":" not in self.auto_classifier_model:
-            logger.warning(
-                "auto_classifier_model '%s' should use provider:model format "
-                "(e.g., 'anthropic:claude-sonnet-4-5')",
+        # Warn if a model field is set but doesn't use provider:model format
+        model_fields = (
+            ("default_model", self.default_model, "anthropic:claude-sonnet-4-5"),
+            ("recent_model", self.recent_model, "anthropic:claude-sonnet-4-5"),
+            (
+                "summarization_default_model",
+                self.summarization_default_model,
+                "openai:gpt-5.4-mini",
+            ),
+            (
+                "auto_classifier_model",
                 self.auto_classifier_model,
-            )
+                "anthropic:claude-sonnet-4-5",
+            ),
+        )
+        for field_name, spec, example in model_fields:
+            if spec and ":" not in spec:
+                logger.warning(
+                    "%s '%s' should use provider:model format (e.g., '%s')",
+                    field_name,
+                    spec,
+                    example,
+                )
 
         # Validate enabled field type and class_path format / params references
         for name, provider in self.providers.items():
@@ -3933,21 +3978,29 @@ def _save_toml_field(
             else:
                 data = {}
 
-            if section not in data:
-                data[section] = {}
-            data[section][field] = value
+            existing_section = data.get(section)
+            existing = (
+                existing_section.get(field)
+                if isinstance(existing_section, dict)
+                else None
+            )
+            unchanged = type(existing) is type(value) and existing == value
+            if not unchanged:
+                if section not in data:
+                    data[section] = {}
+                data[section][field] = value
 
-            # Write to temp file then rename so an interrupted write can't corrupt
-            fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    tomli_w.dump(data, f)
-                Path(tmp_path).replace(config_path)
-            except BaseException:
-                # Clean up temp file on any failure
-                with contextlib.suppress(OSError):
-                    Path(tmp_path).unlink()
-                raise
+                # Write to temp file then rename so an interrupted write can't corrupt
+                fd, tmp_path = tempfile.mkstemp(dir=config_path.parent, suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "wb") as f:
+                        tomli_w.dump(data, f)
+                    Path(tmp_path).replace(config_path)
+                except BaseException:
+                    # Clean up temp file on any failure
+                    with contextlib.suppress(OSError):
+                        Path(tmp_path).unlink()
+                    raise
     except (OSError, tomllib.TOMLDecodeError, TypeError, ValueError):
         # `TypeError` covers `tomli_w.dump` rejecting a non-serializable
         # payload; `ValueError` covers things like `os.fdopen` on a

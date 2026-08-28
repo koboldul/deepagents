@@ -15,6 +15,7 @@ import asyncio
 import atexit
 import logging
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from deepagents_code._server_config import ServerConfig
@@ -22,6 +23,8 @@ from deepagents_code._startup_error import (
     STARTUP_ERROR_MARKER as _STARTUP_ERROR_MARKER,
     emit_startup_failure,
 )
+from deepagents_code.configuration.interpreter import InterpreterConfig
+from deepagents_code.configuration.resolver import get_config_resolver
 from deepagents_code.project_utils import ProjectContext, get_server_project_context
 
 if TYPE_CHECKING:
@@ -29,6 +32,7 @@ if TYPE_CHECKING:
 
     from deepagents.backends.composite import CompositeBackend
 
+    from deepagents_code.extensions.registry import ExtensionRegistry
     from deepagents_code.offload_middleware import OffloadOperation
 
 logger = logging.getLogger(__name__)
@@ -99,11 +103,11 @@ async def _build_tools(
         FileNotFoundError: If the MCP config file is not found.
         RuntimeError: If MCP tool loading fails.
     """
-    from deepagents_code.config import settings
+    from deepagents_code.config import credentials
     from deepagents_code.tools import fetch_url, get_current_thread_id, web_search
 
     tools: list[Any] = [fetch_url, get_current_thread_id]
-    if settings.has_tavily:
+    if credentials.has_tavily:
         tools.append(web_search)
 
     mcp_server_info: list[Any] | None = None
@@ -240,7 +244,6 @@ async def _make_graphs() -> ServerRuntime:
         Any,
         Any,
         Any,
-        Any,
     ]:
         project_context = get_server_project_context()
 
@@ -248,19 +251,18 @@ async def _make_graphs() -> ServerRuntime:
         from deepagents_code.config import (
             configure_langsmith_secret_redaction,
             create_model,
+            credentials,
             is_memory_auto_save_enabled,
-            settings,
         )
 
         if project_context is not None:
-            settings.reload_from_environment(start_path=project_context.user_cwd)
+            credentials.reload_from_environment(start_path=project_context.user_cwd)
         return (
             project_context,
             create_cli_agent,
             load_async_subagents,
             create_model,
             is_memory_auto_save_enabled,
-            settings,
             configure_langsmith_secret_redaction,
         )
 
@@ -270,7 +272,6 @@ async def _make_graphs() -> ServerRuntime:
         load_async_subagents,
         create_model,
         is_memory_auto_save_enabled,
-        settings,
         configure_langsmith_secret_redaction,
     ) = await asyncio.to_thread(_resolve_project_context_and_settings)
     configure_langsmith_secret_redaction()
@@ -284,8 +285,9 @@ async def _make_graphs() -> ServerRuntime:
         config.model,
         extra_kwargs=config.model_params,
         profile_overrides=config.profile_overrides,
+        cli_max_retries=config.cli_max_retries,
     )
-    result.apply_to_settings()
+    result.apply_to_runtime_state()
 
     tools, mcp_server_info, mcp_tools = await _build_tools(config, project_context)
     read_only_context_tools = _criteria_context_tools(tools, mcp_tools)
@@ -343,18 +345,21 @@ async def _make_graphs() -> ServerRuntime:
             )
             sys.exit(1)
 
+    extension_registry: ExtensionRegistry | None = None
+
     def _create_cli_graphs_sync() -> ServerRuntime:
         async_subagents = load_async_subagents() or None
         auto_mode_enabled = config.interactive and sandbox_backend is None
 
-        # These process-global settings writes are safe here because `make_graph`
-        # is lock-serialized and caches one graph for the server process lifetime.
-        if config.interpreter_ptc is not None:
-            settings.interpreter_ptc = config.interpreter_ptc
-        if config.interpreter_ptc_acknowledge_unsafe:
-            settings.interpreter_ptc_acknowledge_unsafe = True
-        if config.enable_interpreter:
-            settings.enable_interpreter = True
+        interpreter_config = (
+            InterpreterConfig.from_resolver(
+                get_config_resolver(),
+                ptc=config.interpreter_ptc,
+                ptc_acknowledge_unsafe=config.interpreter_ptc_acknowledge_unsafe,
+            )
+            if config.enable_interpreter
+            else None
+        )
 
         agent, composite_backend = create_cli_agent(
             model=result.model,
@@ -376,6 +381,7 @@ async def _make_graphs() -> ServerRuntime:
             enable_skills=config.enable_skills,
             enable_shell=config.enable_shell,
             enable_interpreter=config.enable_interpreter,
+            interpreter_config=interpreter_config,
             rubric_model=config.rubric_model,
             rubric_max_iterations=config.rubric_max_iterations,
             auto_classifier_model=config.auto_classifier_model,
@@ -386,6 +392,10 @@ async def _make_graphs() -> ServerRuntime:
             async_subagents=async_subagents,
             goal_criteria_tools=read_only_context_tools,
             rubric_grader_tools=read_only_context_tools,
+            model_retries=result.model_retries,
+            cli_max_retries=result.cli_max_retries,
+            summarization_model=config.summarization_model,
+            extension_registry=extension_registry,
         )
         from deepagents_code.offload_middleware import offload_operation_from
 
@@ -402,7 +412,46 @@ async def _make_graphs() -> ServerRuntime:
             offload=offload,
         )
 
-    return await asyncio.to_thread(_create_cli_graphs_sync)
+    from deepagents_code._env_vars import EXPERIMENTAL, is_env_truthy
+
+    if is_env_truthy(EXPERIMENTAL):
+        from deepagents_code.extensions import ExtensionMode, load_extensions
+        from deepagents_code.extensions.runtime import bind_server_extensions
+
+        extension_result = await load_extensions(
+            cwd=(
+                project_context.user_cwd
+                if project_context is not None
+                else Path(config.cwd)
+                if config.cwd is not None
+                else None
+            ),
+            mode=(
+                ExtensionMode.INTERACTIVE
+                if config.interactive
+                else ExtensionMode.HEADLESS
+            ),
+            project_root=(
+                project_context.project_root or project_context.user_cwd
+                if project_context is not None
+                else None
+            ),
+            project_trust_granted=config.trust_project_extensions,
+            cli_paths=tuple(Path(path) for path in config.extension_paths),
+        )
+        for message in extension_result.errors:
+            logger.warning("Extension not loaded: %s", message)
+        if extension_result.active:
+            extension_registry = extension_result.registry
+            bind_server_extensions(extension_result)
+    try:
+        return await asyncio.to_thread(_create_cli_graphs_sync)
+    except BaseException:
+        if extension_registry is not None:
+            from deepagents_code.extensions.runtime import shutdown_server_extensions
+
+            await shutdown_server_extensions()
+        raise
 
 
 def _build_runtime_factory(

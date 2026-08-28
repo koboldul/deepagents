@@ -15,7 +15,11 @@ import sys
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import (
+    dataclass,
+    field as dataclass_field,
+    replace as dataclass_replace,
+)
 from enum import StrEnum
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
@@ -40,27 +44,26 @@ from deepagents_code._paths import (
     PATHS,
 )
 from deepagents_code._version import __version__
-from deepagents_code.config_manifest import (
-    INTERPRETER_ENABLE_DEFAULT,
-    INTERPRETER_MAX_PTC_CALLS_DEFAULT,
-    INTERPRETER_MAX_RESULT_CHARS_DEFAULT,
-    INTERPRETER_MEMORY_LIMIT_MB_DEFAULT,
-    INTERPRETER_PTC_ACKNOWLEDGE_UNSAFE_DEFAULT,
-    INTERPRETER_PTC_DEFAULT,
-    INTERPRETER_TIMEOUT_SECONDS_DEFAULT,
-    RECURSION_LIMIT_DEFAULT,
-)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
+
+    from langchain_core.runnables import RunnableConfig
+
+    from deepagents_code.config_manifest import ConfigOption
+    from deepagents_code.configuration.resolver import (
+        ConfigResolver,
+        RankedProviderValue,
+    )
+    from deepagents_code.configuration.types import ProviderStatus
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Lazy bootstrap: dotenv loading, LANGSMITH_PROJECT override, and start-path
-# detection are deferred until first access of `settings` (via module
+# detection are deferred until first access of `credentials` (via module
 # `__getattr__`).  This avoids disk I/O and path traversal during import for
-# callers that never touch `settings` (e.g. `deepagents --help`).
+# callers that never touch credentials (e.g. `deepagents --help`).
 # ---------------------------------------------------------------------------
 
 
@@ -103,7 +106,7 @@ _bootstrap_lock = threading.Lock()
 and the prewarm worker thread."""
 
 _singleton_lock = threading.Lock()
-"""Guards lazy singleton construction in `_get_console` / `_get_settings`."""
+"""Guards lazy construction of process-wide config, runtime, and console state."""
 
 _dotenv_loaded_values: dict[str, str] = {}
 """Environment values injected by our dotenv loader and safe to refresh later."""
@@ -295,12 +298,17 @@ def _report_denied_env_key(key: str, dotenv_path: Path, *, is_project: bool) -> 
     logger.warning("%s", message)
 
 
+_LANGGRAPH_DEFAULT_RECURSION_LIMIT_ENV = "LANGGRAPH_DEFAULT_RECURSION_LIMIT"
+"""Upstream recursion default that only trusted user input may override."""
+
+
 _PROJECT_DOTENV_DENIED_ENV_KEYS = frozenset(
     {
         DANGEROUSLY_ENABLE_PROJECT_MCP_SERVERS,
         DISABLED_PROJECT_MCP_SERVERS,
         AUTO_CLASSIFIER_MODEL,
         AUTO_CLASSIFIER_TIMEOUT,
+        _LANGGRAPH_DEFAULT_RECURSION_LIMIT_ENV,
         "TERM_PROGRAM",
     }
 )
@@ -324,6 +332,16 @@ a repo-supplied downgrade of a user-level security decision, not a project build
 setting. Choosing a classifier stays available through the trusted surfaces:
 shell exports, the global `~/.deepagents/.env`, `[models].auto_classifier` in
 `~/.deepagents/config.toml`, `--auto-classifier-model`, and `/auto model`.
+
+`LANGGRAPH_DEFAULT_RECURSION_LIMIT` controls the graph step budget whenever no
+Deep Agents override is configured. A project value would bypass the bounded
+`runtime.recursion_limit` resolver, so only the shell or global `.env` may set
+the upstream default.
+
+Membership is checked against the uppercased key for the same reason as
+`_is_dotenv_denied_env_key`: on Windows, `os.environ` normalizes assigned keys
+to uppercase, so a lowercase `langgraph_default_recursion_limit` would slip
+past an exact-match check yet become the active variable the local API reads.
 
 `AUTO_CLASSIFIER_TIMEOUT` tunes the same control's review deadline, so it is
 denied for the same reason: a cloned repo could otherwise stall every gated
@@ -449,7 +467,10 @@ def _preview_dotenv_environ(*, start_path: Path | None = None) -> dict[str, str]
             ):
                 # Mirror `_load_dotenv`: a project `.env` cannot preview-set a
                 # user-level trust decision — MCP trust lists or the Auto
-                # classifier model/deadline (the global `.env`/shell can).
+                # classifier model/deadline (the global `.env`/shell can). The
+                # key is uppercased so a case variant cannot slip past on
+                # Windows, where `os.environ` assignment normalizes it back to
+                # the active uppercase form.
                 logger.debug(
                     "Ignoring project-denied env key %r from %s", key, dotenv_path
                 )
@@ -572,7 +593,10 @@ def _load_dotenv(
                 # A committed project `.env` must not set a user-level trust
                 # decision — MCP trust lists or the Auto classifier model and
                 # deadline that authorize this repo's own tool calls; the
-                # global `.env` and shell may (is_project=False).
+                # global `.env` and shell may (is_project=False). The key is
+                # uppercased so a case variant cannot slip past on Windows,
+                # where `os.environ` assignment normalizes it back to the
+                # active uppercase form.
                 logger.debug(
                     "Ignoring project-denied env key %r from %s", key, dotenv_path
                 )
@@ -1340,7 +1364,7 @@ def _ensure_bootstrap() -> None:
     """Run one-time bootstrap: dotenv loading and `LANGSMITH_PROJECT` override.
 
     Idempotent and thread-safe — subsequent calls are no-ops. Called
-    automatically by `_get_settings()` when `settings` is first accessed.
+    automatically by `_get_credentials()` when `credentials` is first accessed.
 
     The flag is set in `finally` so that partial failures (e.g. a
     malformed `.env`) still mark bootstrap as done — preventing infinite retry
@@ -1460,12 +1484,6 @@ if TYPE_CHECKING:
 
     from deepagents_code._git import RepositoryMetadata
 
-    # Static type stubs for lazy module attributes resolved by __getattr__.
-    # At runtime these are created on first access by _get_settings() /
-    # _get_console() and cached in globals().
-    settings: Settings
-    console: Console
-
 MODE_PREFIXES: dict[str, str] = {
     "shell_incognito": "!!",
     "shell": "!",
@@ -1565,6 +1583,11 @@ class Glyphs:
 
     # Diff-specific
     hunk_break: str  # ⋮ vs :
+    # Distinct from `ellipsis`, which is identical in Unicode mode but
+    # ASCII-expands to "..." — three cells would overflow the diff's
+    # line-number column, which is only `max(2, len(str(max_line)))` wide,
+    # and break the vertical alignment every row shares.
+    line_continuation: str  # … vs .
 
     # Status bar
     git_branch: str  # "↗" vs "git:"
@@ -1599,6 +1622,7 @@ UNICODE_GLYPHS = Glyphs(
     box_horizontal_heavy="━",
     # Diff-specific
     hunk_break="⋮",
+    line_continuation="…",
     # Status bar
     git_branch="↗",
 )
@@ -1633,6 +1657,7 @@ ASCII_GLYPHS = Glyphs(
     box_horizontal_heavy="=",
     # Diff-specific
     hunk_break=":",
+    line_continuation=".",
     # Status bar
     git_branch="git:",
 )
@@ -1938,20 +1963,6 @@ Longer values are truncated with an ellipsis by `truncate_value`
 in `tool_display`.
 """
 
-config: RunnableConfig = {
-    "recursion_limit": RECURSION_LIMIT_DEFAULT,
-}
-"""Default LangGraph runnable config for the main agent.
-
-Sets `recursion_limit` to `RECURSION_LIMIT_DEFAULT` (2000) to accommodate deeply
-nested agent graphs in long-running sessions without hitting the default
-LangGraph ceiling. The literal lives in `config_manifest` so the default is
-defined in exactly one place. This value is the fallback: `create_cli_agent`
-resolves the effective limit at agent-build time via `resolve_recursion_limit`,
-which honors the `--recursion-limit` CLI flag, the `DEEPAGENTS_CODE_RECURSION_LIMIT`
-env var, and `[runtime].recursion_limit` in `config.toml`.
-"""
-
 _git_branch_cache: dict[str, str | None] = {}
 """Per-cwd cache of resolved git branch names.
 
@@ -2137,6 +2148,7 @@ def build_stream_config(
     turn_id: str | None = None,
     turn_number: int | None = None,
     auto_approve: bool = False,
+    skill_name: str | None = None,
 ) -> RunnableConfig:
     """Build the LangGraph stream config dict.
 
@@ -2202,9 +2214,11 @@ def build_stream_config(
         turn_number: 1-based per-thread turn index, or `None`.
         auto_approve: Whether auto-approve ("YOLO") mode is active for this turn.
             When `True`, `dcode_auto_approve=True` is recorded in trace metadata.
+        skill_name: Invoked skill name to record in trace metadata, or `None`.
 
     Returns:
-        Config dict with `configurable` and `metadata` keys.
+        Config dict with `configurable` and `metadata` keys, plus
+            `recursion_limit` when one is configured.
     """
     from datetime import UTC, datetime
 
@@ -2234,6 +2248,9 @@ def build_stream_config(
     if auto_approve:
         metadata["dcode_auto_approve"] = True
 
+    if skill_name:
+        metadata["ls_skill_name"] = skill_name
+
     # Record the launch environment so traces are groupable by terminal.
     # Blank is treated as unset, matching the other readers. Not a contract key.
     term_program = os.environ.get("TERM_PROGRAM", "").strip()
@@ -2259,10 +2276,19 @@ def build_stream_config(
             }
         )
 
-    return {
+    config: RunnableConfig = {
         "configurable": {"thread_id": thread_id},
         "metadata": metadata,
     }
+
+    # Send configured limits with each run so the setting takes effect.
+    from deepagents_code.config_manifest import resolve_recursion_limit
+
+    resolved_recursion_limit = resolve_recursion_limit()
+    if resolved_recursion_limit is not None:
+        config["recursion_limit"] = resolved_recursion_limit
+
+    return config
 
 
 class _ShellAllowAll(list):  # noqa: FURB189  # sentinel type, not a general-purpose list subclass
@@ -2454,18 +2480,116 @@ def _parse_interpreter_ptc(
     raise ValueError(msg)
 
 
-def _read_config_toml_retries() -> dict[str, Any] | None:
-    """Read and lightly validate `[retries]` from managed config over user config.
+@dataclass(frozen=True)
+class _ProviderRetryConfig:
+    """Validated retry settings for one provider."""
 
-    Provider sub-table names are checked against the set of providers the app
-    knows how to authenticate so a mistyped provider (e.g. `[retries.fireorks]`)
-    surfaces a warning rather than being silently dropped. Value validation is
-    deferred to `_resolve_retry_kwargs`, which runs per active provider.
+    max_retries: int | None = None
+    param: str | None = None
+
+
+@dataclass(frozen=True)
+class _RetryConfig:
+    """Validated retry configuration and user-facing diagnostics."""
+
+    max_retries: int | None = None
+    providers: dict[str, _ProviderRetryConfig] = dataclass_field(default_factory=dict)
+    warnings: tuple[str, ...] = ()
+
+
+def _coerce_max_retries(raw: Any, *, source: str) -> tuple[int | None, str | None]:  # noqa: ANN401
+    """Return a validated retry count and an optional diagnostic."""
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return raw, None
+    return None, f"Ignoring {source}={raw!r} in config.toml (expected int >= 0)"
+
+
+def _coerce_retry_param(raw: Any, *, source: str) -> tuple[str | None, str | None]:  # noqa: ANN401
+    """Return a validated provider retry parameter and optional diagnostic."""
+    if isinstance(raw, str) and raw.isidentifier() and not keyword.iskeyword(raw):
+        return raw, None
+    return (
+        None,
+        (
+            f"Ignoring {source}={raw!r} in config.toml "
+            "(expected Python identifier string)"
+        ),
+    )
+
+
+def _parse_retry_config(
+    section: dict[str, Any] | None,
+    *,
+    known_providers: set[str] | None = None,
+    warnings: tuple[str, ...] = (),
+) -> _RetryConfig:
+    """Validate a raw `[retries]` table without logging side effects.
 
     Returns:
-        The merged `[retries]` mapping, or `None` when neither layer supplies
-            the section. An unusable `~/.deepagents/config.toml` drops only the
-            user layer; managed policy still applies.
+        Parsed retry configuration and diagnostics.
+    """
+    if not section:
+        return _RetryConfig(warnings=warnings)
+
+    diagnostics = list(warnings)
+    global_retries: int | None = None
+    providers: dict[str, _ProviderRetryConfig] = {}
+    if "max_retries" in section:
+        global_retries, warning = _coerce_max_retries(
+            section["max_retries"], source="[retries].max_retries"
+        )
+        if warning:
+            diagnostics.append(warning)
+
+    for provider, raw in section.items():
+        if provider == "max_retries":
+            continue
+        if not isinstance(raw, dict):
+            diagnostics.append(f"Ignoring [retries].{provider}={raw!r} in config.toml")
+            continue
+        if (
+            known_providers is not None
+            and provider not in known_providers
+            and "param" not in raw
+        ):
+            # Kept, not dropped: a provider dcode does not list can still be
+            # the one the langchain registry builds, and discarding the table
+            # would silently ignore a setting that does apply. Say that, rather
+            # than claiming an override that never happens.
+            diagnostics.append(
+                f"[retries.{provider}] in config.toml names an unrecognized "
+                f"provider; it applies only if {provider!r} is the provider "
+                "dcode builds"
+            )
+        for key, value in raw.items():
+            if key not in {"max_retries", "param"}:
+                diagnostics.append(
+                    f"Ignoring [retries.{provider}].{key}={value!r} in config.toml"
+                )
+        provider_retries: int | None = None
+        retry_param: str | None = None
+        if "max_retries" in raw:
+            provider_retries, warning = _coerce_max_retries(
+                raw["max_retries"], source=f"[retries.{provider}].max_retries"
+            )
+            if warning:
+                diagnostics.append(warning)
+        if "param" in raw:
+            retry_param, warning = _coerce_retry_param(
+                raw["param"], source=f"[retries.{provider}].param"
+            )
+            if warning:
+                diagnostics.append(warning)
+        providers[provider] = _ProviderRetryConfig(provider_retries, retry_param)
+
+    return _RetryConfig(global_retries, providers, tuple(diagnostics))
+
+
+def _read_retry_config() -> _RetryConfig:
+    """Read and validate merged retry configuration.
+
+    Returns:
+        Parsed retry configuration and diagnostics.
     """
     from deepagents_code.configuration.service import get_config_sources
     from deepagents_code.model_config import (
@@ -2475,25 +2599,22 @@ def _read_config_toml_retries() -> dict[str, Any] | None:
         RETRY_PARAM_BY_PROVIDER,
     )
 
+    diagnostics: list[str] = []
     sources = get_config_sources()
     if not sources.user.status.usable:
-        logger.warning(
-            "Could not read retries config from %s",
-            sources.user.status.path,
+        diagnostics.append(
+            f"Could not read retries config from {sources.user.status.path}"
         )
     dropped = sources.dropped_managed_detail()
     if dropped is not None:
-        logger.error(
-            "Managed policy from %s is not being applied: %s",
-            sources.managed.status.path,
-            dropped,
+        diagnostics.append(
+            f"Managed policy from {sources.managed.status.path} "
+            f"is not being applied: {dropped}"
         )
-    # Managed policy parsed cleanly and must still apply, so keep going
-    # with the merged data (managed-only when the user file failed).
     data, _ = sources.merged()
     section = data.get("retries")
     if not isinstance(section, dict):
-        return None
+        return _RetryConfig(warnings=tuple(diagnostics))
 
     known_providers = (
         set(PROVIDER_API_KEY_ENV)
@@ -2501,181 +2622,197 @@ def _read_config_toml_retries() -> dict[str, Any] | None:
         | set(IMPLICIT_AUTH_PROVIDERS)
         | set(RETRY_PARAM_BY_PROVIDER)
     )
-    for key, value in section.items():
-        if (
-            isinstance(value, dict)
-            and key not in known_providers
-            and "param" not in value
-        ):
-            logger.warning(
-                "Ignoring [retries.%s] in config.toml; %r is not a known provider",
-                key,
-                key,
-            )
-    return section
-
-
-def _coerce_max_retries(raw: Any, *, source: str) -> int | None:  # noqa: ANN401
-    """Validate a TOML retry count.
-
-    Args:
-        raw: Value loaded from TOML.
-        source: Human-readable config path for warnings.
-
-    Returns:
-        The retry count, or `None` when invalid.
-    """
-    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
-        return raw
-    logger.warning("Ignoring %s=%r in config.toml (expected int >= 0)", source, raw)
-    return None
-
-
-def _coerce_retry_param(raw: Any, *, source: str) -> str | None:  # noqa: ANN401
-    """Validate a constructor kwarg name for retry configuration.
-
-    Args:
-        raw: Value loaded from TOML.
-        source: Human-readable config path for warnings.
-
-    Returns:
-        The retry parameter name, or `None` when invalid.
-    """
-    if isinstance(raw, str) and raw.isidentifier() and not keyword.iskeyword(raw):
-        return raw
-    logger.warning(
-        "Ignoring %s=%r in config.toml (expected Python identifier string)",
-        source,
-        raw,
+    models = data.get("models")
+    if isinstance(models, dict):
+        providers = models.get("providers")
+        if isinstance(providers, dict):
+            known_providers.update(providers)
+    return _parse_retry_config(
+        section,
+        known_providers=known_providers,
+        warnings=tuple(diagnostics),
     )
-    return None
 
 
-def _resolve_retry_kwargs(
-    section: dict[str, Any] | None,
+def _resolve_config_retry_count(
+    config: _RetryConfig,
     provider: str,
-) -> dict[str, int]:
-    """Resolve the retry-count kwarg for `provider` from a `[retries]` section.
+) -> int | None:
+    """Return the provider-specific retry count over the global count."""
+    provider_config = config.providers.get(provider)
+    if provider_config is not None and provider_config.max_retries is not None:
+        return provider_config.max_retries
+    return config.max_retries
 
-    A per-provider `[retries.<provider>].max_retries` overrides the global
-    `[retries].max_retries`. Known providers use `RETRY_PARAM_BY_PROVIDER`;
-    arbitrary providers can opt in with `[retries.<provider>].param`.
-    Unknown providers without a configured parameter receive nothing, and
-    unknown or malformed keys are dropped with a warning.
+
+_warned_unknown_retry_providers: set[str] = set()
+"""Providers already reported as having no identifiable retry control."""
+
+
+def _resolve_retry_param(
+    config: _RetryConfig, provider: str, model_kwargs: Mapping[str, Any]
+) -> str | None:
+    """Return the kwarg naming `provider`'s own retry count, if it is known.
 
     Args:
-        section: Raw `[retries]` mapping from `config.toml`, or `None`.
-        provider: Provider the kwargs are being resolved for.
+        config: Parsed retry configuration.
+        provider: Effective model provider.
+        model_kwargs: Constructor kwargs after all user overrides are merged.
 
     Returns:
-        `{retry_param_name: count}` when a valid retry count resolves, else an
-            empty dict.
+        The kwarg dcode will force to the provider's disable value, or `None`
+        when the provider's retry control cannot be identified.
     """
-    if not section:
-        return {}
-
     from deepagents_code.model_config import RETRY_PARAM_BY_PROVIDER
 
-    for key, value in section.items():
-        if key == "max_retries" or isinstance(value, dict):
-            continue
-        logger.warning("Ignoring [retries].%s=%r in config.toml", key, value)
-
-    retry_param = RETRY_PARAM_BY_PROVIDER.get(provider)
-    resolved: int | None = None
-    if "max_retries" in section:
-        resolved = _coerce_max_retries(
-            section["max_retries"], source="[retries].max_retries"
-        )
-
-    provider_section = section.get(provider)
-    if provider_section is not None and not isinstance(provider_section, dict):
-        logger.warning(
-            "Ignoring [retries].%s=%r in config.toml (expected table)",
-            provider,
-            provider_section,
-        )
-    elif provider_section:
-        for key, value in provider_section.items():
-            if key not in {"max_retries", "param"}:
-                logger.warning(
-                    "Ignoring [retries.%s].%s=%r in config.toml",
-                    provider,
-                    key,
-                    value,
-                )
-        if "max_retries" in provider_section:
-            provider_value = _coerce_max_retries(
-                provider_section["max_retries"],
-                source=f"[retries.{provider}].max_retries",
-            )
-            if provider_value is not None:
-                resolved = provider_value
-        if "param" in provider_section:
-            provider_param = _coerce_retry_param(
-                provider_section["param"],
-                source=f"[retries.{provider}].param",
-            )
-            if provider_param is not None:
-                retry_param = provider_param
-
+    # An explicit `[retries.<provider>].param` outranks the built-in registry:
+    # the user is correcting our knowledge of their provider's SDK, so honoring
+    # the registry instead would silently discard the directive.
+    provider_config = config.providers.get(provider)
+    retry_param = provider_config.param if provider_config is not None else None
     if retry_param is None:
+        retry_param = RETRY_PARAM_BY_PROVIDER.get(provider)
+
+    # A custom provider that already exposes the conventional parameter has
+    # positively identified its retry control through model configuration. The
+    # value itself is replaced by the caller -- it is a detection signal, not a
+    # setting.
+    if retry_param is None and "max_retries" in model_kwargs:
+        retry_param = "max_retries"
+    return retry_param
+
+
+def _provider_retry_disable_kwargs(
+    config: _RetryConfig,
+    provider: str,
+    model_kwargs: dict[str, Any],
+) -> dict[str, int]:
+    """Return the constructor kwarg that disables provider-owned retries.
+
+    Args:
+        config: Parsed retry configuration.
+        provider: Effective model provider.
+        model_kwargs: Constructor kwargs after all user overrides are merged.
+
+    Returns:
+        A one-item mapping that disables provider retries when the provider's
+        retry control is known, otherwise an empty mapping.
+    """
+    from deepagents_code.model_config import RETRY_DISABLE_VALUE_BY_PROVIDER
+
+    retry_param = _resolve_retry_param(config, provider, model_kwargs)
+    if retry_param is None:
+        # A `None` entry records an integration checked and found to have no
+        # retry-count kwarg, so there is no SDK loop to multiply and nothing to
+        # warn about. Warning anyway pointed the user at
+        # `[retries.<provider>].param`, which their integration would drop.
+        from deepagents_code.model_config import RETRY_PARAM_BY_PROVIDER
+
+        if provider in RETRY_PARAM_BY_PROVIDER:
+            return {}
+        # The provider's own SDK retry loop can't be identified, so it stays
+        # active and may multiply the middleware's attempts. Register the
+        # provider in `RETRY_PARAM_BY_PROVIDER` or set `[retries.<provider>].param`.
+        # Said once per provider: nothing the user can do makes it stop, and
+        # `create_model` runs again for every subagent, rubric model, and
+        # runtime `/model` switch, so repeating it just buries the debug buffer.
+        if provider not in _warned_unknown_retry_providers:
+            _warned_unknown_retry_providers.add(provider)
+            logger.warning(
+                "No retry-disable kwarg known for provider %r, so its own SDK "
+                "retries stay active and may multiply dcode's retry attempts. "
+                "Set [retries.%s].param in config.toml to name the provider's "
+                "retry-count kwarg.",
+                provider,
+                provider,
+            )
+        return {}
+
+    disable_value = RETRY_DISABLE_VALUE_BY_PROVIDER.get(provider, 0)
+    existing = model_kwargs.get(retry_param)
+    if (
+        isinstance(existing, int)
+        and not isinstance(existing, bool)
+        and existing != disable_value
+    ):
         logger.warning(
-            "Ignoring [retries] config for provider %r; provider does not support "
-            "a registered or configured retry parameter",
+            "Ignoring %s=%r for provider %r: dcode's model-node middleware owns "
+            "the retry budget, so the provider's own retry loop is disabled. Use "
+            "--max-retries or [retries.%s].max_retries to set the budget.",
+            retry_param,
+            existing,
+            provider,
             provider,
         )
-        return {}
-
-    if resolved is None:
-        return {}
-    return {retry_param: resolved}
+    return {retry_param: disable_value}
 
 
-CLI_MAX_RETRIES_KEY = "__deepagents_cli_max_retries__"
-"""Internal carrier key for the `--max-retries` CLI flag.
+DEFAULT_MODEL_RETRIES = 5
+"""Default model-node retry attempts after the first call when config is absent.
 
-`cli_main` stashes the flag value under this key in the `model_params` dict it
-forwards to the run, and `create_model` pops it before constructing the model.
-This lets the CLI value ride the existing `model_params`/`extra_kwargs` carrier
-to the one place that authoritatively resolves the provider, where it can be
-folded under the provider's *resolved* retry-param name (see
-`_resolve_retry_param_name`) rather than a hardcoded `max_retries`.
-
-The key is internal-only: it is popped before reaching any model constructor and
-is never serialized or surfaced to users. It is deliberately unlikely to collide
-with a real constructor kwarg name.
+Canonical source for the dcode retry default; `model_retry` re-exports it so the
+middleware and the config resolver never drift.
 """
 
+MODEL_RETRIES_ATTR = "_deepagents_model_retries"
+"""Private model attribute carrying the budget resolved when it was built."""
 
-def _resolve_retry_param_name(provider: str) -> str:
-    """Resolve the constructor kwarg name that sets `provider`'s retry count.
 
-    Honors a `[retries.<provider>].param` override in `config.toml`, then the
-    registered `RETRY_PARAM_BY_PROVIDER` mapping, and finally falls back to
-    `max_retries` -- the near-universal LangChain chat-model kwarg -- for
-    providers that are neither registered nor configured.
+def _resolve_model_retries_from_section(
+    config: _RetryConfig,
+    provider: str,
+    cli_max_retries: int | None,
+) -> int:
+    """Resolve a retry budget from an already-loaded `[retries]` section.
+
+    Precedence (highest first):
+
+    1. `cli_max_retries` (the `--max-retries` flag).
+    2. `[retries.<provider>].max_retries` in `config.toml`.
+    3. `[retries].max_retries` (global) in `config.toml`.
+    4. `DEFAULT_MODEL_RETRIES`.
+
+    A resolved value of `0` disables retries. The caller passes the section in
+    so `create_model` reads `config.toml` once for both the budget and the
+    provider disable kwarg.
 
     Args:
-        provider: Provider the retry kwarg name is being resolved for.
+        config: Parsed retry configuration.
+        provider: Effective model provider.
+        cli_max_retries: Explicit CLI override, or `None` when unset.
 
     Returns:
-        The constructor kwarg name to use for the retry count.
+        The effective retry count. Always `>= 0` for a `cli_max_retries` that
+        came through `--max-retries`, which `non_negative_int` validates.
     """
-    from deepagents_code.model_config import RETRY_PARAM_BY_PROVIDER
+    if cli_max_retries is not None:
+        return cli_max_retries
+    configured = _resolve_config_retry_count(config, provider)
+    return configured if configured is not None else DEFAULT_MODEL_RETRIES
 
-    section = _read_config_toml_retries()
-    if section:
-        provider_section = section.get(provider)
-        if isinstance(provider_section, dict) and "param" in provider_section:
-            configured = _coerce_retry_param(
-                provider_section["param"],
-                source=f"[retries.{provider}].param",
-            )
-            if configured is not None:
-                return configured
 
-    return RETRY_PARAM_BY_PROVIDER.get(provider, "max_retries")
+def collect_retry_config_startup(
+    provider: str | None = None,
+    model_kwargs: Mapping[str, Any] | None = None,
+) -> tuple[list[str], set[str]]:
+    """Return retry diagnostics and the retry kwarg dcode will force.
+
+    Args:
+        provider: Effective model provider, when it is already resolved.
+        model_kwargs: Constructor kwargs the run will supply, used to detect a
+            custom provider's retry control.
+
+    Returns:
+        User-facing diagnostics, and the retry kwarg names `create_model` will
+        override for `provider`. The set is empty when the provider is unknown
+        or its retry control cannot be identified, because a kwarg belonging to
+        some other provider is forwarded to the constructor untouched.
+    """
+    retry_config = _read_retry_config()
+    if not provider:
+        return list(retry_config.warnings), set()
+    retry_param = _resolve_retry_param(retry_config, provider, model_kwargs or {})
+    return list(retry_config.warnings), {retry_param} if retry_param else set()
 
 
 _extra_skills_path_base: ContextVar[Path | None] = ContextVar(
@@ -2795,14 +2932,12 @@ _RELOADABLE_FIELDS = (
     "google_cloud_location",
     "deepagents_langchain_project",
     "project_root",
-    "shell_allow_list",
-    "extra_skills_dirs",
 )
 """Fields refreshed on `/reload` and cwd switches.
 
-Runtime model state (`model_name`, `model_provider`, `model_context_limit`) and
-the original user LangSmith project are intentionally excluded -- they are set
-once and should not change across reloads.
+Runtime model metadata lives in `RuntimeState` and cannot be touched by a config
+reload. The original user LangSmith project is intentionally excluded because it
+is captured once at bootstrap.
 """
 
 _API_KEY_FIELDS = frozenset(
@@ -2814,17 +2949,179 @@ Derived from `_RELOADABLE_FIELDS` so new `*_api_key` fields are picked up
 automatically.
 """
 
+_RESOLVER_RELOAD_FIELDS = (
+    "shell_allow_list",
+    "extra_skills_dirs",
+)
+"""Resolver-backed values included in reload previews and change reports."""
+
+_RELOAD_CHANGE_FIELDS = (*_RELOADABLE_FIELDS, *_RESOLVER_RELOAD_FIELDS)
+"""Stable display order for every reload-owned change report entry."""
+
+_resolver_reload_snapshot: dict[str, object] = {
+    "shell_allow_list": None,
+    "extra_skills_dirs": None,
+}
+_resolver_reload_snapshot_lock = threading.Lock()
+
+
+@dataclass(slots=True)
+class _ReloadOverrideProvider:
+    """Retain resolver values when one reload candidate cannot be applied."""
+
+    name: str = "retained reload value"
+    rank: int = 350
+    _values: dict[str, object] = dataclass_field(default_factory=dict)
+    _lock: threading.Lock = dataclass_field(default_factory=threading.Lock)
+
+    @property
+    def durable(self) -> bool:
+        """The retained generation exists only for this process lifetime."""
+        return False
+
+    def get(self, option: ConfigOption) -> RankedProviderValue[object]:
+        """Return a retained typed value or leave the option unset."""
+        from deepagents_code.configuration.resolver import RankedProviderValue
+        from deepagents_code.configuration.types import (
+            Found,
+            ProviderHealth,
+            ProviderStatus,
+            Unset,
+        )
+
+        with self._lock:
+            result = (
+                Found(self._values[option.key])
+                if option.key in self._values
+                else Unset()
+            )
+        return RankedProviderValue(
+            self.rank,
+            self.durable,
+            ProviderStatus(self.name, None, ProviderHealth.OK),
+            result,
+        )
+
+    def status(self) -> ProviderStatus:
+        """Return the health of the in-memory retained generation."""
+        from deepagents_code.configuration.types import ProviderHealth, ProviderStatus
+
+        return ProviderStatus(self.name, None, ProviderHealth.OK)
+
+    def reload(self) -> None:
+        """Keep the accepted in-memory generation unchanged."""
+
+    def replace(self, values: Mapping[str, object]) -> None:
+        """Atomically replace the options whose previous values stay in force."""
+        with self._lock:
+            self._values = dict(values)
+
+
+_reload_override_provider = _ReloadOverrideProvider()
+
+
+def _resolver_with_reload_overrides() -> ConfigResolver:
+    """Return the shared resolver with the reload-retention tier installed."""
+    from deepagents_code.configuration.resolver import (
+        RELOAD_RANK,
+        get_config_resolver,
+    )
+
+    resolver = get_config_resolver()
+    if RELOAD_RANK not in resolver.provider_statuses():
+        resolver.install_provider(_reload_override_provider)
+    return resolver
+
+
+def _sync_reload_overrides(
+    values: Mapping[str, object], *, path_base: Path | None
+) -> None:
+    """Retain values that the refreshed resolver generation cannot reproduce."""
+    from deepagents_code.config_manifest import get_option
+    from deepagents_code.configuration.resolver import RELOAD_RANK
+
+    resolver = _resolver_with_reload_overrides()
+    retained: dict[str, object] = {}
+    option_keys = {
+        "shell_allow_list": "shell.allow_list",
+        "extra_skills_dirs": "skills.extra_allowed_dirs",
+    }
+    with _use_extra_skills_path_base(path_base):
+        for field, key in option_keys.items():
+            option = get_option(key)
+            if option is None:
+                continue
+            try:
+                candidate = resolver.get_without_ranks(option, {RELOAD_RANK}).value
+            except (OSError, RuntimeError, ValueError):
+                candidate = object()
+            if candidate != values[field]:
+                retained[key] = values[field]
+    _reload_override_provider.replace(retained)
+
+
+def _remember_resolver_reload_values(values: Mapping[str, object]) -> None:
+    """Remember the accepted resolver generation for future change reports."""
+    with _resolver_reload_snapshot_lock:
+        for field in _RESOLVER_RELOAD_FIELDS:
+            _resolver_reload_snapshot[field] = values[field]
+
+
+def _remembered_resolver_reload_values() -> dict[str, object]:
+    """Return the resolver generation currently accepted by runtime reload."""
+    with _resolver_reload_snapshot_lock:
+        return dict(_resolver_reload_snapshot)
+
+
+def _current_resolver_reload_values(*, path_base: Path | None) -> dict[str, object]:
+    """Snapshot resolver-backed values before a preview or accepted reload.
+
+    Returns:
+        Resolver values keyed by their stable reload-report field names.
+
+    Raises:
+        RuntimeError: If either reload-owned option is absent from the manifest.
+    """
+    from deepagents_code.config_manifest import _emit_ranked_diagnostics, get_option
+
+    options = tuple(
+        option
+        for key in ("shell.allow_list", "skills.extra_allowed_dirs")
+        if (option := get_option(key)) is not None
+    )
+    if len(options) != len(_RESOLVER_RELOAD_FIELDS):
+        msg = "reload options are missing from the configuration manifest"
+        raise RuntimeError(msg)
+    with _use_extra_skills_path_base(path_base):
+        resolved = _resolver_with_reload_overrides().resolve_options(options)
+    for option in options:
+        _emit_ranked_diagnostics(option, resolved[option.key])
+    return {
+        "shell_allow_list": resolved["shell.allow_list"].value,
+        "extra_skills_dirs": resolved["skills.extra_allowed_dirs"].value,
+    }
+
 
 @dataclass
-class Settings:
-    """Global settings and environment detection for deepagents-code.
+class RuntimeState:
+    """Mutable metadata for the model active in this process."""
 
-    This class is initialized once at startup and provides access to:
-    - Available models and API keys
-    - Current project information
-    - Tool availability (e.g., Tavily)
-    - File system paths
-    """
+    model_name: str | None = None
+    """Currently active model name, set after model creation."""
+
+    model_provider: str | None = None
+    """Provider identifier (e.g., `openai`, `anthropic`, `google_genai`)."""
+
+    model_context_limit: int | None = None
+    """Maximum input token count from the model profile."""
+
+    model_unsupported_modalities: frozenset[str] = frozenset()
+    """Input modalities not indicated as supported by the model profile."""
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialsSnapshot:
+    """One complete generation of credentials and project context."""
 
     openai_api_key: str | None
     """OpenAI API key if available."""
@@ -2853,104 +3150,92 @@ class Settings:
     user_langchain_project: str | None
     """Original `LANGSMITH_PROJECT` from environment (for user code)."""
 
-    model_name: str | None = None
-    """Currently active model name, set after model creation."""
-
-    model_provider: str | None = None
-    """Provider identifier (e.g., `openai`, `anthropic`, `google_genai`)."""
-
-    model_context_limit: int | None = None
-    """Maximum input token count from the model profile."""
-
-    model_unsupported_modalities: frozenset[str] = frozenset()
-    """Input modalities not indicated as supported by the model profile."""
-
     project_root: Path | None = None
     """Current project root directory, or `None` if not in a git project."""
 
-    shell_allow_list: list[str] | None = None
-    """Shell commands that don't require user approval."""
+    @property
+    def has_anthropic(self) -> bool:
+        """Check if Anthropic API key is configured."""
+        return self.anthropic_api_key is not None
 
-    extra_skills_dirs: list[Path] | None = None
-    """Extra directories added to the skill path containment allowlist.
+    @property
+    def has_google(self) -> bool:
+        """Check if Google API key is configured."""
+        return self.google_api_key is not None
 
-    These do NOT add new skill discovery locations — skills are still only
-    discovered from the standard directories. They exist so that symlinks inside
-    standard skill directories can point to targets in these additional
-    locations without being rejected by the containment check
-    in `load_skill_content`.
+    @property
+    def has_vertex_ai(self) -> bool:
+        """Check if VertexAI is available (Google Cloud project set, no API key)."""
+        return self.google_cloud_project is not None and self.google_api_key is None
 
-    Set via `DEEPAGENTS_CODE_EXTRA_SKILLS_DIRS` env var (colon-separated) or
-    `[skills].extra_allowed_dirs` in `~/.deepagents/config.toml`.
+    @property
+    def has_tavily(self) -> bool:
+        """Check if Tavily API key is configured."""
+        return self.tavily_api_key is not None
+
+
+_CREDENTIAL_FIELDS = frozenset(CredentialsSnapshot.__dataclass_fields__)
+
+
+class Credentials:
+    """Stable owner of the active credential and project-context snapshot.
+
+    Reloads construct a complete immutable `CredentialsSnapshot` and publish it
+    with one reference assignment. Callers that need a consistent multi-field
+    view can retain `active` while ordinary field reads remain source compatible.
     """
 
-    enable_interpreter: bool = INTERPRETER_ENABLE_DEFAULT
-    """Wire `CodeInterpreterMiddleware` from `langchain-quickjs` into the main
-    agent. Local-mode only; raises `ValueError` at agent-build time when a
-    remote sandbox is active. Subagents never receive the interpreter in v1.
+    openai_api_key: str | None
+    anthropic_api_key: str | None
+    google_api_key: str | None
+    nvidia_api_key: str | None
+    tavily_api_key: str | None
+    google_cloud_project: str | None
+    google_cloud_location: str | None
+    deepagents_langchain_project: str | None
+    user_langchain_project: str | None
+    project_root: Path | None
 
-    `langchain-quickjs` is installed as a core dependency.
+    def __init__(self, active: CredentialsSnapshot) -> None:
+        """Create a stable owner for one complete credential generation."""
+        self._active = active
 
-    Defaults are owned by `config_manifest` (the canonical config surface) so
-    they are defined in exactly one place.
-    """
+    @property
+    def active(self) -> CredentialsSnapshot:
+        """Complete credential generation currently in force."""
+        return self._active
 
-    interpreter_timeout_seconds: float = INTERPRETER_TIMEOUT_SECONDS_DEFAULT
-    """Per-`js_eval`-call wall-clock timeout (seconds) for the QuickJS REPL."""
+    def __getattr__(self, name: str) -> object:
+        """Forward credential field reads to the active immutable snapshot.
 
-    interpreter_memory_limit_mb: int = INTERPRETER_MEMORY_LIMIT_MB_DEFAULT
-    """QuickJS heap memory cap (MB), shared across all calls within a session."""
+        Returns:
+            The requested credential field value.
 
-    interpreter_max_ptc_calls: int = INTERPRETER_MAX_PTC_CALLS_DEFAULT
-    """Maximum `tools.*` host-bridge invocations allowed per `js_eval` call.
+        Raises:
+            AttributeError: If `name` is not a credential field.
+        """
+        if name in _CREDENTIAL_FIELDS:
+            return getattr(self._active, name)
+        msg = f"{type(self).__name__!s} has no attribute {name!r}"
+        raise AttributeError(msg)
 
-    PTC calls bypass `interrupt_on`/HITL approval — this budget is the only
-    runtime limiter on bursty tool fan-out from inside the REPL.
-    """
-
-    interpreter_max_result_chars: int = INTERPRETER_MAX_RESULT_CHARS_DEFAULT
-    """Independent cap (chars) on `js_eval` result and stdout blocks before
-    truncation."""
-
-    interpreter_ptc: str | bool | list[str] = INTERPRETER_PTC_DEFAULT
-    """Programmatic tool calling allowlist for `js_eval`.
-
-    Accepted values:
-
-    - `False` or `[]`: pure REPL, no `tools.*` bridge.
-    - `"safe"`: expand to `INTERPRETER_PTC_SAFE_PRESET` (the default).
-    - `"all"`: every tool passed to `create_cli_agent` is exposed. Requires
-        `interpreter_ptc_acknowledge_unsafe=True` when `auto_approve` is `False`.
-    - `list[str]`: explicit tool names. The list may also include the `"safe"`
-        preset (expanded to `INTERPRETER_PTC_SAFE_PRESET`); `"all"` is rejected
-        inside a list. Names are matched against the live tool registry at
-        runtime, so names not present are simply not exposed.
-    """
-
-    interpreter_ptc_acknowledge_unsafe: bool = (
-        INTERPRETER_PTC_ACKNOWLEDGE_UNSAFE_DEFAULT
-    )
-    """Explicit acknowledgement required when `interpreter_ptc="all"` is set
-    without `auto_approve`.
-
-    `"all"` exposes every host tool to `tools.*` calls from inside the REPL,
-    bypassing HITL approval — this flag is a deliberate sanity gate, not a
-    feature toggle.
-    """
+    def __setattr__(self, name: str, value: object) -> None:
+        """Publish a replacement snapshot for compatibility field mutations."""
+        if name in _CREDENTIAL_FIELDS:
+            self._active = dataclass_replace(self._active, **{name: value})
+            return
+        object.__setattr__(self, name, value)
 
     @classmethod
-    def from_environment(cls, *, start_path: Path | None = None) -> Settings:
-        """Create settings by detecting the current environment.
+    def from_environment(cls, *, start_path: Path | None = None) -> Credentials:
+        """Create credentials by detecting the current environment.
 
         Args:
             start_path: Directory to start project detection from (defaults to cwd)
 
         Returns:
-            Settings instance with detected configuration
+            Credentials instance with detected configuration.
 
-        Raises:
-            RuntimeError: If the manifest is missing an enforced managed key, so
-                resolving it from the environment alone would bypass policy.
         """
         # Detect API keys (normalize empty strings to None).
         from deepagents_code.model_config import resolve_env_var
@@ -2966,8 +3251,8 @@ class Settings:
         # Detect LangSmith configuration
         # DEEPAGENTS_CODE_LANGSMITH_PROJECT: Project for deepagents agent tracing
         # user_langchain_project: User's ORIGINAL LANGSMITH_PROJECT (before override)
-        # When accessed via the module-level `settings` singleton,
-        # _ensure_bootstrap() has already run and may have overridden
+        # When accessed via the module-level `credentials` proxy,
+        # `_ensure_bootstrap()` has already run and may have overridden
         # LANGSMITH_PROJECT. We use the saved original value, not the
         # current os.environ value. Direct callers should ensure
         # bootstrap has run if they depend on the override.
@@ -2984,85 +3269,24 @@ class Settings:
         from deepagents_code.project_utils import find_project_root
 
         project_root = find_project_root(start_path)
-
-        from deepagents_code.config_manifest import (
-            _emit_ranked_diagnostics,
-            get_config_options,
-            get_option,
+        _reload_override_provider.replace({})
+        _remember_resolver_reload_values(
+            _current_resolver_reload_values(path_base=start_path)
         )
-        from deepagents_code.configuration.resolver import get_config_resolver
-
-        # Resolve only the options this constructor reads. `resolve_all()`
-        # would also resolve `display.theme`, whose `THEME_DELEGATE` coercion
-        # reaches the theme registry and imports Textual (~470ms) — see
-        # `libs/code/AGENTS.md` on the startup hot path. Four CLI entry points
-        # in `skills/commands.py` build `Settings` without ever drawing a UI.
-        wanted = tuple(
-            option
-            for option in get_config_options()
-            if option.key in {"shell.allow_list", "skills.extra_allowed_dirs"}
-            or (option.group == "Interpreter" and option.settings_field is not None)
-        )
-        with _use_extra_skills_path_base(start_path):
-            resolved_config = get_config_resolver().resolve_options(wanted)
-
-        # No `is None` fallback for either enforced key below. The manifest is a
-        # module-level constant, so a missing option is a programming error, not
-        # a runtime condition — and resolving from the environment alone would
-        # bypass managed policy for a key that grants shell auto-approval or
-        # widens the skill-content allowlist. Failing loudly beats escalating
-        # quietly. `test_every_enforced_managed_key_resolves_to_a_manifest_option`
-        # keeps this unreachable.
-        shell_option = get_option("shell.allow_list")
-        if shell_option is None:
-            msg = "manifest is missing shell.allow_list; refusing to resolve it alone"
-            raise RuntimeError(msg)
-        shell_resolved = resolved_config[shell_option.key]
-        _emit_ranked_diagnostics(shell_option, shell_resolved)
-        # `parse_shell_allow_list_items` is the only producer for this
-        # option on every tier, and it yields `list[str] | None`.
-        shell_allow_list = cast("list[str] | None", shell_resolved.value)
-
-        # Parse extra skill containment roots from managed policy, the env
-        # var, or config.toml. These extend the path allowlist for
-        # load_skill_content but do not add new skill discovery locations.
-        skills_option = get_option("skills.extra_allowed_dirs")
-        if skills_option is None:
-            msg = (
-                "manifest is missing skills.extra_allowed_dirs; refusing to "
-                "resolve it alone"
-            )
-            raise RuntimeError(msg)
-        skills_resolved = resolved_config[skills_option.key]
-        _emit_ranked_diagnostics(skills_option, skills_resolved)
-        extra_skills_dirs = cast("list[Path] | None", skills_resolved.value)
-
-        # Only the Interpreter group is manifest-resolved here. Credentials,
-        # the shell allow-list, and the LangSmith project keep their dedicated
-        # loaders above: their empty-string-to-`None` and reload semantics do
-        # not fit the generic resolver.
-        interpreter_kwargs: dict[str, Any] = {}
-        for option in get_config_options():
-            if option.group != "Interpreter" or option.settings_field is None:
-                continue
-            resolved = resolved_config[option.key]
-            _emit_ranked_diagnostics(option, resolved)
-            interpreter_kwargs[option.settings_field] = resolved.value
 
         return cls(
-            openai_api_key=openai_key,
-            anthropic_api_key=anthropic_key,
-            google_api_key=google_key,
-            nvidia_api_key=nvidia_key,
-            tavily_api_key=tavily_key,
-            google_cloud_project=google_cloud_project,
-            google_cloud_location=google_cloud_location,
-            deepagents_langchain_project=deepagents_langchain_project,
-            user_langchain_project=user_langchain_project,
-            project_root=project_root,
-            shell_allow_list=shell_allow_list,
-            extra_skills_dirs=extra_skills_dirs,
-            **interpreter_kwargs,
+            CredentialsSnapshot(
+                openai_api_key=openai_key,
+                anthropic_api_key=anthropic_key,
+                google_api_key=google_key,
+                nvidia_api_key=nvidia_key,
+                tavily_api_key=tavily_key,
+                google_cloud_project=google_cloud_project,
+                google_cloud_location=google_cloud_location,
+                deepagents_langchain_project=deepagents_langchain_project,
+                user_langchain_project=user_langchain_project,
+                project_root=project_root,
+            )
         )
 
     @staticmethod
@@ -3135,6 +3359,7 @@ class Settings:
         )
         from deepagents_code.configuration.resolver import (
             CLI_RANK,
+            RELOAD_RANK,
             USER_RANK,
             get_config_resolver,
             resolver_from_snapshots,
@@ -3159,7 +3384,8 @@ class Settings:
         # `config.toml` the user just edited deserves the same treatment, and
         # more so -- they are staring at the edit that did not take.
         user_notice: str | None = None
-        user_status = resolver.provider_statuses().get(USER_RANK)
+        provider_statuses = resolver.provider_statuses()
+        user_status = provider_statuses.get(USER_RANK)
         if user_status is not None and not user_status.usable:
             detail = user_status.detail or user_status.health.value
             user_notice = f"Kept previous config.toml: {detail}"
@@ -3176,11 +3402,6 @@ class Settings:
 
         candidate_resolver = resolver
         if not refresh_managed:
-            # The shared resolver's cached user snapshot may predate the edit
-            # being previewed. Read the user file fresh when possible, but fall
-            # back to the retained snapshot when that read is unusable, matching
-            # the real reload. Keep the current managed snapshot because a
-            # preview must not refresh policy the process is enforcing.
             from deepagents_code.configuration.providers import TomlFileProvider
             from deepagents_code.model_config import DEFAULT_CONFIG_PATH
 
@@ -3192,9 +3413,6 @@ class Settings:
                 )
                 user_notice = None
             else:
-                # The preview's own read failed, so report that rather than
-                # the shared resolver's status: the file on disk right now is
-                # what the user would be accepting.
                 detail = (
                     user_candidate.status.detail or user_candidate.status.health.value
                 )
@@ -3202,17 +3420,10 @@ class Settings:
 
         shell_option = get_option("shell.allow_list")
         if shell_option is not None:
-            # Accepting an *env*-tier hit would defeat the `env` argument this
-            # method exists to honor: the resolver's env provider reads
-            # `os.environ` directly, so a preview of a `.env` edit reported the
-            # value live in the process instead of the one being previewed.
-            # Managed policy, the session CLI, and the user's file are safe to
-            # take from their resolvers; the env tier stays with the
-            # `env`-derived value computed above. Check the shared resolver
-            # first because the preview's candidate resolver -- built from the
-            # managed snapshot and a *freshly parsed* user file -- deliberately
-            # carries no process-local CLI provider.
-            shell_resolved = resolver.get(shell_option)
+            shell_resolved = resolver.get_without_ranks(
+                shell_option,
+                {RELOAD_RANK},
+            )
             _emit_ranked_diagnostics(shell_option, shell_resolved)
             shell_source = _ranked_source(shell_resolved)
             if (
@@ -3246,7 +3457,14 @@ class Settings:
                 resolved_skills: list[Path] | None = None
                 skills_managed = False
                 if skills_option is not None:
-                    skills_resolved = candidate_resolver.get(skills_option)
+                    skills_resolved = (
+                        candidate_resolver.get_without_ranks(
+                            skills_option,
+                            {RELOAD_RANK},
+                        )
+                        if candidate_resolver is resolver
+                        else candidate_resolver.get(skills_option)
+                    )
                     _emit_ranked_diagnostics(skills_option, skills_resolved)
                     if managed_decided(_ranked_source(skills_resolved)):
                         skills_managed = True
@@ -3265,11 +3483,7 @@ class Settings:
                     if skills_managed or not env_skills
                     else _parse_extra_skills_dirs(env_skills)
                 )
-        except (OSError, ValueError):
-            # Path resolution can fail (e.g. broken symlink loop). Keep the
-            # previous value rather than letting the failure escape reload --
-            # callers such as the cwd switch run this after `os.chdir`, where an
-            # uncaught error would strand the process in a half-applied cwd.
+        except (OSError, RuntimeError, ValueError):
             logger.warning(
                 "Could not resolve %s during reload; keeping previous value",
                 EXTRA_SKILLS_DIRS,
@@ -3312,7 +3526,7 @@ class Settings:
             return str(value)
 
         changes: list[str] = []
-        for field in _RELOADABLE_FIELDS:
+        for field in _RELOAD_CHANGE_FIELDS:
             old_value = previous[field]
             new_value = refreshed[field]
             if old_value != new_value:
@@ -3334,7 +3548,9 @@ class Settings:
             A list of human-readable change descriptions that would be produced by
             `reload_from_environment`.
         """
-        previous = {field: getattr(self, field) for field in _RELOADABLE_FIELDS}
+        active = self.active
+        previous = {field: getattr(active, field) for field in _RELOADABLE_FIELDS}
+        previous.update(_remembered_resolver_reload_values())
         env = _preview_dotenv_environ(start_path=start_path)
         refreshed, blocked = self._reload_values(
             start_path=start_path,
@@ -3349,13 +3565,14 @@ class Settings:
         """Reload selected settings from environment variables and project files.
 
         This refreshes only fields that are expected to change at runtime
-        (API keys, Google Cloud project, project root, shell allow-list, and
-        LangSmith tracing project).
+        (API keys, Google Cloud project, project root, and LangSmith tracing
+        project). Resolver-backed configuration is refreshed separately by the
+        shared `ConfigResolver` generation.
 
-        Runtime model state (`model_name`, `model_provider`,
-        `model_context_limit`) and the original user LangSmith project
-        (`user_langchain_project`) are intentionally preserved -- they are
-        not in `_RELOADABLE_FIELDS` and are never touched by this method.
+        Runtime model metadata lives in `RuntimeState` and is never touched by
+        this method. The original user LangSmith project
+        (`user_langchain_project`) is also intentionally preserved because it is
+        not in `_RELOADABLE_FIELDS`.
 
         !!! note
 
@@ -3372,17 +3589,23 @@ class Settings:
             A list of human-readable change descriptions. Empty when nothing
             changed; a single notice when managed policy blocked the reload.
         """
+        active = self.active
+        previous = {field: getattr(active, field) for field in _RELOADABLE_FIELDS}
+        previous.update(_remembered_resolver_reload_values())
+        _resolver_with_reload_overrides()
         _load_dotenv(start_path=start_path, refresh_loaded=True)
-
-        previous = {field: getattr(self, field) for field in _RELOADABLE_FIELDS}
         refreshed, blocked = self._reload_values(
             start_path=start_path,
             env=dict(os.environ),
             previous=previous,
         )
 
-        for field, value in refreshed.items():
-            setattr(self, field, value)
+        replacement = dataclass_replace(
+            active,
+            **{field: refreshed[field] for field in _RELOADABLE_FIELDS},
+        )
+        _remember_resolver_reload_values(refreshed)
+        _sync_reload_overrides(refreshed, path_base=start_path)
 
         # Sync the LANGSMITH_PROJECT env var so LangSmith tracing picks up
         # the change
@@ -3411,17 +3634,19 @@ class Settings:
 
         reset_env_resolution_log()
         changes = self._format_reload_changes(previous, refreshed)
+        if managed_reload_block([blocked] if blocked else []) is None:
+            self._active = replacement
         return [blocked, *changes] if blocked else changes
 
     @property
     def has_anthropic(self) -> bool:
         """Check if Anthropic API key is configured."""
-        return self.anthropic_api_key is not None
+        return self.active.has_anthropic
 
     @property
     def has_google(self) -> bool:
         """Check if Google API key is configured."""
-        return self.google_api_key is not None
+        return self.active.has_google
 
     @property
     def has_vertex_ai(self) -> bool:
@@ -3431,284 +3656,12 @@ class Settings:
         so if GOOGLE_CLOUD_PROJECT is set and GOOGLE_API_KEY is not, we assume
         VertexAI.
         """
-        return self.google_cloud_project is not None and self.google_api_key is None
+        return self.active.has_vertex_ai
 
     @property
     def has_tavily(self) -> bool:
         """Check if Tavily API key is configured."""
-        return self.tavily_api_key is not None
-
-    @property
-    def user_deepagents_dir(self) -> Path:
-        """The immutable launch-time user profile root.
-
-        Returns:
-            The normalized `DEEPAGENTS_HOME`, defaulting to `~/.deepagents`.
-        """
-        return PATHS.profile.root
-
-    def get_user_agent_md_path(self, agent_name: str) -> Path:
-        """Get user-level AGENTS.md path for a specific agent.
-
-        Returns path regardless of whether the file exists.
-
-        Delegates to `get_agent_dir` so the name is held to one rule set.
-        Building the path directly would skip both the character check and the
-        reserved-name check: `onboarding.write_onboarding_name_memory` calls
-        this and then creates the parent, so an unchecked name here is exactly
-        how a marker lands in app-owned state.
-
-        Args:
-            agent_name: Name of the agent
-
-        Returns:
-            Path to `{DEEPAGENTS_HOME}/{agent_name}/AGENTS.md`.
-
-        Note:
-            `ValueError` propagates from `get_agent_dir` when the agent name
-            contains invalid characters or names a directory the app owns.
-        """
-        return self.get_agent_dir(agent_name) / "AGENTS.md"
-
-    def get_project_agent_md_path(self) -> list[Path]:
-        """Get project-level AGENTS.md paths.
-
-        Checks both `{project_root}/.deepagents/AGENTS.md` and
-        `{project_root}/AGENTS.md`, returning all that exist. If both are
-        present, both are loaded and their instructions are combined, with
-        `.deepagents/AGENTS.md` first.
-
-        Returns:
-            Existing AGENTS.md paths.
-
-                Empty if neither file exists or not in a project, one entry if
-                only one is present, or two entries if both locations have the
-                file.
-        """
-        if not self.project_root:
-            return []
-        from deepagents_code.project_utils import find_project_agent_md
-
-        return find_project_agent_md(self.project_root)
-
-    @staticmethod
-    def _is_valid_agent_name(agent_name: str) -> bool:
-        """Validate to prevent invalid filesystem paths and security issues.
-
-        Returns:
-            True if the agent name is valid, False otherwise.
-        """
-        if not agent_name or not agent_name.strip():
-            return False
-        # Allow only alphanumeric, hyphens, underscores, and whitespace
-        return bool(re.match(r"^[a-zA-Z0-9_\-\s]+$", agent_name))
-
-    def get_agent_dir(self, agent_name: str) -> Path:
-        """Get the global agent directory path.
-
-        Args:
-            agent_name: Name of the agent
-
-        Returns:
-            Path to `{DEEPAGENTS_HOME}/{agent_name}`.
-
-        Raises:
-            ValueError: If the agent name contains invalid characters or names
-                a directory the app owns.
-        """
-        if not self._is_valid_agent_name(agent_name):
-            msg = (
-                f"Invalid agent name: {agent_name!r}. Agent names can only "
-                "contain letters, numbers, hyphens, underscores, and spaces."
-            )
-            raise ValueError(msg)
-        # Agent profiles live directly under the profile root, so an agent
-        # named after an app-owned directory would resolve onto app state. The
-        # picker already hides these names; reject them on the write path too
-        # rather than letting `dcode -a plugins` stamp a marker into it. The
-        # comparison is filesystem-aware so a case or trailing-dot alias that
-        # resolves onto the reserved directory is rejected as well.
-        # Imported from `_reserved_names`, not `agent`: this runs on the CLI
-        # startup path and `agent` pulls in LangChain at module level.
-        from deepagents_code._reserved_names import is_reserved_agent_dir_name
-
-        if is_reserved_agent_dir_name(agent_name):
-            msg = (
-                f"Invalid agent name: {agent_name!r} is reserved for dcode's own state."
-            )
-            raise ValueError(msg)
-        return PATHS.profile.agent_dir(agent_name)
-
-    def ensure_agent_dir(self, agent_name: str) -> Path:
-        """Ensure the global agent directory exists and return its path.
-
-        Args:
-            agent_name: Name of the agent
-
-        Returns:
-            Path to `{DEEPAGENTS_HOME}/{agent_name}`.
-
-        Note:
-            `ValueError` propagates from `get_agent_dir` when the name contains
-            invalid characters or names a directory the app owns. Validation is
-            not repeated here, so there is one place it can change.
-        """
-        agent_dir = self.get_agent_dir(agent_name)
-        agent_dir.mkdir(parents=True, exist_ok=True)
-        return agent_dir
-
-    def get_user_skills_dir(self, agent_name: str) -> Path:
-        """Get user-level skills directory path for a specific agent.
-
-        Args:
-            agent_name: Name of the agent
-
-        Returns:
-            Path to `{DEEPAGENTS_HOME}/{agent_name}/skills/`.
-        """
-        return self.get_agent_dir(agent_name) / "skills"
-
-    def ensure_user_skills_dir(self, agent_name: str) -> Path:
-        """Ensure user-level skills directory exists and return its path.
-
-        Args:
-            agent_name: Name of the agent
-
-        Returns:
-            Path to `{DEEPAGENTS_HOME}/{agent_name}/skills/`.
-        """
-        skills_dir = self.get_user_skills_dir(agent_name)
-        skills_dir.mkdir(parents=True, exist_ok=True)
-        return skills_dir
-
-    def get_project_skills_dir(self) -> Path | None:
-        """Get project-level skills directory path.
-
-        Returns:
-            Path to {project_root}/.deepagents/skills/, or None if not in a project
-        """
-        if not self.project_root:
-            return None
-        return self.project_root / ".deepagents" / "skills"
-
-    def ensure_project_skills_dir(self) -> Path | None:
-        """Ensure project-level skills directory exists and return its path.
-
-        Returns:
-            Path to {project_root}/.deepagents/skills/, or None if not in a project
-        """
-        if not self.project_root:
-            return None
-        skills_dir = self.get_project_skills_dir()
-        if skills_dir is None:
-            return None
-        skills_dir.mkdir(parents=True, exist_ok=True)
-        return skills_dir
-
-    def get_user_agents_dir(self, agent_name: str) -> Path:
-        """Get user-level agents directory path for custom subagent definitions.
-
-        Args:
-            agent_name: Name of the agent (e.g., "deepagents")
-
-        Returns:
-            Path to `{DEEPAGENTS_HOME}/{agent_name}/agents/`.
-        """
-        return self.get_agent_dir(agent_name) / "agents"
-
-    def get_project_agents_dir(self) -> Path | None:
-        """Get project-level agents directory path for custom subagent definitions.
-
-        Returns:
-            Path to {project_root}/.deepagents/agents/, or None if not in a project
-        """
-        if not self.project_root:
-            return None
-        return self.project_root / ".deepagents" / "agents"
-
-    @property
-    def user_agents_dir(self) -> Path | None:
-        """Base user-level `.agents` directory (`~/.agents`).
-
-        Returns:
-            Path to `~/.agents`, or `None` when the process has no resolvable
-                home directory.
-        """
-        if PATHS.launch_home is None:
-            return None
-        return PATHS.launch_home / ".agents"
-
-    def get_user_agent_skills_dir(self) -> Path | None:
-        """Get user-level `~/.agents/skills/` directory.
-
-        This is a generic alias path for skills that is tool-agnostic.
-
-        Returns:
-            Path to `~/.agents/skills/`, or `None` when the process has no
-                resolvable home directory.
-        """
-        base = self.user_agents_dir
-        return None if base is None else base / "skills"
-
-    def get_project_agent_skills_dir(self) -> Path | None:
-        """Get project-level `.agents/skills/` directory.
-
-        This is a generic alias path for skills that is tool-agnostic.
-
-        Returns:
-            Path to `{project_root}/.agents/skills/`, or `None` if not in a project
-        """
-        if not self.project_root:
-            return None
-        return self.project_root / ".agents" / "skills"
-
-    @staticmethod
-    def get_user_claude_skills_dir() -> Path | None:
-        """Get user-level `~/.claude/skills/` directory (experimental).
-
-        Convenience bridge for cross-tool skill sharing with Claude Code.
-        This is experimental and may be removed.
-
-        Returns:
-            Path to `~/.claude/skills/`, or `None` when the process has no
-                resolvable home directory.
-        """
-        if PATHS.launch_home is None:
-            return None
-        return PATHS.launch_home / ".claude" / "skills"
-
-    def get_project_claude_skills_dir(self) -> Path | None:
-        """Get project-level `.claude/skills/` directory (experimental).
-
-        Convenience bridge for cross-tool skill sharing with Claude Code.
-        This is experimental and may be removed.
-
-        Returns:
-            Path to `{project_root}/.claude/skills/`, or `None` if not in a project.
-        """
-        if not self.project_root:
-            return None
-        return self.project_root / ".claude" / "skills"
-
-    @staticmethod
-    def get_built_in_skills_dir() -> Path:
-        """Get the directory containing built-in skills that ship with the app.
-
-        Returns:
-            Path to the `built_in_skills/` directory within the package.
-        """
-        return Path(__file__).parent / "built_in_skills"
-
-    def get_extra_skills_dirs(self) -> list[Path]:
-        """Get user-configured extra skill directories.
-
-        Set via `DEEPAGENTS_CODE_EXTRA_SKILLS_DIRS` (colon-separated paths) or
-        `[skills].extra_allowed_dirs` in `~/.deepagents/config.toml`.
-
-        Returns:
-            List of extra skill directory paths, or empty list if not configured.
-        """
-        return self.extra_skills_dirs or []
+        return self.active.has_tavily
 
 
 DANGEROUS_SHELL_PATTERNS = (
@@ -3878,7 +3831,7 @@ def get_langsmith_project_name() -> str | None:
 
     Checks for the required API key and tracing environment variables.
     When both are present, resolves the project name with priority:
-    `settings.deepagents_langchain_project` (from
+    `credentials.deepagents_langchain_project` (from
     `DEEPAGENTS_CODE_LANGSMITH_PROJECT`), then `LANGSMITH_PROJECT` from the
     environment (note: this may already have been overridden at bootstrap time
     to match `DEEPAGENTS_CODE_LANGSMITH_PROJECT`), then `'deepagents-code'`.
@@ -3896,7 +3849,7 @@ def get_langsmith_project_name() -> str | None:
         return None
 
     return (
-        _get_settings().deepagents_langchain_project
+        _get_credentials().deepagents_langchain_project
         or os.environ.get("LANGSMITH_PROJECT")
         or LANGSMITH_PROJECT_DEFAULT
     )
@@ -5037,14 +4990,14 @@ def detect_provider(model_name: str) -> str | None:
         return "perplexity"
 
     if model_lower.startswith("claude"):
-        s = _get_settings()
-        if not s.has_anthropic and s.has_vertex_ai:
+        credentials = _get_credentials()
+        if not credentials.has_anthropic and credentials.has_vertex_ai:
             return "google_anthropic_vertex"
         return "anthropic"
 
     if model_lower.startswith("gemini"):
-        s = _get_settings()
-        if s.has_vertex_ai and not s.has_google:
+        credentials = _get_credentials()
+        if credentials.has_vertex_ai and not credentials.has_google:
             return "google_vertexai"
         return "google_genai"
 
@@ -5340,11 +5293,6 @@ def _get_provider_kwargs(
                         client_kwargs["headers"] = headers
                         result["client_kwargs"] = client_kwargs
 
-    retry_section = _read_config_toml_retries()
-    retry_kwargs = _resolve_retry_kwargs(retry_section, provider)
-    for key, value in retry_kwargs.items():
-        result.setdefault(key, value)
-
     return result
 
 
@@ -5358,11 +5306,11 @@ def _apply_google_anthropic_vertex_kwargs(
     """
     if provider != "google_anthropic_vertex":
         return
-    settings = _get_settings()
-    if settings.google_cloud_project:
-        kwargs.setdefault("project", settings.google_cloud_project)
-    if settings.google_cloud_location:
-        kwargs.setdefault("location", settings.google_cloud_location)
+    credentials = _get_credentials()
+    if credentials.google_cloud_project:
+        kwargs.setdefault("project", credentials.google_cloud_project)
+    if credentials.google_cloud_location:
+        kwargs.setdefault("location", credentials.google_cloud_location)
     if not kwargs.get("location"):
         from deepagents_code.model_config import ModelConfigError
 
@@ -5582,8 +5530,8 @@ def _create_model_via_init(
 class ModelResult:
     """Result of creating a chat model, bundling the model with its metadata.
 
-    This separates model creation from settings mutation so callers can decide
-    when to commit the metadata to global settings.
+    This separates model creation from runtime-state mutation so callers can
+    decide when to commit the metadata to process-wide state.
 
     Attributes:
         model: The instantiated chat model.
@@ -5592,6 +5540,13 @@ class ModelResult:
         context_limit: Max input tokens from the model profile, or `None`.
         unsupported_modalities: Input modalities not indicated as supported by
             the model profile (e.g. `{"audio", "video"}`).
+        model_retries: Effective model-node retry count for the resolved
+            provider (see `_resolve_model_retries_from_section`). `0` disables
+            retries.
+        cli_max_retries: The `--max-retries` flag value, or `None` when the user
+            did not set it. Kept distinct from `model_retries` so a model built
+            for a different provider can resolve its own configured budget
+            instead of inheriting this one.
     """
 
     model: BaseChatModel
@@ -5599,14 +5554,52 @@ class ModelResult:
     provider: str
     context_limit: int | None = None
     unsupported_modalities: frozenset[str] = frozenset()
+    model_retries: int = DEFAULT_MODEL_RETRIES
+    cli_max_retries: int | None = None
 
-    def apply_to_settings(self) -> None:
-        """Commit this result's metadata to global `settings`."""
-        s = _get_settings()
-        s.model_name = self.model_name
-        s.model_provider = self.provider
-        s.model_context_limit = self.context_limit
-        s.model_unsupported_modalities = self.unsupported_modalities
+    def __post_init__(self) -> None:
+        """Enforce the middleware's non-negative retry-budget invariant.
+
+        Non-negativity is enforced upstream by `non_negative_int` on
+        `--max-retries` and by `_coerce_max_retries` for config values, not by
+        the retry resolver itself, so a bad value here signals a caller
+        constructing `ModelResult` by hand with a budget the retry middleware
+        could not honor. `bool` is rejected for the same reason
+        `_model_max_retries` and `CodeModelRetryMiddleware.__init__` reject it:
+        `True` would silently read as a budget of one.
+
+        `cli_max_retries` gets the same gate. It is the field that carries the
+        explicit flag onward to a re-resolution for a different provider, and
+        it was the one budget field in dcode without the check -- which is the
+        argument for a single validated budget type rather than a ninth copy of
+        this predicate.
+
+        Raises:
+            TypeError: If `model_retries` or `cli_max_retries` is a `bool`.
+            ValueError: If `model_retries` or `cli_max_retries` is negative.
+        """
+        if isinstance(self.model_retries, bool):
+            msg = f"model_retries must be an int, got {self.model_retries!r}"
+            raise TypeError(msg)
+        if self.model_retries < 0:
+            msg = f"model_retries must be >= 0, got {self.model_retries}"
+            raise ValueError(msg)
+        if isinstance(self.cli_max_retries, bool):
+            msg = (
+                f"cli_max_retries must be None or an int, got {self.cli_max_retries!r}"
+            )
+            raise TypeError(msg)
+        if self.cli_max_retries is not None and self.cli_max_retries < 0:
+            msg = f"cli_max_retries must be >= 0, got {self.cli_max_retries}"
+            raise ValueError(msg)
+
+    def apply_to_runtime_state(self) -> None:
+        """Commit this result's metadata to global `runtime_state`."""
+        state = _get_runtime_state()
+        state.model_name = self.model_name
+        state.model_provider = self.provider
+        state.model_context_limit = self.context_limit
+        state.model_unsupported_modalities = self.unsupported_modalities
 
 
 def _apply_profile_overrides(
@@ -5663,6 +5656,7 @@ def create_model(
     *,
     extra_kwargs: dict[str, Any] | None = None,
     profile_overrides: dict[str, Any] | None = None,
+    cli_max_retries: int | None = None,
 ) -> ModelResult:
     """Create a chat model.
 
@@ -5680,15 +5674,22 @@ def create_model(
                 If not provided, uses environment-based defaults.
         extra_kwargs: Additional kwargs to pass to the model constructor.
 
-            These take highest priority, overriding values from the config file.
+            These take highest priority, overriding values from the config file,
+            except that provider-owned retry loops are disabled when known.
 
-            A `CLI_MAX_RETRIES_KEY` entry (set by the `--max-retries` flag) is
-            treated specially: it is popped here and re-applied under the
-            provider's resolved retry-param name with top precedence, rather than
-            being forwarded verbatim to the constructor.
+            The provider's own retry-count kwarg (`RETRY_PARAM_BY_PROVIDER`,
+            usually `max_retries`) is forced off after this merge whenever dcode
+            can identify it, because the model-node middleware owns the retry
+            budget and nested SDK retries would multiply its attempts. Supplying
+            that kwarg here logs a warning; use `--max-retries` or `[retries]`
+            instead. A provider dcode cannot identify (absent from the registry,
+            no `[retries.<provider>].param`, and no `max_retries` already in the
+            kwargs) keeps its own retry loop and logs a warning saying so.
         profile_overrides: Extra profile fields from `--profile-override`.
 
             Merged on top of config file profile overrides (dcode wins).
+        cli_max_retries: Explicit `--max-retries` value. When absent, the
+            provider-specific or global config value applies.
 
     Returns:
         A `ModelResult` containing the model and its metadata.
@@ -5702,6 +5703,8 @@ def create_model(
             model must re-raise it (see `configurable_model._apply_overrides`).
         MissingCredentialsError: If no credentials are configured for the
             resolved provider.
+        TypeError: If `cli_max_retries` is not an integer.
+        ValueError: If `cli_max_retries` is negative.
 
     Examples:
         >>> model = create_model("anthropic:claude-sonnet-4-5")
@@ -5844,16 +5847,11 @@ def create_model(
             )
             raise ModelConfigError(msg) from exc
 
-    # App --model-params take highest priority. Copy defensively before popping
-    # the CLI sentinel so a caller that retains and reuses this dict (e.g. the
-    # app re-creating the model on a runtime `/model` switch) keeps the sentinel
-    # for the next provider's resolution.
-    cli_max_retries: int | None = None
+    # App --model-params take highest priority.
     reasoning_effort_override: object = None
     reasoning_override: object = None
     if extra_kwargs:
         extra_kwargs = dict(extra_kwargs)
-        cli_max_retries = extra_kwargs.pop(CLI_MAX_RETRIES_KEY, None)
         reasoning_effort_override = extra_kwargs.get("reasoning_effort")
         reasoning_override = extra_kwargs.get("reasoning")
         kwargs.update(extra_kwargs)
@@ -5864,12 +5862,26 @@ def create_model(
         reasoning_override,
     )
 
-    # `--max-retries` outranks everything: fold it under the provider's resolved
-    # retry-param name (honoring `[retries.<provider>].param`) so a custom
-    # provider whose kwarg is not `max_retries` is still served. Applied after
-    # the `extra_kwargs` merge so it wins over a `max_retries` in `--model-params`.
-    if cli_max_retries is not None:
-        kwargs[_resolve_retry_param_name(provider)] = cli_max_retries
+    # dcode's model-node middleware owns the user-visible retry budget. Resolve
+    # that budget separately, then force the provider's own retry loop off so
+    # nested SDK retries cannot multiply the configured attempt count.
+    if cli_max_retries is not None and (
+        not isinstance(cli_max_retries, int) or isinstance(cli_max_retries, bool)
+    ):
+        msg = "cli_max_retries must be None or an int >= 0"
+        raise TypeError(msg)
+    if cli_max_retries is not None and cli_max_retries < 0:
+        msg = "cli_max_retries must be None or an int >= 0"
+        raise ValueError(msg)
+    retry_config = _read_retry_config()
+    for warning in retry_config.warnings:
+        logger.warning("%s", warning)
+    model_retries = _resolve_model_retries_from_section(
+        retry_config,
+        provider,
+        cli_max_retries,
+    )
+    kwargs.update(_provider_retry_disable_kwargs(retry_config, provider, kwargs))
 
     _apply_google_anthropic_vertex_kwargs(provider, kwargs)
 
@@ -5947,6 +5959,24 @@ def create_model(
             raise_on_failure=True,
         )
 
+    # Keep retry policy metadata on the concrete model selected for the request.
+    # Runtime `/model` switches replace `request.model`, so the downstream retry
+    # middleware can read the matching budget without mutating shared middleware
+    # state or forwarding an internal key to a provider API.
+    try:
+        object.__setattr__(  # noqa: PLC2801  # Pydantic models reject unknown fields through normal setattr
+            model, MODEL_RETRIES_ATTR, model_retries
+        )
+    except AttributeError:
+        # A custom provider class using `__slots__` rejects the write. The
+        # metadata is advisory, so the middleware falls back to its startup
+        # budget rather than failing an otherwise usable model.
+        logger.warning(
+            "Could not attach the retry budget to %r; the model-node middleware "
+            "will use its startup budget instead",
+            model_name,
+        )
+
     # Extract context limit and modality support from model profile
     context_limit: int | None = None
     unsupported_modalities: frozenset[str] = frozenset()
@@ -5971,6 +6001,8 @@ def create_model(
         provider=resolved_provider,
         context_limit=context_limit,
         unsupported_modalities=unsupported_modalities,
+        model_retries=model_retries,
+        cli_max_retries=cli_max_retries,
     )
 
 
@@ -6027,6 +6059,11 @@ def validate_model_capabilities(model: BaseChatModel, model_name: str) -> None:
         )
 
 
+_console_instance: Console | None = None
+_credentials_instance: Credentials | None = None
+_runtime_state_instance: RuntimeState | None = None
+
+
 def _get_console() -> Console:
     """Return the lazily-initialized global `Console` instance.
 
@@ -6036,65 +6073,91 @@ def _get_console() -> Console:
     Returns:
         The global Rich `Console` singleton.
     """
-    cached = globals().get("console")
+    global _console_instance  # noqa: PLW0603  # lazy process singleton
+    cached = _console_instance
     if cached is not None:
         return cached
     with _singleton_lock:
-        cached = globals().get("console")
+        cached = _console_instance
         if cached is not None:
             return cached
         from rich.console import Console
 
         inst = Console(highlight=False)
-        globals()["console"] = inst
+        _console_instance = inst
         return inst
 
 
-def _get_settings() -> Settings:
-    """Return the lazily-initialized global `Settings` instance.
+def _get_credentials() -> Credentials:
+    """Return the lazily initialized process-wide `Credentials` instance.
 
-    Ensures bootstrap has run before constructing settings. The result is cached
-    in `globals()["settings"]` so subsequent access — including
-    `from config import settings` in other modules — resolves instantly.
+    Bootstrap runs before credentials are read.
 
     Returns:
-        The global `Settings` singleton.
+        The global credentials singleton.
     """
-    cached = globals().get("settings")
+    global _credentials_instance  # noqa: PLW0603  # lazy process singleton
+    cached = _credentials_instance
     if cached is not None:
         return cached
     with _singleton_lock:
-        cached = globals().get("settings")
+        cached = _credentials_instance
         if cached is not None:
             return cached
         _ensure_bootstrap()
         try:
-            inst = Settings.from_environment(start_path=_bootstrap_state.start_path)
+            inst = Credentials.from_environment(start_path=_bootstrap_state.start_path)
         except Exception:
             logger.exception(
-                "Failed to initialize settings from environment (start_path=%s)",
+                "Failed to initialize credentials from environment (start_path=%s)",
                 _bootstrap_state.start_path,
             )
             raise
-        globals()["settings"] = inst
+        _credentials_instance = inst
         return inst
 
 
-def __getattr__(name: str) -> Settings | Console:
-    """Lazy module attributes for `settings` and `console`.
+def _get_runtime_state() -> RuntimeState:
+    """Return the lazily initialized process-wide `RuntimeState` instance."""
+    global _runtime_state_instance  # noqa: PLW0603  # lazy process singleton
+    cached = _runtime_state_instance
+    if cached is not None:
+        return cached
+    with _singleton_lock:
+        cached = _runtime_state_instance
+        if cached is not None:
+            return cached
+        state = RuntimeState()
+        _runtime_state_instance = state
+        return state
 
-    Defers heavy initialization until first access. Subsequent accesses hit
-    the module-level attribute directly (no `__getattr__` overhead).
 
-    Returns:
-        The requested lazy singleton.
+class _LazyProxy:
+    """Defer singleton construction until an attribute is first used."""
 
-    Raises:
-        AttributeError: If *name* is not a lazily-provided attribute.
-    """
-    if name == "settings":
-        return _get_settings()
-    if name == "console":
-        return _get_console()
-    msg = f"module {__name__!r} has no attribute {name!r}"
-    raise AttributeError(msg)
+    __slots__ = ("_factory",)
+    _factory: Callable[[], object]
+
+    def __init__(self, factory: Callable[[], object]) -> None:
+        object.__setattr__(self, "_factory", factory)
+
+    def __getattr__(self, name: str) -> object:
+        """Forward reads to the initialized singleton.
+
+        Returns:
+            The requested attribute.
+        """
+        return getattr(self._factory(), name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Forward mutations to the initialized singleton."""
+        setattr(self._factory(), name, value)
+
+    def __delattr__(self, name: str) -> None:
+        """Forward patch cleanup to the initialized singleton."""
+        delattr(self._factory(), name)
+
+
+credentials = cast("Credentials", _LazyProxy(_get_credentials))
+runtime_state = cast("RuntimeState", _LazyProxy(_get_runtime_state))
+console = cast("Console", _LazyProxy(_get_console))

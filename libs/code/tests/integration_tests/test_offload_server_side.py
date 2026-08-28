@@ -10,6 +10,7 @@ and prove the archive is readable *through the agent*.
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from typing import TYPE_CHECKING
@@ -76,7 +77,7 @@ def _build_long_prompt(turn: int) -> str:
 
 async def _run_turn(agent, *, thread_id: str, assistant_id: str, prompt: str) -> None:
     """Execute one real remote agent turn and drain the stream to completion."""
-    from deepagents_code.config import build_stream_config, settings
+    from deepagents_code.config import build_stream_config, runtime_state
 
     config = build_stream_config(thread_id, assistant_id)
     stream_input = {"messages": [{"role": "user", "content": prompt}]}
@@ -88,7 +89,7 @@ async def _run_turn(agent, *, thread_id: str, assistant_id: str, prompt: str) ->
         stream_mode=["messages", "updates"],
         subgraphs=True,
         config=config,
-        context={"model_context_limit": settings.model_context_limit},
+        context={"model_context_limit": runtime_state.model_context_limit},
         durability="exit",
     ):
         pass
@@ -209,7 +210,7 @@ async def test_offload_runs_server_side_and_is_agent_readable(
 
     model_config.clear_caches()
     try:
-        create_model("itest:fake").apply_to_settings()
+        create_model("itest:fake").apply_to_runtime_state()
         thread_id = generate_thread_id()
 
         async with server_session(
@@ -414,7 +415,7 @@ async def test_concurrent_run_during_offload_preserves_messages(
 
     model_config.clear_caches()
     try:
-        create_model("itest:fake").apply_to_settings()
+        create_model("itest:fake").apply_to_runtime_state()
         thread_id = generate_thread_id()
 
         async with server_session(
@@ -577,7 +578,7 @@ async def test_offload_route_respects_configured_auth(
     model_config.clear_caches()
     server: ServerProcess | None = None
     try:
-        create_model("itest:fake").apply_to_settings()
+        create_model("itest:fake").apply_to_runtime_state()
 
         # The auth module lives in the server work dir (the subprocess's cwd,
         # which `langgraph dev` puts on `sys.path`) so its import path stays
@@ -638,6 +639,92 @@ async def test_offload_route_respects_configured_auth(
                 malformed.text,
             )
             assert "context.model" in malformed.text
+    finally:
+        if server is not None:
+            server.stop()
+        model_config.clear_caches()
+
+
+_TEST_FLUSH_APP = """
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from langsmith import run_trees
+
+from deepagents_code.offload_api import app
+
+
+class _MarkerClient:
+    def flush(self) -> None:
+        Path(os.environ["ITEST_TRACE_FLUSH_MARKER"]).write_text("flushed")
+
+
+_original_lifespan = app.router.lifespan_context
+
+
+@asynccontextmanager
+async def _marker_lifespan(starlette_app):
+    previous = getattr(run_trees, "_CLIENT", None)
+    run_trees._CLIENT = _MarkerClient()
+    try:
+        async with _original_lifespan(starlette_app):
+            yield
+    finally:
+        run_trees._CLIENT = previous
+
+
+app.router.lifespan_context = _marker_lifespan
+"""
+
+
+@pytest.mark.timeout(60)
+async def test_server_shutdown_flushes_existing_tracers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real `langgraph dev` shutdown runs the custom app's flush lifespan."""
+    home_dir = tmp_path / "home"
+    project_dir = tmp_path / "project"
+    work_dir = tmp_path / "server_work"
+    marker = tmp_path / "trace-flushed"
+    home_dir.mkdir()
+    project_dir.mkdir()
+    work_dir.mkdir()
+
+    monkeypatch.setenv("HOME", str(home_dir))
+    monkeypatch.setenv("DEEPAGENTS_CODE_NO_UPDATE_CHECK", "1")
+    monkeypatch.setenv("LANGSMITH_TRACING", "false")
+    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "false")
+    monkeypatch.setenv("ITEST_TRACE_FLUSH_MARKER", str(marker))
+    monkeypatch.chdir(project_dir)
+    _write_model_config(home_dir)
+
+    from deepagents_code import model_config
+    from deepagents_code.client.launch.server import (
+        ServerProcess,
+        generate_langgraph_json,
+    )
+    from deepagents_code.config import create_model
+
+    config_path = home_dir / ".deepagents" / "config.toml"
+    monkeypatch.setattr(model_config, "DEFAULT_CONFIG_DIR", config_path.parent)
+    monkeypatch.setattr(model_config, "DEFAULT_CONFIG_PATH", config_path)
+
+    model_config.clear_caches()
+    server: ServerProcess | None = None
+    try:
+        create_model("itest:fake").apply_to_runtime_state()
+        (work_dir / "itest_flush_app.py").write_text(_TEST_FLUSH_APP)
+        generated = generate_langgraph_json(work_dir)
+        config = json.loads(generated.read_text())
+        config["http"]["app"] = "./itest_flush_app.py:app"
+        generated.write_text(json.dumps(config, indent=2))
+
+        server = ServerProcess(config_dir=work_dir, scaffold=None)
+        await server.start()
+        server.stop()
+
+        assert marker.read_text() == "flushed"
     finally:
         if server is not None:
             server.stop()

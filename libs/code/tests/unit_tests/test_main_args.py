@@ -14,6 +14,10 @@ import pytest
 
 from deepagents_code.config import parse_shell_allow_list
 from deepagents_code.main import apply_stdin_pipe, parse_args
+from deepagents_code.update_check import ExtraInstallOutcome
+
+_INSTALL_SUCCEEDED = ExtraInstallOutcome(True, "")
+"""Default `perform_install_extra` stub result for the install-subcommand tests."""
 
 MockArgvType = Callable[..., AbstractContextManager[object]]
 
@@ -1132,6 +1136,161 @@ class TestSkillFlagValidation:
         assert mock_run.await_args.kwargs["message"] == "review this repo"  # ty: ignore
 
 
+class TestSummarizationModelForwarding:
+    """The dedicated summary model reaches every headless input route."""
+
+    def test_cli_override_reaches_explicit_headless_mode(self) -> None:
+        from deepagents_code.main import cli_main
+
+        mock_stdin = MagicMock()
+        mock_stdin.isatty.return_value = True
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "deepagents",
+                    "-n",
+                    "task",
+                    "--summarization-model",
+                    "openai:summary-model",
+                ],
+            ),
+            patch.object(sys, "stdin", mock_stdin),
+            patch("deepagents_code.main.check_optional_tools", return_value=[]),
+            patch(
+                "deepagents_code.main._should_ensure_managed_ripgrep",
+                return_value=False,
+            ),
+            patch(
+                "deepagents_code.client.non_interactive.run_non_interactive",
+                new_callable=AsyncMock,
+                return_value=0,
+            ) as mock_run,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cli_main()
+
+        assert exc_info.value.code == 0
+        assert (
+            mock_run.await_args.kwargs["summarization_model"]  # ty: ignore
+            == "openai:summary-model"
+        )
+
+    def test_config_default_reaches_piped_stdin(self) -> None:
+        from deepagents_code.main import cli_main
+        from deepagents_code.model_config import ModelConfig
+
+        mock_stdin = MagicMock()
+        mock_stdin.isatty.return_value = False
+        mock_stdin.read.return_value = "piped task"
+        config = ModelConfig(summarization_default_model="openai:config-summary")
+        with (
+            patch.object(sys, "argv", ["deepagents"]),
+            patch.object(sys, "stdin", mock_stdin),
+            patch.object(ModelConfig, "load", return_value=config),
+            patch("deepagents_code.main.check_optional_tools", return_value=[]),
+            patch(
+                "deepagents_code.main._should_ensure_managed_ripgrep",
+                return_value=False,
+            ),
+            patch("os.open", side_effect=OSError("No tty in test sandbox")),
+            patch(
+                "deepagents_code.client.non_interactive.run_non_interactive",
+                new_callable=AsyncMock,
+                return_value=0,
+            ) as mock_run,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cli_main()
+
+        assert exc_info.value.code == 0
+        assert (
+            mock_run.await_args.kwargs["summarization_model"]  # ty: ignore
+            == "openai:config-summary"
+        )
+
+    def test_blank_flag_overrides_the_configured_default(self) -> None:
+        """`--summarization-model ""` means "use the main model this launch".
+
+        The resolver tests `is not None`, so an explicitly blank flag outranks
+        `[models].summarization_default` -- the same escape hatch
+        `--auto-classifier-model` documents.
+        """
+        from deepagents_code.main import cli_main
+        from deepagents_code.model_config import ModelConfig
+
+        mock_stdin = MagicMock()
+        mock_stdin.isatty.return_value = True
+        config = ModelConfig(summarization_default_model="openai:config-summary")
+        with (
+            patch.object(
+                sys,
+                "argv",
+                ["deepagents", "-n", "task", "--summarization-model", ""],
+            ),
+            patch.object(sys, "stdin", mock_stdin),
+            patch.object(ModelConfig, "load", return_value=config),
+            patch("deepagents_code.main.check_optional_tools", return_value=[]),
+            patch(
+                "deepagents_code.main._should_ensure_managed_ripgrep",
+                return_value=False,
+            ),
+            patch(
+                "deepagents_code.client.non_interactive.run_non_interactive",
+                new_callable=AsyncMock,
+                return_value=0,
+            ) as mock_run,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cli_main()
+
+        assert exc_info.value.code == 0
+        assert not mock_run.await_args.kwargs["summarization_model"]  # ty: ignore
+
+    def test_config_default_reaches_the_tui(self) -> None:
+        """Every launch mode gets the same resolved spec, the TUI included."""
+        from deepagents_code.main import cli_main
+        from deepagents_code.model_config import ModelConfig
+
+        mock_stdin = MagicMock()
+        mock_stdin.isatty.return_value = True
+        config = ModelConfig(summarization_default_model="openai:config-summary")
+
+        fake_result = MagicMock()
+        fake_result.return_code = 0
+        fake_result.thread_id = None
+        fake_result.update_available = (False, None)
+        fake_result.session_stats = MagicMock(request_count=0)
+        run_tui = AsyncMock(return_value=fake_result)
+
+        with (
+            patch.object(sys, "argv", ["deepagents", "-m", "hello"]),
+            patch.object(sys, "stdin", mock_stdin),
+            patch.object(ModelConfig, "load", return_value=config),
+            patch("deepagents_code.main.run_textual_cli_async", run_tui),
+            patch("deepagents_code.main._run_startup_auto_update"),
+            patch("deepagents_code.main._resolve_agent_arg", return_value="agent"),
+            patch("deepagents_code.main._check_mcp_project_trust", return_value=False),
+            patch(
+                "deepagents_code.main._resolve_interpreter_enabled",
+                return_value=False,
+            ),
+            patch("deepagents_code.main._print_session_stats"),
+            patch(
+                "deepagents_code.main._should_check_teardown_thread",
+                return_value=False,
+            ),
+        ):
+            cli_main()
+
+        run_tui.assert_awaited_once()
+        assert run_tui.await_args is not None
+        assert (
+            run_tui.await_args.kwargs["summarization_model"] == "openai:config-summary"
+        )
+
+
 class TestMaxTurnsArgument:
     """Tests for --max-turns argument parsing and validation."""
 
@@ -1313,22 +1472,54 @@ def test_cli_main_forwards_recursion_limit_to_headless_server() -> None:
     assert run_mock.await_args.kwargs["recursion_limit"] == 3000  # ty: ignore
 
 
+@pytest.mark.parametrize(
+    ("argv_extra", "expected"),
+    [
+        pytest.param([], False, id="default-off"),
+        pytest.param(["--show-reasoning"], True, id="flag-on"),
+    ],
+)
+def test_cli_main_forwards_show_reasoning_to_headless(
+    argv_extra: list[str], expected: bool
+) -> None:
+    """`--show-reasoning` must reach the headless runner, not just resolve.
+
+    The flag resolving correctly proves nothing on its own: `cli_main` reads the
+    preference and passes it as a separate kwarg, and dropping that kwarg leaves
+    the flag parsing, the manifest binding intact, and the feature dead.
+    """
+    from deepagents_code.main import cli_main
+
+    run_mock = AsyncMock(return_value=0)
+    mock_stdin = MagicMock()
+    mock_stdin.isatty.return_value = True
+    with (
+        patch.object(sys, "argv", ["deepagents", "-n", "task", *argv_extra]),
+        patch.object(sys, "stdin", mock_stdin),
+        patch("deepagents_code.main.check_optional_tools", return_value=[]),
+        patch(
+            "deepagents_code.main._should_ensure_managed_ripgrep",
+            return_value=False,
+        ),
+        patch("deepagents_code.client.non_interactive.run_non_interactive", run_mock),
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        cli_main()
+
+    assert exc_info.value.code == 0
+    assert run_mock.await_args.kwargs["show_reasoning"] is expected  # ty: ignore
+
+
 def test_cli_main_installs_the_shell_allow_list_before_dispatch() -> None:
     """`--shell-allow-list` must be resolvable by the time the agent is built.
 
-    This branch deleted the explicit application in `cli_main`
-    (`settings.shell_allow_list = parse_shell_allow_list(...)`). The flag's
-    whole effect now rests on an unwritten ordering invariant:
+    The flag's whole effect rests on an ordering invariant:
     `_install_cli_provider` must run before the work that reads the value.
     Nothing else fails if that ordering breaks -- the flag still parses, no
     warning fires, and shell auto-approval simply stops applying.
 
-    Asserted against the resolver and a freshly built `Settings`, not the
-    `deepagents_code.config.settings` singleton. `_get_settings` caches
-    permanently on first access, and under pytest `agent.py` is already
-    imported (it binds `settings` at module scope), so the singleton in this
-    process was built long before this test ran. Reading it here would assert
-    the import order of the test session rather than the order in `cli_main`.
+    Asserted against the resolver rather than the process singleton so the
+    test observes the CLI provider installed by this invocation.
 
     Scope, verified by mutation: this fails if the manifest binding names the
     wrong argparse destination, and it does *not* fail if the explicit
@@ -1337,7 +1528,6 @@ def test_cli_main_installs_the_shell_allow_list_before_dispatch() -> None:
     the flag survives; do not read a pass here as proof the explicit call is
     still in place.
     """
-    from deepagents_code.config import Settings
     from deepagents_code.config_manifest import get_option
     from deepagents_code.configuration.resolver import (
         CLI_RANK,
@@ -1353,7 +1543,6 @@ def test_cli_main_installs_the_shell_allow_list_before_dispatch() -> None:
         resolved = get_config_resolver().get(option)
         seen["value"] = resolved.value
         seen["ranks"] = resolved.ranks
-        seen["settings"] = Settings.from_environment().shell_allow_list
         return 0
 
     mock_stdin = MagicMock()
@@ -1381,7 +1570,6 @@ def test_cli_main_installs_the_shell_allow_list_before_dispatch() -> None:
     assert exc_info.value.code == 0
     assert seen["value"] == ["git status", "ls"]
     assert seen["ranks"] == (CLI_RANK,)
-    assert seen["settings"] == ["git status", "ls"]
 
 
 class TestTimeoutArgument:
@@ -1587,16 +1775,10 @@ class TestModelParamsArgument:
 
 
 class TestMaxRetriesForwarding:
-    """`--max-retries` rides the forwarded model_params under an internal key.
+    """`--max-retries` stays separate from provider model parameters."""
 
-    The value is carried under `CLI_MAX_RETRIES_KEY` rather than a literal
-    `max_retries` so `create_model` can fold it under the resolved provider's
-    retry-param name; see `TestRetriesConfig` in `test_config.py` for the
-    folding/precedence behavior at the `create_model` layer.
-    """
-
-    def _run_model_params(self, argv: list[str]) -> dict[str, object] | None:
-        """Drive `cli_main` and return the `model_params` passed downstream."""
+    def _run_model_kwargs(self, argv: list[str]) -> dict[str, object]:
+        """Drive `cli_main` and return model-related downstream arguments."""
         from deepagents_code.main import cli_main
 
         mock_stdin = MagicMock()
@@ -1619,24 +1801,21 @@ class TestMaxRetriesForwarding:
             cli_main()
         await_args = mock_run.await_args
         assert await_args is not None
-        return await_args.kwargs["model_params"]  # ty: ignore
+        return {
+            "model_params": await_args.kwargs["model_params"],
+            "cli_max_retries": await_args.kwargs["cli_max_retries"],
+        }
 
-    def test_folds_into_model_params(self) -> None:
-        """`--max-retries` creates model_params when no `--model-params` is given."""
-        from deepagents_code.config import CLI_MAX_RETRIES_KEY
-
+    def test_forwards_explicit_field(self) -> None:
+        """`--max-retries` does not create provider model parameters."""
         argv = ["deepagents", "-n", "task", "--max-retries", "4"]
-        assert self._run_model_params(argv) == {CLI_MAX_RETRIES_KEY: 4}
+        assert self._run_model_kwargs(argv) == {
+            "model_params": None,
+            "cli_max_retries": 4,
+        }
 
-    def test_carried_alongside_model_params(self) -> None:
-        """`--max-retries` rides next to `--model-params` without clobbering it.
-
-        The flag value is stashed under the internal key, leaving any explicit
-        `--model-params` entries (including a literal `max_retries`) untouched in
-        the forwarded dict. Precedence is resolved later, in `create_model`.
-        """
-        from deepagents_code.config import CLI_MAX_RETRIES_KEY
-
+    def test_separate_from_model_params(self) -> None:
+        """The explicit retry field does not clobber provider parameters."""
         argv = [
             "deepagents",
             "-n",
@@ -1646,16 +1825,18 @@ class TestMaxRetriesForwarding:
             "--max-retries",
             "4",
         ]
-        assert self._run_model_params(argv) == {
-            "max_retries": 1,
-            "temperature": 0.5,
-            CLI_MAX_RETRIES_KEY: 4,
+        assert self._run_model_kwargs(argv) == {
+            "model_params": {"max_retries": 1, "temperature": 0.5},
+            "cli_max_retries": 4,
         }
 
     def test_absent_leaves_model_params_untouched(self) -> None:
         """Without `--max-retries`, model_params reflects only `--model-params`."""
         argv = ["deepagents", "-n", "task", "--model-params", '{"temperature": 0.5}']
-        assert self._run_model_params(argv) == {"temperature": 0.5}
+        assert self._run_model_kwargs(argv) == {
+            "model_params": {"temperature": 0.5},
+            "cli_max_retries": None,
+        }
 
 
 class TestProfileOverrideArgument:
@@ -2754,7 +2935,7 @@ class TestInstallExtraSubcommand:
         editable: bool = False,
         yes: bool = False,
         interactive: bool = False,
-        perform_return: tuple[bool, str] = (True, ""),
+        perform_return: ExtraInstallOutcome = _INSTALL_SUCCEEDED,
         command_side_effect: BaseException | None = None,
     ) -> tuple[int, MagicMock]:
         """Invoke `cli_main()` with `--install`; return exit code + mock."""
@@ -2861,7 +3042,7 @@ class TestInstallExtraSubcommand:
         editable: bool = False,
         yes: bool = False,
         interactive: bool = False,
-        perform_return: tuple[bool, str] = (True, ""),
+        perform_return: ExtraInstallOutcome = _INSTALL_SUCCEEDED,
         perform_side_effect: BaseException | None = None,
         command_side_effect: BaseException | None = None,
         command_return: str | None = None,
@@ -2967,7 +3148,7 @@ class TestInstallExtraSubcommand:
         """A failed install surfaces both the log path and manual script command."""
         code, _perform, console_mock = self._run_install_capture(
             "quickjs",
-            perform_return=(False, "resolver: conflict"),
+            perform_return=ExtraInstallOutcome(False, "resolver: conflict"),
         )
         assert code == 1
         text = self._printed_text(console_mock)
@@ -2983,7 +3164,7 @@ class TestInstallExtraSubcommand:
         command = "uv tool install -U 'deepagents-code[quickjs]'"
         code, _perform, console_mock = self._run_install_capture(
             "quickjs",
-            perform_return=(False, "resolver: conflict"),
+            perform_return=ExtraInstallOutcome(False, "resolver: conflict"),
             command_return=command,
         )
         assert code == 1
@@ -2998,7 +3179,7 @@ class TestInstallExtraSubcommand:
         resolved = "uv tool install -U 'deepagents-code[quickjs]'"
         code, _perform, console_mock = self._run_install_capture(
             "quickjs",
-            perform_return=(False, "resolver: conflict"),
+            perform_return=ExtraInstallOutcome(False, "resolver: conflict"),
             command_return=resolved,
             recovery_side_effect=ValueError("bad receipt"),
         )
@@ -3554,25 +3735,31 @@ class TestInterpreterFlagParsing:
 class TestResolveInterpreterEnabled:
     """Tests for `_resolve_interpreter_enabled`."""
 
-    def test_local_mode_uses_config_default(self, mock_argv: MockArgvType) -> None:
-        from deepagents_code.config import settings
+    def test_local_mode_uses_config_default(
+        self, mock_argv: MockArgvType, tmp_path: Path
+    ) -> None:
+        from deepagents_code.configuration import service
         from deepagents_code.main import _resolve_interpreter_enabled
 
         with mock_argv("-n", "task"):
             args = parse_args()
-        with patch.object(settings, "enable_interpreter", False):
-            assert _resolve_interpreter_enabled(args) is False
-        with patch.object(settings, "enable_interpreter", True):
-            assert _resolve_interpreter_enabled(args) is True
+        (tmp_path / "config.toml").write_text(
+            "[interpreter]\nenable_interpreter = false\n", encoding="utf-8"
+        )
+        service.invalidate_config_sources()
+        assert _resolve_interpreter_enabled(args) is False
+        (tmp_path / "config.toml").write_text(
+            "[interpreter]\nenable_interpreter = true\n", encoding="utf-8"
+        )
+        service.invalidate_config_sources()
+        assert _resolve_interpreter_enabled(args) is True
 
     def test_sandbox_defaults_disabled(self, mock_argv: MockArgvType) -> None:
-        from deepagents_code.config import settings
         from deepagents_code.main import _resolve_interpreter_enabled
 
         with mock_argv("-n", "task", "--sandbox", "daytona"):
             args = parse_args()
-        with patch.object(settings, "enable_interpreter", True):
-            assert _resolve_interpreter_enabled(args) is False
+        assert _resolve_interpreter_enabled(args) is False
 
     def test_explicit_flag_with_remote_sandbox_is_a_visible_error(
         self, mock_argv: MockArgvType, capsys: pytest.CaptureFixture[str]
@@ -3599,13 +3786,11 @@ class TestResolveInterpreterEnabled:
     def test_explicit_no_flag_overrides_local_default(
         self, mock_argv: MockArgvType
     ) -> None:
-        from deepagents_code.config import settings
         from deepagents_code.main import _resolve_interpreter_enabled
 
         with mock_argv("-n", "task", "--no-interpreter"):
             args = parse_args()
-        with patch.object(settings, "enable_interpreter", True):
-            assert _resolve_interpreter_enabled(args) is False
+        assert _resolve_interpreter_enabled(args) is False
 
     def test_empty_sandbox_treated_as_local(self) -> None:
         """An empty-string sandbox is falsy and must resolve as local mode.
@@ -3617,12 +3802,10 @@ class TestResolveInterpreterEnabled:
         """
         import argparse
 
-        from deepagents_code.config import settings
         from deepagents_code.main import _resolve_interpreter_enabled
 
         args = argparse.Namespace(interpreter=None, sandbox="")
-        with patch.object(settings, "enable_interpreter", True):
-            assert _resolve_interpreter_enabled(args) is True
+        assert _resolve_interpreter_enabled(args) is True
 
     def test_managed_false_revokes_an_explicit_interpreter_flag(
         self,
@@ -3776,7 +3959,6 @@ class TestResolveInterpreterEnabled:
         """With policy silent on the key, the sandbox default stands."""
         import argparse
 
-        from deepagents_code.config import settings
         from deepagents_code.configuration import service
         from deepagents_code.main import _resolve_interpreter_enabled
         from unit_tests.conftest import redirect_managed_config
@@ -3787,8 +3969,7 @@ class TestResolveInterpreterEnabled:
         service.invalidate_config_sources()
         try:
             args = argparse.Namespace(interpreter=None, sandbox="daytona")
-            with patch.object(settings, "enable_interpreter", True):
-                assert _resolve_interpreter_enabled(args) is False
+            assert _resolve_interpreter_enabled(args) is False
         finally:
             service.invalidate_config_sources()
 
@@ -3942,52 +4123,52 @@ class TestWarnInterpreterDisabledBySandbox:
         self, mock_argv: MockArgvType, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """A `--sandbox` run with the default-on interpreter warns on stderr."""
-        from deepagents_code.config import settings
         from deepagents_code.main import _warn_if_interpreter_disabled_by_sandbox
 
         with mock_argv("-n", "task", "--sandbox", "daytona"):
             args = parse_args()
-        with patch.object(settings, "enable_interpreter", True):
-            _warn_if_interpreter_disabled_by_sandbox(args)
+        _warn_if_interpreter_disabled_by_sandbox(args)
         assert "unavailable under a remote sandbox" in capsys.readouterr().err
 
     def test_silent_in_local_mode(
         self, mock_argv: MockArgvType, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Local mode keeps the interpreter, so there is nothing to warn about."""
-        from deepagents_code.config import settings
         from deepagents_code.main import _warn_if_interpreter_disabled_by_sandbox
 
         with mock_argv("-n", "task"):
             args = parse_args()
-        with patch.object(settings, "enable_interpreter", True):
-            _warn_if_interpreter_disabled_by_sandbox(args)
+        _warn_if_interpreter_disabled_by_sandbox(args)
         assert capsys.readouterr().err == ""
 
     def test_silent_on_explicit_opt_out_under_sandbox(
         self, mock_argv: MockArgvType, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """An explicit `--no-interpreter` is the user's choice, not a drop."""
-        from deepagents_code.config import settings
         from deepagents_code.main import _warn_if_interpreter_disabled_by_sandbox
 
         with mock_argv("-n", "task", "--sandbox", "daytona", "--no-interpreter"):
             args = parse_args()
-        with patch.object(settings, "enable_interpreter", True):
-            _warn_if_interpreter_disabled_by_sandbox(args)
+        _warn_if_interpreter_disabled_by_sandbox(args)
         assert capsys.readouterr().err == ""
 
     def test_silent_when_config_default_off(
-        self, mock_argv: MockArgvType, capsys: pytest.CaptureFixture[str]
+        self,
+        mock_argv: MockArgvType,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
     ) -> None:
         """A user who disabled the interpreter in config is not nagged."""
-        from deepagents_code.config import settings
+        from deepagents_code.configuration import service
         from deepagents_code.main import _warn_if_interpreter_disabled_by_sandbox
 
+        (tmp_path / "config.toml").write_text(
+            "[interpreter]\nenable_interpreter = false\n", encoding="utf-8"
+        )
+        service.invalidate_config_sources()
         with mock_argv("-n", "task", "--sandbox", "daytona"):
             args = parse_args()
-        with patch.object(settings, "enable_interpreter", False):
-            _warn_if_interpreter_disabled_by_sandbox(args)
+        _warn_if_interpreter_disabled_by_sandbox(args)
         assert capsys.readouterr().err == ""
 
     def test_cli_main_forwards_enabled_interpreter_in_local_mode(self) -> None:
@@ -3996,7 +4177,6 @@ class TestWarnInterpreterDisabledBySandbox:
         Guards the `cli_main` -> `run_non_interactive` wiring: a dropped or
         reverted assignment (e.g. back to a hard-coded `False`) fails here.
         """
-        from deepagents_code.config import settings
         from deepagents_code.main import cli_main
 
         run_mock = AsyncMock(return_value=0)
@@ -4010,7 +4190,6 @@ class TestWarnInterpreterDisabledBySandbox:
                 "deepagents_code.main._should_ensure_managed_ripgrep",
                 return_value=False,
             ),
-            patch.object(settings, "enable_interpreter", True),
             patch(
                 "deepagents_code.client.non_interactive.run_non_interactive", run_mock
             ),
@@ -4025,7 +4204,6 @@ class TestWarnInterpreterDisabledBySandbox:
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """End-to-end: `-n --sandbox` forwards the disabled interpreter and warns."""
-        from deepagents_code.config import settings
         from deepagents_code.main import cli_main
 
         run_mock = AsyncMock(return_value=0)
@@ -4044,7 +4222,6 @@ class TestWarnInterpreterDisabledBySandbox:
             patch(
                 "deepagents_code.integrations.sandbox_factory.verify_sandbox_deps",
             ),
-            patch.object(settings, "enable_interpreter", True),
             patch(
                 "deepagents_code.client.non_interactive.run_non_interactive", run_mock
             ),
@@ -4060,7 +4237,6 @@ class TestWarnInterpreterDisabledBySandbox:
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """End-to-end: `-n --sandbox --no-interpreter` disables without an advisory."""
-        from deepagents_code.config import settings
         from deepagents_code.main import cli_main
 
         run_mock = AsyncMock(return_value=0)
@@ -4088,7 +4264,6 @@ class TestWarnInterpreterDisabledBySandbox:
             patch(
                 "deepagents_code.integrations.sandbox_factory.verify_sandbox_deps",
             ),
-            patch.object(settings, "enable_interpreter", True),
             patch(
                 "deepagents_code.client.non_interactive.run_non_interactive", run_mock
             ),
@@ -4099,3 +4274,115 @@ class TestWarnInterpreterDisabledBySandbox:
         assert exc_info.value.code == 0
         assert run_mock.call_args.kwargs["enable_interpreter"] is False
         assert "unavailable under a remote sandbox" not in capsys.readouterr().err
+
+
+class TestModelParamsRetryOverrideWarning:
+    """An ignored `--model-params` retry count must be visible, not buffered."""
+
+    @staticmethod
+    def _run_headless(argv: list[str]) -> None:
+        """Run `cli_main` headlessly so the caller can read captured stderr."""
+        from deepagents_code.main import cli_main
+
+        mock_stdin = MagicMock()
+        mock_stdin.isatty.return_value = False
+        mock_stdin.read.return_value = "hi"
+
+        real_open = os.open
+
+        def _open_no_tty(
+            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            if os.fsdecode(path) == "/dev/tty":
+                msg = "No controlling terminal"
+                raise OSError(msg)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(sys, "stdin", mock_stdin),
+            patch("os.open", side_effect=_open_no_tty),
+            patch("deepagents_code.main.check_optional_tools", return_value=[]),
+            patch(
+                "deepagents_code.main._should_ensure_managed_ripgrep",
+                return_value=False,
+            ),
+            patch(
+                "deepagents_code.client.non_interactive.run_non_interactive",
+                new_callable=AsyncMock,
+                return_value=0,
+            ),
+            pytest.raises(SystemExit),
+        ):
+            cli_main()
+
+    def test_supplied_retry_param_warns(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`--model-params max_retries` is always overridden, so say so."""
+        # Pin the provider: without `--model` it resolves from available
+        # credentials, and on a credential-free machine the provider is
+        # unknown, so no retry kwarg is forced and the warning never fires.
+        self._run_headless(
+            [
+                "dcode",
+                "--model",
+                "anthropic:claude-opus-4-5",
+                "--model-params",
+                '{"max_retries": 10}',
+                "-n",
+                "hi",
+            ]
+        )
+        stderr = capsys.readouterr().err
+        assert "--model-params max_retries is ignored" in stderr
+        assert "--max-retries" in stderr
+        # Rich parses `[retries]` as a style tag and drops it, which would
+        # delete the remediation this warning exists to deliver.
+        assert "[retries].max_retries in config.toml" in stderr
+
+    def test_unrelated_params_stay_quiet(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An ordinary override must not trigger the retry warning."""
+        self._run_headless(
+            ["dcode", "--model-params", '{"temperature": 0.7}', "-n", "hi"]
+        )
+        assert "is ignored; dcode owns the retry budget" not in capsys.readouterr().err
+
+    def test_custom_retry_param_warns(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A configured custom-provider retry kwarg is visibly overridden."""
+        with patch(
+            "deepagents_code.config.collect_retry_config_startup",
+            return_value=([], {"retry_attempts"}),
+        ):
+            self._run_headless(
+                [
+                    "dcode",
+                    "--model-params",
+                    '{"retry_attempts": 3}',
+                    "-n",
+                    "hi",
+                ]
+            )
+
+        stderr = capsys.readouterr().err
+        assert "--model-params retry_attempts is ignored" in stderr
+        assert "--max-retries" in stderr
+
+    def test_retry_config_warning_renders_markup_as_text(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Malformed config values cannot inject Rich markup or crash startup."""
+        warning = "Ignoring [retries].max_retries='[/bold]'; expected an integer."
+        with patch(
+            "deepagents_code.config.collect_retry_config_startup",
+            return_value=([warning], set()),
+        ):
+            self._run_headless(["dcode", "-n", "hi"])
+
+        assert warning in capsys.readouterr().err

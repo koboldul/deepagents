@@ -2,6 +2,44 @@
 
 # Deep Agents Code Changelog
 
+## [0.1.64](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.63...deepagents-code==0.1.64) (2026-08-28)
+
+### Features
+
+- Added trace metadata attribution for skill invocations ([#5925](https://github.com/langchain-ai/deepagents/issues/5925)).
+- Added a list of MCP servers that require login ([#5867](https://github.com/langchain-ai/deepagents/issues/5867)).
+- Added the ability to copy the current model from the picker header ([#5904](https://github.com/langchain-ai/deepagents/issues/5904)).
+- Linked the doctor commit hash to GitHub ([#5920](https://github.com/langchain-ai/deepagents/issues/5920)).
+- Standardized the external editor shortcut ([#5911](https://github.com/langchain-ai/deepagents/issues/5911)).
+
+### Bug Fixes
+
+- Deferred recursion-limit handling to the LangGraph server ([#5882](https://github.com/langchain-ai/deepagents/issues/5882)).
+- Disabled Git terminal prompts in `execute` ([#5878](https://github.com/langchain-ai/deepagents/issues/5878)).
+- Improved privacy and debug-only visibility for MCP token and editable paths ([#5866](https://github.com/langchain-ai/deepagents/issues/5866), [#5850](https://github.com/langchain-ai/deepagents/issues/5850)).
+- Updated the model-switch warning to point to `/offload` ([#5901](https://github.com/langchain-ai/deepagents/issues/5901)).
+- Rejected stale successful updates ([#5847](https://github.com/langchain-ai/deepagents/issues/5847)).
+- Fixed thread timestamp rendering on systems without the glibc-only `%-I` `strftime` flag ([#5886](https://github.com/langchain-ai/deepagents/issues/5886)).
+- Respected ASCII mode in the splash border ([#5923](https://github.com/langchain-ai/deepagents/issues/5923)).
+- Skipped unchanged config writes ([#5919](https://github.com/langchain-ai/deepagents/issues/5919)).
+- Skipped uncorrelated-result warnings for auto-mode policy denials ([#5869](https://github.com/langchain-ai/deepagents/issues/5869)).
+
+## [0.1.63](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.62...deepagents-code==0.1.63) (2026-08-26)
+
+### Features
+
+- Added Baseten `zai-org/GLM-5.3-Flash` to the model switcher ([#5844](https://github.com/langchain-ai/deepagents/issues/5844)).
+- Added support for loading managed config from a remote source ([#5776](https://github.com/langchain-ai/deepagents/issues/5776)).
+- Added retry middleware for transient model errors in model nodes ([#4569](https://github.com/langchain-ai/deepagents/issues/4569)).
+
+### Fixes
+
+- Fixed live cost tracking for dynamic subagents ([#5833](https://github.com/langchain-ai/deepagents/issues/5833)).
+- Improved `clear` command descriptions ([#5841](https://github.com/langchain-ai/deepagents/issues/5841)).
+- Allowed instrumental Auto actions ([#5832](https://github.com/langchain-ai/deepagents/issues/5832)).
+- Ensured traces are flushed before server shutdown ([#5837](https://github.com/langchain-ai/deepagents/issues/5837)).
+- Made the debug log path click-to-copy ([#5845](https://github.com/langchain-ai/deepagents/issues/5845)).
+
 ## [0.1.62](https://github.com/langchain-ai/deepagents/compare/deepagents-code==0.1.61...deepagents-code==0.1.62) (2026-08-26)
 
 ### Features

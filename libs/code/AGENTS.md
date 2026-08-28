@@ -126,7 +126,7 @@ Debug logging is configured **once**, on the `deepagents_code` package logger, b
 
 - Do **not** add per-module `configure_debug_logging(logger)` calls. They are redundant now that the package logger is configured at import, and they reintroduce the duplicate-handler problem the single-config approach solves.
 - Every module should create its logger with `logging.getLogger(__name__)` so it stays inside the `deepagents_code.*` hierarchy and inherits the package handler. Don't set `logger.propagate = False` or attach your own handlers.
-- The **file** handler only attaches when `DEEPAGENTS_CODE_DEBUG` is truthy; that path is a single env-var read, so it's safe on the startup hot path. See `DEVELOPMENT.md` for the `DEEPAGENTS_CODE_DEBUG` / `DEEPAGENTS_CODE_DEBUG_FILE` / `DEEPAGENTS_CODE_LOG_LEVEL` env vars.
+- The **file** handler only attaches when `DEEPAGENTS_CODE_DEBUG` is truthy and the active thread is known; that path is a small env-var read and filesystem operation, so it's safe on the startup hot path. See `DEVELOPMENT.md` for the `DEEPAGENTS_CODE_DEBUG` / `DEEPAGENTS_CODE_DEBUG_DIRECTORY` / `DEEPAGENTS_CODE_LOG_LEVEL` env vars.
 - Separately, an **always-on in-memory ring buffer** (`_debug_buffer.install_log_buffer`, called from `__init__.py` right before `configure_debug_logging`) attaches unconditionally at import so the in-app Debug Console (`Ctrl+\`) can tail recent `deepagents_code.*` records without file logging. It captures `INFO` and above by default (or `DEEPAGENTS_CODE_LOG_LEVEL`), and may lower the package logger to `INFO` for the process lifetime. It never spills to the terminal (a handler is always found, so `lastResort` is skipped) and is bounded (a `deque` of 1000 records *per log level*), so it's cheap enough to keep on. Because it installs *before* `configure_debug_logging`, warnings that helper emits at startup are captured and visible in the console.
 
 ## CLI help screen
@@ -139,7 +139,7 @@ Hints that tell the user to run something (for example the teardown `-r <thread>
 
 ## Splash screen tips
 
-When adding a user-facing CLI feature (new slash command, keybinding, workflow), add a corresponding entry to the `_TIPS` dict in `deepagents_code/tui/widgets/startup_tip.py`, mapping the tip text to a relative selection weight (higher = shown more often). One tip is chosen at random above the input on startup to help users discover features. Keep tips short and action-oriented (e.g., `"Press ctrl+x to compose prompts in your external editor"`).
+When adding a user-facing CLI feature (new slash command, keybinding, workflow), add a corresponding entry to the `_TIPS` dict in `deepagents_code/tui/widgets/startup_tip.py`, mapping the tip text to a relative selection weight (higher = shown more often). One tip is chosen at random above the input on startup to help users discover features. Keep tips short and action-oriented (e.g., `"Press ctrl+g to compose prompts in your external editor"`).
 
 ## Slash commands
 
@@ -153,8 +153,8 @@ To add a new slash command: (1) add a `SlashCommand` entry to `COMMANDS`, (2) se
 
 1. `deepagents_code/model_config.py` — add `"provider_name": "ENV_VAR_NAME"` to `PROVIDER_API_KEY_ENV`
 2. `deepagents_code/model_config.py` — if the provider reads a *dedicated* endpoint env var, add `"provider_name": ("CANONICAL_BASE_URL", "ALTERNATE", ...)` to `PROVIDER_BASE_URL_ENV` (see guidelines below); omit the provider entirely when it has no provider-specific endpoint variable
-3. `pyproject.toml` — add `provider = ["langchain-provider>=X.Y.Z,<N.0.0"]` to `[project.optional-dependencies]` and include it in the `all-providers` composite extra
-4. `deepagents_code/model_config.py` — add `"provider_name"` to `RETRY_PARAM_BY_PROVIDER` if the provider's chat model accepts `max_retries`
+3. `deepagents_code/model_config.py` — add `"provider_name": "max_retries"` (or the provider's actual retry-count constructor kwarg) to `RETRY_PARAM_BY_PROVIDER`. dcode's model-node middleware owns the retry budget, so this entry is the disable-list that forces the provider's own SDK retry loop off; omitting it lets the SDK retries multiply the middleware's attempts. Verify the kwarg name against the integration's constructor — leave the provider out only when it exposes no integer retry-count kwarg. Check what the kwarg counts: retries are disabled with the default zero, but a kwarg counting *total attempts* needs an entry in `RETRY_DISABLE_VALUE_BY_PROVIDER` (see `google_genai`), because zero attempts either restores the SDK default or is coerced back to one
+4. `pyproject.toml` — add `provider = ["langchain-provider>=X.Y.Z,<N.0.0"]` to `[project.optional-dependencies]` and include it in the `all-providers` composite extra
 5. `deepagents_code/tui/widgets/auth.py` — add `"provider_name": "Display Name"` to `PROVIDER_DISPLAY_NAMES` so the `/auth` UI shows a branded label instead of the title-cased key, and (if the provider issues API keys from a self-serve page) `"provider_name": "https://…"` to `PROVIDER_API_KEY_URLS` so the prompt links straight to the key page
 6. `tests/unit_tests/test_model_config.py` — add `assert PROVIDER_API_KEY_ENV["provider_name"] == "ENV_VAR_NAME"` to `TestProviderApiKeyEnv.test_contains_major_providers`, and pin any `PROVIDER_BASE_URL_ENV` entry with a matching assertion
 
@@ -170,6 +170,6 @@ To add a new slash command: (1) add a `SlashCommand` entry to `COMMANDS`, (2) se
 **Not required** unless the provider's models have a distinctive name prefix (like `gpt-*`, `claude*`, `gemini*`):
 
 - `detect_provider()` in `config.py` — only needed for auto-detection from bare model names
-- `Settings.has_*` property in `config.py` — only needed if referenced by `detect_provider()` fallback logic
+- `Credentials.has_*` property in `config.py` — only needed if referenced by `detect_provider()` fallback logic
 
 Model discovery, credential checking, and UI integration are automatic once `PROVIDER_API_KEY_ENV` is populated and the `langchain-*` package is installed.

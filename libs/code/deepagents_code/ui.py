@@ -147,6 +147,9 @@ def show_help() -> None:
         "  dcode tools <install|list>                Manage managed tools (ripgrep)"
     )
     console.print("  dcode install NAME                        Install optional extras")
+    console.print(
+        "  dcode uninstall NAME                      Remove an optional extra"
+    )
     console.print()
 
     console.print("[bold]Options:[/bold]", style=theme.PRIMARY)
@@ -158,8 +161,10 @@ def show_help() -> None:
     console.print(
         "  --model-params JSON        Extra model kwargs (e.g., '{\"temperature\": 0.7}')"  # noqa: E501
     )
+    console.print("  --summarization-model MODEL")
+    console.print("                             Model for context-compaction summaries")
     console.print(
-        "  --max-retries N            Override max retries for transient model errors"
+        "  --max-retries N            Retries after a failed model request; 0 disables"
     )
     console.print("  --profile-override JSON    Override model profile fields as JSON")
     console.print("  -m, --message TEXT         Initial prompt to auto-submit on start")
@@ -216,6 +221,14 @@ def show_help() -> None:
         "  --trust-project-hooks      Trust project hooks.json command handlers"
     )
     console.print(
+        "  --trust-project-extensions Trust project .deepagents/extensions Python "
+        "(experimental)"
+    )
+    console.print(
+        "  -e, --extension PATH       Load extension file or directory "
+        "(experimental, repeatable)"
+    )
+    console.print(
         "  --interpreter, --no-interpreter"
         "  Enable or disable JS interpreter (`js_eval`) middleware"
     )
@@ -235,6 +248,7 @@ def show_help() -> None:
     console.print(
         "  --no-stream                Buffer full response instead of streaming"
     )
+    console.print("  --show-reasoning           Show provider-visible reasoning")
     console.print(
         "  --max-turns N              Max agentic turns before stopping (needs -n)"
     )
@@ -255,7 +269,6 @@ def show_help() -> None:
     )
     console.print(
         "  --recursion-limit N        Override the agent's graph recursion_limit"
-        " (default 2000)"
     )
     console.print(
         "  --timeout SECONDS          Hard wall-clock limit; exits 124 on expiry"
@@ -280,6 +293,7 @@ def show_help() -> None:
         "  --auto-update              Toggle automatic updates on or off, then exit"
     )
     console.print("  --install NAME             Alias for `install NAME`")
+    console.print("  --uninstall NAME           Alias for `uninstall NAME`")
     console.print(
         "  --package                  With install/--install, treat NAME as a "
         "package (uv --with), not an extra"
@@ -742,6 +756,41 @@ def show_install_help() -> None:
     console.print()
 
 
+def show_uninstall_help() -> None:
+    """Show help information for the `uninstall` subcommand."""
+    console.print()
+    console.print("[bold]Usage:[/bold]", style=theme.PRIMARY)
+    console.print("  dcode uninstall NAME")
+    console.print()
+    console.print("Remove an installed optional deepagents-code extra.")
+    console.print("dcode rebuilds the tool environment with the remaining extras.")
+    console.print()
+    console.print("[bold]Examples:[/bold]", style=theme.PRIMARY)
+    console.print("  dcode uninstall ollama")
+    console.print()
+    from deepagents_code.extras_info import (
+        BASE_DEPENDENCY_EXTRAS,
+        COMPOSITE_EXTRA_MEMBERS,
+    )
+
+    base = ", ".join(sorted(BASE_DEPENDENCY_EXTRAS))
+    composites = " or ".join(sorted(COMPOSITE_EXTRA_MEMBERS))
+    console.print("[bold]Restrictions:[/bold]", style=theme.PRIMARY)
+    console.print(f"  These extras are base dependencies: {base}.")
+    console.print("  They cannot be removed.")
+    console.print("  Editable and Homebrew installs cannot remove extras in place.")
+    console.print(f"  An extra installed through {composites} cannot be")
+    console.print("  removed on its own. Remove the composite extra instead.")
+    console.print()
+    console.print(
+        "In-session equivalent: `/uninstall NAME`. Legacy CLI alias:",
+        style=theme.MUTED,
+        highlight=False,
+    )
+    console.print("  dcode --uninstall ollama", style=theme.MUTED)
+    console.print()
+
+
 def _print_mcp_discovery_paths() -> None:
     """Print the auto-discovered MCP config paths in precedence order."""
     from deepagents_code.mcp_tools import MCP_CONFIG_DISCOVERY_PATHS
@@ -778,7 +827,7 @@ def show_mcp_help() -> None:
     console.print("  dcode mcp <command> [options]")
     console.print()
     console.print("[bold]Commands:[/bold]", style=theme.PRIMARY)
-    console.print("  login <server>    Run the OAuth login flow for an MCP server")
+    console.print("  login [server]    List servers needing login or authenticate one")
     console.print("  config            Show MCP config discovery paths")
     console.print()
     _print_option_section()
@@ -801,7 +850,11 @@ def show_mcp_login_help() -> None:
     """Show help information for the `mcp login` subcommand."""
     console.print()
     console.print("[bold]Usage:[/bold]", style=theme.PRIMARY)
-    console.print("  dcode mcp login <server> [--mcp-config PATH]")
+    console.print("  dcode mcp login [server] [--mcp-config PATH]")
+    console.print()
+    console.print(
+        "With no server, lists configured OAuth servers that have no stored login."
+    )
     console.print()
     _print_option_section(
         "  --mcp-config PATH       Path to an MCP config JSON file "
@@ -814,6 +867,7 @@ def show_mcp_login_help() -> None:
     console.print(_MCP_CONFIG_FORMAT_EXAMPLE, style=theme.MUTED)
     console.print()
     console.print("[bold]Examples:[/bold]", style=theme.PRIMARY)
+    console.print("  dcode mcp login")
     console.print("  dcode mcp login notion")
     console.print("  dcode mcp login linear --mcp-config ./mcp-config.json")
     console.print()

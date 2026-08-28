@@ -104,6 +104,28 @@ class TestInitialSkillArg:
         assert args.initial_prompt == "review this patch"
 
 
+class TestSummarizationModelArg:
+    def test_flag_sets_model_independently(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "deepagents",
+                "--model",
+                "anthropic:claude-sonnet-4-5",
+                "--summarization-model",
+                "openai:gpt-5.4-mini",
+            ],
+        ):
+            args = parse_args()
+        assert args.model == "anthropic:claude-sonnet-4-5"
+        assert args.summarization_model == "openai:gpt-5.4-mini"
+
+    def test_flag_defaults_to_none(self) -> None:
+        with patch.object(sys, "argv", ["deepagents"]):
+            assert parse_args().summarization_model is None
+
+
 class TestMaxRetriesArg:
     """Tests for `--max-retries` argument."""
 
@@ -546,6 +568,32 @@ class TestConfigCommandDispatch:
 
 class TestMcpCommandDispatch:
     """Tests for `cli_main()` dispatch of `dcode mcp` subcommands."""
+
+    def test_bare_mcp_login_lists_servers(self) -> None:
+        """`dcode mcp login` dispatches to login discovery."""
+        from deepagents_code.main import cli_main
+
+        with (
+            patch.object(sys, "argv", ["deepagents", "mcp", "login"]),
+            patch("deepagents_code.main.check_cli_dependencies"),
+            patch("deepagents_code.main.apply_stdin_pipe"),
+            patch(
+                "deepagents_code.client.commands.mcp.run_mcp_login_list",
+                new=AsyncMock(return_value=0),
+            ) as mock_list,
+            patch(
+                "deepagents_code.client.commands.mcp.run_mcp_login",
+                new=AsyncMock(return_value=0),
+            ) as mock_login,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            cli_main()
+
+        assert exc_info.value.code == 0
+        mock_list.assert_awaited_once_with(config_path=None)
+        # `assert_not_called`, not `assert_not_awaited`: building both
+        # coroutines and awaiting one would still pass the latter.
+        mock_login.assert_not_called()
 
     def test_mcp_login_uses_top_level_mcp_config_as_fallback(self) -> None:
         """`dcode --mcp-config PATH mcp login NAME` propagates PATH to login."""

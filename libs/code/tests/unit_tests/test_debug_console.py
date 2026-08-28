@@ -1770,10 +1770,8 @@ class TestDebugConsoleToggle:
 
         Guards the enabled path the reverse-focus fix depends on: on the main
         screen `check_action` must leave `toggle_auto_approve` enabled (return
-        `True`) so shift+tab and ctrl+t still toggle auto-approve; the
+        `True`) so Shift+Tab still toggles auto-approve; the
         `test_shift_tab_reverses_focus_*` test only exercises the disabled path.
-        Branching on the action name (not the key) means the same gate covers
-        the `ctrl+t` binding, which also maps to `toggle_auto_approve`.
         """
         app = DeepAgentsApp(agent=MagicMock(), thread_id="thread-123")
         async with app.run_test() as pilot:
@@ -2094,6 +2092,72 @@ class TestDebugConsoleToggle:
             assert fields["Version"].value
             assert fields["CWD"].copyable is True
             assert fields["CWD"].value
+
+    async def test_build_snapshot_editable_install_path_is_copyable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import deepagents_code.config as config_mod
+
+        monkeypatch.setattr(
+            config_mod,
+            "_get_editable_install_path",
+            lambda: "~/oss/deepagents/libs/code",
+        )
+        app = DeepAgentsApp(agent=MagicMock(), thread_id="t")
+        async with app.run_test():
+            field = next(
+                field
+                for field in app._build_debug_snapshot()
+                if field.label == "Install path"
+            )
+            assert field.value == "~/oss/deepagents/libs/code"
+            assert field.copyable is True
+
+    async def test_build_snapshot_omits_non_editable_install_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import deepagents_code.config as config_mod
+
+        monkeypatch.setattr(config_mod, "_get_editable_install_path", lambda: None)
+        app = DeepAgentsApp(agent=MagicMock(), thread_id="t")
+        async with app.run_test():
+            fields = {field.label: field for field in app._build_debug_snapshot()}
+            assert "Install path" not in fields
+
+    async def test_build_snapshot_debug_log_path_is_copyable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import deepagents_code._debug as debug_mod
+
+        monkeypatch.setattr(
+            debug_mod, "installed_debug_log_path", lambda: "/tmp/custom-debug.log"
+        )
+        app = DeepAgentsApp(agent=MagicMock(), thread_id="t")
+        async with app.run_test():
+            field = next(
+                field
+                for field in app._build_debug_snapshot()
+                if field.label == "Debug log"
+            )
+            assert field.value == "/tmp/custom-debug.log"
+            assert field.copyable is True
+
+    async def test_build_snapshot_in_memory_log_is_not_copyable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import deepagents_code._debug as debug_mod
+
+        monkeypatch.setattr(debug_mod, "installed_debug_log_path", lambda: None)
+        monkeypatch.delenv("DEEPAGENTS_CODE_DEBUG", raising=False)
+        app = DeepAgentsApp(agent=MagicMock(), thread_id="t")
+        async with app.run_test():
+            field = next(
+                field
+                for field in app._build_debug_snapshot()
+                if field.label == "Debug log"
+            )
+            assert field.value == "in-memory only"
+            assert field.copyable is False
 
     async def test_build_snapshot_model_field_is_copyable_when_configured(
         self, monkeypatch: pytest.MonkeyPatch

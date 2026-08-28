@@ -457,7 +457,7 @@ def _restore_os_environ() -> Generator[None, None, None]:
 def _clear_langsmith_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent LangSmith env vars loaded from .env from leaking into tests.
 
-    `deepagents_code.config` loads dotenv lazily on first `settings` access
+    `deepagents_code.config` loads dotenv lazily on first `credentials` access
     (via `_ensure_bootstrap()` / `_load_dotenv()`, which reads values with
     `dotenv.dotenv_values()`) and may inject `LANGSMITH_*` variables from a
     local `.env` file. Because those mutations persist in `os.environ`, they
@@ -504,16 +504,16 @@ def _disable_langsmith_batching(monkeypatch: pytest.MonkeyPatch) -> None:
 def _clear_tavily_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent a Tavily key loaded from .env from leaking into tests.
 
-    Like `LANGSMITH_*`, the lazy dotenv load on first `settings` access (see
+    Like `LANGSMITH_*`, the lazy dotenv load on first `credentials` access (see
     `_clear_langsmith_env`) may inject `TAVILY_API_KEY` from a developer's
     local `.env`.
-    A leaked key flips `settings.has_tavily` to `True`, which silently changes
+    A leaked key flips `credentials.has_tavily` to `True`, which silently changes
     onboarding behavior: the launch sequence short-circuits the Tavily step on
     a dev machine but runs it on CI, so a test that reaches the step passes
     locally yet hangs (real screen push) or writes a credential on CI.
 
     Each test that *needs* a Tavily key should set it explicitly via
-    `monkeypatch.setenv` or patch `settings.has_tavily`.
+    `monkeypatch.setenv` or patch `credentials.has_tavily`.
     """
     for key in ("TAVILY_API_KEY", "DEEPAGENTS_CODE_TAVILY_API_KEY"):
         monkeypatch.delenv(key, raising=False)
@@ -524,7 +524,7 @@ def _clear_project_mcp_trust_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Prevent developer MCP trust decisions from changing unit-test behavior.
 
     These may already be present in `os.environ` before any fixture runs:
-    `deepagents_code.config` loads dotenv lazily on first `settings` access
+    `deepagents_code.config` loads dotenv lazily on first `credentials` access
     (via `_ensure_bootstrap()` / `_load_dotenv()`) and injects them from the
     developer's global `~/.deepagents/.env`. The dangerous allowlist adds
     project-agnostic trust decisions, so leaving it set changes trust-list and
@@ -579,7 +579,7 @@ def _clear_debug_notifications_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
     `DEEPAGENTS_CODE_DEBUG_NOTIFICATIONS` may be loaded from the developer's
     global `~/.deepagents/.env` when `deepagents_code.config` loads dotenv
-    lazily on first `settings` access, before fixtures run. When set, the
+    lazily on first `credentials` access, before fixtures run. When set, the
     notification suppression path skips persistence -- it removes the entry
     without calling `suppress_warning` -- so tests asserting that a suppression
     is persisted (or that a failed suppression keeps the row) break. Tests that
@@ -1162,7 +1162,7 @@ def _close_leaked_debug_handlers() -> None:
 
 
 def resolve_option_for_test(
-    option: ConfigOption,
+    option: ConfigOption[object],
     *,
     toml_data: dict[str, Any],
     managed_toml_data: dict[str, Any] | None = None,

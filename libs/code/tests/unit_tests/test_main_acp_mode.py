@@ -56,6 +56,7 @@ def _make_acp_args(**overrides: object) -> argparse.Namespace:
         no_mcp=False,
         trust_project_mcp=False,
         auto_classifier_model=None,
+        summarization_model=None,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -156,6 +157,7 @@ def test_acp_mode_loads_tools_and_mcp_and_runs_server(
     args = _make_acp_args(
         model_params='{"temperature": 0.2}',
         profile_override='{"max_input_tokens": 4096}',
+        summarization_model="openai:summary-model",
         yolo=True,
     )
     model_obj = object()
@@ -163,7 +165,9 @@ def test_acp_mode_loads_tools_and_mcp_and_runs_server(
         model=model_obj,
         provider="anthropic",
         model_name="claude-sonnet-4-6",
-        apply_to_settings=MagicMock(),
+        apply_to_runtime_state=MagicMock(),
+        model_retries=5,
+        cli_max_retries=None,
     )
     server = object()
     mcp_loop = None
@@ -215,7 +219,9 @@ def test_acp_mode_loads_tools_and_mcp_and_runs_server(
             side_effect=AssertionError("check_cli_dependencies should be skipped"),
         ),
         patch("deepagents_code.main.parse_args", return_value=args),
-        patch("deepagents_code.config.settings", new=SimpleNamespace(has_tavily=True)),
+        patch(
+            "deepagents_code.config.credentials", new=SimpleNamespace(has_tavily=True)
+        ),
         patch(
             "deepagents_code.config.is_memory_auto_save_enabled", return_value=False
         ) as mock_memory_auto_save,
@@ -254,6 +260,7 @@ def test_acp_mode_loads_tools_and_mcp_and_runs_server(
         None,
         extra_kwargs={"temperature": 0.2},
         profile_overrides={"max_input_tokens": 4096},
+        cli_max_retries=None,
     )
     resolve_mcp_tools.assert_awaited_once_with(
         explicit_config_path=None,
@@ -263,7 +270,7 @@ def test_acp_mode_loads_tools_and_mcp_and_runs_server(
         additional_configs=plugin_configs,
     )
     discover_plugin_mcp.assert_called_once_with(project_dir=acp_project_root)
-    assert model_result.apply_to_settings.call_count == 2
+    assert model_result.apply_to_runtime_state.call_count == 2
     mock_create_agent.assert_called_once()
     call_kwargs = mock_create_agent.call_args.kwargs
     assert call_kwargs["model"] is model_obj
@@ -276,6 +283,7 @@ def test_acp_mode_loads_tools_and_mcp_and_runs_server(
     assert call_kwargs["auto_approve"] is True
     assert call_kwargs["auto_mode_enabled"] is False
     assert call_kwargs["memory_auto_save"] is False
+    assert call_kwargs["summarization_model"] == "openai:summary-model"
     mock_memory_auto_save.assert_called_once_with()
     test_acp_checkpointer.setup.assert_awaited_once_with()
     assert mock_server_cls.call_args.kwargs["models"][0] == {
@@ -296,7 +304,9 @@ def test_acp_mode_auto_forwards_classifier_and_store() -> None:
         model=object(),
         provider="openai",
         model_name="gpt-5.5",
-        apply_to_settings=MagicMock(),
+        apply_to_runtime_state=MagicMock(),
+        model_retries=5,
+        cli_max_retries=None,
     )
     server = object()
     auto_server = MagicMock(return_value=server)
@@ -312,7 +322,9 @@ def test_acp_mode_auto_forwards_classifier_and_store() -> None:
     with (
         patch.object(sys, "argv", ["deepagents", "--acp", "--auto-approve"]),
         patch("deepagents_code.main.parse_args", return_value=args),
-        patch("deepagents_code.config.settings", new=SimpleNamespace(has_tavily=False)),
+        patch(
+            "deepagents_code.config.credentials", new=SimpleNamespace(has_tavily=False)
+        ),
         patch("deepagents_code.model_config.save_recent_model", return_value=True),
         patch("deepagents_code.config.create_model", return_value=model_result),
         patch(
@@ -350,7 +362,9 @@ def test_acp_mode_omits_web_search_without_tavily() -> None:
         model=model_obj,
         provider="anthropic",
         model_name="claude-sonnet-4-6",
-        apply_to_settings=MagicMock(),
+        apply_to_runtime_state=MagicMock(),
+        model_retries=5,
+        cli_max_retries=None,
     )
     server = object()
     run_agent = AsyncMock(return_value=None)
@@ -366,7 +380,9 @@ def test_acp_mode_omits_web_search_without_tavily() -> None:
             side_effect=AssertionError("check_cli_dependencies should be skipped"),
         ),
         patch("deepagents_code.main.parse_args", return_value=args),
-        patch("deepagents_code.config.settings", new=SimpleNamespace(has_tavily=False)),
+        patch(
+            "deepagents_code.config.credentials", new=SimpleNamespace(has_tavily=False)
+        ),
         patch("deepagents_code.model_config.save_recent_model", return_value=True),
         patch("deepagents_code.config.create_model", return_value=model_result),
         patch(
@@ -405,7 +421,9 @@ def test_acp_mode_forwards_allow_fs_tools() -> None:
         model=model_obj,
         provider="anthropic",
         model_name="claude-sonnet-4-6",
-        apply_to_settings=MagicMock(),
+        apply_to_runtime_state=MagicMock(),
+        model_retries=5,
+        cli_max_retries=None,
     )
     server = object()
     run_agent = AsyncMock(return_value=None)
@@ -418,7 +436,9 @@ def test_acp_mode_forwards_allow_fs_tools() -> None:
             side_effect=AssertionError("check_cli_dependencies should be skipped"),
         ),
         patch("deepagents_code.main.parse_args", return_value=args),
-        patch("deepagents_code.config.settings", new=SimpleNamespace(has_tavily=False)),
+        patch(
+            "deepagents_code.config.credentials", new=SimpleNamespace(has_tavily=False)
+        ),
         patch("deepagents_code.model_config.save_recent_model", return_value=True),
         patch("deepagents_code.config.create_model", return_value=model_result),
         patch(
@@ -451,7 +471,9 @@ def test_acp_mode_forwards_none_allow_fs_tools_by_default() -> None:
         model=object(),
         provider="anthropic",
         model_name="claude-sonnet-4-6",
-        apply_to_settings=MagicMock(),
+        apply_to_runtime_state=MagicMock(),
+        model_retries=5,
+        cli_max_retries=None,
     )
     run_agent = AsyncMock(return_value=None)
     resolve_mcp_tools = AsyncMock(return_value=([], None, []))
@@ -463,7 +485,9 @@ def test_acp_mode_forwards_none_allow_fs_tools_by_default() -> None:
             side_effect=AssertionError("check_cli_dependencies should be skipped"),
         ),
         patch("deepagents_code.main.parse_args", return_value=args),
-        patch("deepagents_code.config.settings", new=SimpleNamespace(has_tavily=False)),
+        patch(
+            "deepagents_code.config.credentials", new=SimpleNamespace(has_tavily=False)
+        ),
         patch("deepagents_code.model_config.save_recent_model", return_value=True),
         patch("deepagents_code.config.create_model", return_value=model_result),
         patch(
@@ -501,7 +525,9 @@ def test_acp_mode_forwards_recursion_limit() -> None:
         model=object(),
         provider="anthropic",
         model_name="claude-sonnet-4-6",
-        apply_to_settings=MagicMock(),
+        apply_to_runtime_state=MagicMock(),
+        model_retries=5,
+        cli_max_retries=None,
     )
     run_agent = AsyncMock(return_value=None)
     resolve_mcp_tools = AsyncMock(return_value=([], None, []))
@@ -513,7 +539,9 @@ def test_acp_mode_forwards_recursion_limit() -> None:
             side_effect=AssertionError("check_cli_dependencies should be skipped"),
         ),
         patch("deepagents_code.main.parse_args", return_value=args),
-        patch("deepagents_code.config.settings", new=SimpleNamespace(has_tavily=False)),
+        patch(
+            "deepagents_code.config.credentials", new=SimpleNamespace(has_tavily=False)
+        ),
         patch("deepagents_code.model_config.save_recent_model", return_value=True),
         patch("deepagents_code.config.create_model", return_value=model_result),
         patch(

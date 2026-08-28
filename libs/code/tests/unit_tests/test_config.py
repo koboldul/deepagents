@@ -7,30 +7,42 @@ import textwrap
 import time
 import warnings
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest.mock import Mock, patch
 
 import pytest
 
-from deepagents_code import _git as git_module, model_config
+from deepagents_code import _git as git_module, config as config_module, model_config
 from deepagents_code._env_vars import SERVER_ENV_PREFIX
+from deepagents_code._paths import (
+    get_agent_dir,
+    get_project_agent_md_path,
+    get_project_agent_skills_dir,
+    get_project_claude_skills_dir,
+    get_user_agent_md_path,
+    get_user_agent_skills_dir,
+    get_user_claude_skills_dir,
+    user_agents_dir,
+    user_deepagents_dir,
+)
 from deepagents_code._version import __version__
 from deepagents_code.config import (
     _MCP_SHUTDOWN_RACE_MESSAGES,
     _MCP_SSE_LOGGER_NAME,
     _MCP_STREAMABLE_HTTP_LOGGER_NAME,
     _QUIET_SDK_LOGGER_NAMES,
-    CLI_MAX_RETRIES_KEY,
     LANGSMITH_EU_ENDPOINT,
     LANGSMITH_US_ENDPOINT,
+    MODEL_RETRIES_ATTR,
     RECOMMENDED_SAFE_SHELL_COMMANDS,
     SHELL_ALLOW_ALL,
+    Credentials,
     LangSmithApiError,
     LangSmithProjectNotFoundError,
     LangsmithShadowResult,
     ModelResult,
-    Settings,
     _apply_default_langsmith_project,
     _apply_stored_langsmith_tracing,
     _create_model_from_class,
@@ -38,15 +50,18 @@ from deepagents_code.config import (
     _disable_orphaned_tracing,
     _get_provider_kwargs,
     _McpShutdownRaceFilter,
+    _parse_retry_config,
+    _provider_retry_disable_kwargs,
     _quiet_sdk_logging,
-    _read_config_toml_retries,
-    _resolve_retry_kwargs,
-    _resolve_retry_param_name,
+    _read_retry_config,
+    _resolve_config_retry_count,
+    _resolve_model_retries_from_section,
     apply_stored_langsmith_auth,
     build_langsmith_thread_url,
     configure_langsmith_secret_redaction,
     consume_orphaned_tracing_disabled_notice,
     create_model,
+    credentials,
     detect_mode_prefix,
     detect_provider,
     fetch_langsmith_project_url,
@@ -60,9 +75,10 @@ from deepagents_code.config import (
     normalize_langsmith_endpoint,
     parse_shell_allow_list,
     reset_langsmith_url_cache,
-    settings,
+    runtime_state,
     validate_model_capabilities,
 )
+from deepagents_code.configuration.interpreter import InterpreterConfig
 from deepagents_code.model_config import (
     ModelConfig,
     ModelConfigError,
@@ -113,7 +129,7 @@ class TestRuntimeDotenvReload:
 
         try:
             config_mod._load_dotenv(start_path=current)
-            runtime = Settings.from_environment(start_path=current)
+            runtime = Credentials.from_environment(start_path=current)
             assert runtime.openai_api_key == "sk-current"
 
             changes = runtime.reload_from_environment(start_path=target)
@@ -148,7 +164,7 @@ class TestRuntimeDotenvReload:
         caplog.set_level(logging.DEBUG, logger="deepagents_code.model_config")
         reset_env_resolution_log()
         try:
-            runtime = Settings.from_environment(start_path=tmp_path)
+            runtime = Credentials.from_environment(start_path=tmp_path)
             assert resolve_env_var("OPENAI_API_KEY") == "sk-prefixed"
             runtime.reload_from_environment(start_path=tmp_path)
             assert resolve_env_var("OPENAI_API_KEY") == "sk-prefixed"
@@ -200,7 +216,7 @@ class TestRuntimeDotenvReload:
             # Agent-project override is active before the reload, cleared after.
             monkeypatch.setenv("DEEPAGENTS_CODE_LANGSMITH_PROJECT", "agent-project")
 
-            runtime = Settings.from_environment(start_path=current)
+            runtime = Credentials.from_environment(start_path=current)
             assert runtime.deepagents_langchain_project == "agent-project"
 
             monkeypatch.delenv("DEEPAGENTS_CODE_LANGSMITH_PROJECT", raising=False)
@@ -337,6 +353,87 @@ class TestProjectDotenvDeniedKeys:
             # A non-denied key from the same file still loads, so the assertion
             # above cannot pass just because the `.env` was never read.
             assert os.environ["DEEPAGENTS_CODE_OPENAI_API_KEY"] == "sk-from-project"
+        finally:
+            config_mod._dotenv_loaded_values.clear()
+
+    def test_project_dotenv_cannot_set_langgraph_recursion_default(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A repo cannot bypass the bounded Deep Agents recursion setting."""
+        import os
+
+        import deepagents_code.config as config_mod
+
+        upstream_env = "LANGGRAPH_DEFAULT_RECURSION_LIMIT"
+        project = tmp_path / "cloned-repo"
+        project.mkdir()
+        (project / ".env").write_text(
+            f"{upstream_env}=0\nDEEPAGENTS_CODE_TEST_PROJECT_VALUE=allowed\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.delenv(upstream_env, raising=False)
+        monkeypatch.delenv("DEEPAGENTS_CODE_TEST_PROJECT_VALUE", raising=False)
+        monkeypatch.setattr(
+            config_mod,
+            "_GLOBAL_DOTENV_PATH",
+            tmp_path / "missing-global.env",
+        )
+        config_mod._dotenv_loaded_values.clear()
+
+        try:
+            config_mod._load_dotenv(start_path=project)
+            preview = config_mod._preview_dotenv_environ(start_path=project)
+
+            assert upstream_env not in os.environ
+            assert upstream_env not in preview
+            assert os.environ["DEEPAGENTS_CODE_TEST_PROJECT_VALUE"] == "allowed"
+            assert preview["DEEPAGENTS_CODE_TEST_PROJECT_VALUE"] == "allowed"
+        finally:
+            config_mod._dotenv_loaded_values.clear()
+
+    def test_project_dotenv_cannot_set_langgraph_recursion_default_lowercase(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A lowercase spelling cannot bypass the project denial on Windows."""
+        import os
+
+        import deepagents_code.config as config_mod
+
+        upstream_env = "LANGGRAPH_DEFAULT_RECURSION_LIMIT"
+        project = tmp_path / "cloned-repo"
+        project.mkdir()
+        (project / ".env").write_text(
+            "langgraph_default_recursion_limit=0\n"
+            "deepagents_code_test_project_value=allowed\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.delenv(upstream_env, raising=False)
+        monkeypatch.delenv("deepagents_code_test_project_value", raising=False)
+        monkeypatch.delenv("DEEPAGENTS_CODE_TEST_PROJECT_VALUE", raising=False)
+        monkeypatch.setattr(
+            config_mod,
+            "_GLOBAL_DOTENV_PATH",
+            tmp_path / "missing-global.env",
+        )
+        config_mod._dotenv_loaded_values.clear()
+
+        try:
+            config_mod._load_dotenv(start_path=project)
+            preview = config_mod._preview_dotenv_environ(start_path=project)
+
+            # On POSIX the lowercase key is a distinct, inert variable; on
+            # Windows the same assignment would activate the real one. Either
+            # way the denied spelling must not reach the environment.
+            assert upstream_env not in os.environ
+            assert upstream_env not in preview
+            assert "langgraph_default_recursion_limit" not in os.environ
+            assert "langgraph_default_recursion_limit" not in preview
         finally:
             config_mod._dotenv_loaded_values.clear()
 
@@ -812,7 +909,7 @@ class TestProjectAgentMdFinding:
         regular-file candidate to fail the absolute-vs-resolved equality check
         and be returned as the canonical target rather than reported as missing.
         Pin behavior so that callers passing an uncanonicalized root (common
-        when `Settings.project_root` originates from an unresolved cwd) still
+        when `Credentials.project_root` originates from an unresolved cwd) still
         find a regular AGENTS.md.
         """
         real_root = tmp_path / "real"
@@ -831,36 +928,31 @@ class TestProjectAgentMdFinding:
         assert result[0].is_relative_to(link_root.resolve())
 
 
-class TestSettingsUserDeepagentsDir:
+class TestUserDeepagentsDir:
     """Test user-level paths derived from `DEEPAGENTS_HOME`."""
 
     def test_uses_deepagents_home(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Agent profiles and instructions use the configured root."""
-        import deepagents_code.config as config_module
+        import deepagents_code._paths as paths_module
         from deepagents_code._paths import _capture_paths
 
         configured = tmp_path / "custom-home"
         snapshot = _capture_paths(str(configured), launch_home=tmp_path)
-        monkeypatch.setattr(config_module, "PATHS", snapshot)
-        settings = Settings.__new__(Settings)
+        monkeypatch.setattr(paths_module, "PATHS", snapshot)
 
-        assert settings.user_deepagents_dir == configured
-        assert settings.get_agent_dir("coder") == configured / "coder"
-        assert settings.get_user_agent_md_path("coder") == (
-            configured / "coder" / "AGENTS.md"
-        )
+        assert user_deepagents_dir() == configured
+        assert get_agent_dir("coder") == configured / "coder"
+        assert get_user_agent_md_path("coder") == (configured / "coder" / "AGENTS.md")
 
 
-class TestSettingsGetProjectAgentMdPath:
-    """Test Settings.get_project_agent_md_path() integration."""
+class TestGetProjectAgentMdPath:
+    """Test `get_project_agent_md_path` integration."""
 
     def test_returns_empty_list_when_no_project_root(self) -> None:
         """Should return [] when project_root is None."""
-        s = Settings.__new__(Settings)
-        s.project_root = None
-        assert s.get_project_agent_md_path() == []
+        assert get_project_agent_md_path(None) == []
 
     def test_returns_existing_paths(self, tmp_path: Path) -> None:
         """Should return existing AGENTS.md paths from project root."""
@@ -872,17 +964,12 @@ class TestSettingsGetProjectAgentMdPath:
         root_md = tmp_path / "AGENTS.md"
         root_md.write_text("root")
 
-        s = Settings.__new__(Settings)
-        s.project_root = tmp_path
-
-        result = s.get_project_agent_md_path()
+        result = get_project_agent_md_path(tmp_path)
         assert result == [deepagents_md, root_md]
 
     def test_returns_empty_when_no_agents_md_files(self, tmp_path: Path) -> None:
         """Should return [] when project exists but has no AGENTS.md."""
-        s = Settings.__new__(Settings)
-        s.project_root = tmp_path
-        assert s.get_project_agent_md_path() == []
+        assert get_project_agent_md_path(tmp_path) == []
 
 
 class TestNewlineShortcut:
@@ -939,7 +1026,7 @@ class TestNewlineShortcut:
 class TestValidateModelCapabilities:
     """Tests for model capability validation."""
 
-    @patch("deepagents_code.config.console")
+    @patch("deepagents_code.config._console_instance")
     def test_model_without_profile_attribute_warns(self, mock_console: Mock) -> None:
         """Test that models without profile attribute trigger a warning."""
         model = Mock(spec=[])  # No profile attribute
@@ -950,7 +1037,7 @@ class TestValidateModelCapabilities:
         assert "No capability profile" in call_args
         assert "test-model" in call_args
 
-    @patch("deepagents_code.config.console")
+    @patch("deepagents_code.config._console_instance")
     def test_model_with_none_profile_warns(self, mock_console: Mock) -> None:
         """Test that models with `profile=None` trigger a warning."""
         model = Mock()
@@ -962,7 +1049,7 @@ class TestValidateModelCapabilities:
         call_args = mock_console.print.call_args[0][0]
         assert "No capability profile" in call_args
 
-    @patch("deepagents_code.config.console")
+    @patch("deepagents_code.config._console_instance")
     def test_model_with_tool_calling_false_exits(self, mock_console: Mock) -> None:
         """Test that models with `tool_calling=False` cause `sys.exit(1)`."""
         model = Mock()
@@ -978,7 +1065,7 @@ class TestValidateModelCapabilities:
         assert "does not support tool calling" in error_call
         assert "no-tools-model" in error_call
 
-    @patch("deepagents_code.config.console")
+    @patch("deepagents_code.config._console_instance")
     def test_model_with_tool_calling_true_passes(self, mock_console: Mock) -> None:
         """Test that models with `tool_calling=True` pass without messages."""
         model = Mock()
@@ -988,7 +1075,7 @@ class TestValidateModelCapabilities:
 
         mock_console.print.assert_not_called()
 
-    @patch("deepagents_code.config.console")
+    @patch("deepagents_code.config._console_instance")
     def test_model_with_tool_calling_none_passes(self, mock_console: Mock) -> None:
         """Test that models with `tool_calling=None` (missing) pass."""
         model = Mock()
@@ -998,7 +1085,7 @@ class TestValidateModelCapabilities:
 
         mock_console.print.assert_not_called()
 
-    @patch("deepagents_code.config.console")
+    @patch("deepagents_code.config._console_instance")
     def test_model_with_limited_context_warns(self, mock_console: Mock) -> None:
         """Test that models with <8000 token context trigger a warning."""
         model = Mock()
@@ -1012,7 +1099,7 @@ class TestValidateModelCapabilities:
         assert "4,096" in call_args
         assert "small-context-model" in call_args
 
-    @patch("deepagents_code.config.console")
+    @patch("deepagents_code.config._console_instance")
     def test_model_with_adequate_context_passes(self, mock_console: Mock) -> None:
         """Confirm that models with >=8000 token context pass silently."""
         model = Mock()
@@ -1022,7 +1109,7 @@ class TestValidateModelCapabilities:
 
         mock_console.print.assert_not_called()
 
-    @patch("deepagents_code.config.console")
+    @patch("deepagents_code.config._console_instance")
     def test_model_without_max_input_tokens_passes(self, mock_console: Mock) -> None:
         """Test that models without `max_input_tokens` key pass silently."""
         model = Mock()
@@ -1032,7 +1119,7 @@ class TestValidateModelCapabilities:
 
         mock_console.print.assert_not_called()
 
-    @patch("deepagents_code.config.console")
+    @patch("deepagents_code.config._console_instance")
     def test_model_with_zero_max_input_tokens_passes(self, mock_console: Mock) -> None:
         """Test that models with `max_input_tokens=0` pass (falsy value check)."""
         model = Mock()
@@ -1043,7 +1130,7 @@ class TestValidateModelCapabilities:
         # Should pass because 0 is falsy, so the condition `if max_input_tokens` fails
         mock_console.print.assert_not_called()
 
-    @patch("deepagents_code.config.console")
+    @patch("deepagents_code.config._console_instance")
     def test_model_with_empty_profile_passes(self, mock_console: Mock) -> None:
         """Test that models with empty profile dict pass silently."""
         model = Mock()
@@ -1055,35 +1142,32 @@ class TestValidateModelCapabilities:
 
 
 class TestAgentsAliasDirectories:
-    """Tests for .agents directory alias methods."""
+    """Tests for `.agents` directory path helpers."""
 
     def test_user_agents_dir(self) -> None:
         """Test user_agents_dir returns ~/.agents."""
-        settings = Settings.from_environment()
         expected = Path.home() / ".agents"
-        assert settings.user_agents_dir == expected
+        assert user_agents_dir() == expected
 
     def test_get_user_agent_skills_dir(self) -> None:
         """Test get_user_agent_skills_dir returns ~/.agents/skills."""
-        settings = Settings.from_environment()
         expected = Path.home() / ".agents" / "skills"
-        assert settings.get_user_agent_skills_dir() == expected
+        assert get_user_agent_skills_dir() == expected
 
     def test_home_aliases_are_skipped_when_home_is_unresolvable(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """An absolute profile stays usable without optional home aliases."""
-        import deepagents_code.config as config_module
+        import deepagents_code._paths as paths_module
         from deepagents_code._paths import _capture_paths
 
         with patch.object(Path, "home", side_effect=RuntimeError("no home")):
             snapshot = _capture_paths(str(tmp_path / "profile"))
-        monkeypatch.setattr(config_module, "PATHS", snapshot)
-        settings = Settings.__new__(Settings)
+        monkeypatch.setattr(paths_module, "PATHS", snapshot)
 
-        assert settings.user_agents_dir is None
-        assert settings.get_user_agent_skills_dir() is None
-        assert settings.get_user_claude_skills_dir() is None
+        assert user_agents_dir() is None
+        assert get_user_agent_skills_dir() is None
+        assert get_user_claude_skills_dir() is None
 
     def test_get_project_agent_skills_dir_with_project(self, tmp_path: Path) -> None:
         """Test get_project_agent_skills_dir returns .agents/skills in project."""
@@ -1092,27 +1176,21 @@ class TestAgentsAliasDirectories:
         project_root.mkdir()
         (project_root / ".git").mkdir()
 
-        settings = Settings.from_environment(start_path=project_root)
         expected = project_root / ".agents" / "skills"
-        assert settings.get_project_agent_skills_dir() == expected
+        assert get_project_agent_skills_dir(project_root) == expected
 
-    def test_get_project_agent_skills_dir_without_project(self, tmp_path: Path) -> None:
+    def test_get_project_agent_skills_dir_without_project(self) -> None:
         """Test get_project_agent_skills_dir returns None when not in a project."""
-        # Create a directory without .git
-        no_project = tmp_path / "no-project"
-        no_project.mkdir()
-
-        settings = Settings.from_environment(start_path=no_project)
-        assert settings.get_project_agent_skills_dir() is None
+        assert get_project_agent_skills_dir(None) is None
 
 
 class TestClaudeSkillsDirs:
-    """Tests for .claude/skills/ directory methods."""
+    """Tests for `.claude/skills` path helpers."""
 
     def test_get_user_claude_skills_dir(self) -> None:
         """Test get_user_claude_skills_dir returns ~/.claude/skills."""
         expected = Path.home() / ".claude" / "skills"
-        assert Settings.get_user_claude_skills_dir() == expected
+        assert get_user_claude_skills_dir() == expected
 
     def test_get_project_claude_skills_dir_with_project(self, tmp_path: Path) -> None:
         """Test get_project_claude_skills_dir returns .claude/skills in project."""
@@ -1120,17 +1198,12 @@ class TestClaudeSkillsDirs:
         project_root.mkdir()
         (project_root / ".git").mkdir()
 
-        settings = Settings.from_environment(start_path=project_root)
         expected = project_root / ".claude" / "skills"
-        assert settings.get_project_claude_skills_dir() == expected
+        assert get_project_claude_skills_dir(project_root) == expected
 
-    def test_project_claude_skills_dir_without_project(self, tmp_path: Path) -> None:
+    def test_project_claude_skills_dir_without_project(self) -> None:
         """Test get_project_claude_skills_dir returns None outside a project."""
-        no_project = tmp_path / "no-project"
-        no_project.mkdir()
-
-        settings = Settings.from_environment(start_path=no_project)
-        assert settings.get_project_claude_skills_dir() is None
+        assert get_project_claude_skills_dir(None) is None
 
 
 class TestCreateModelAllowlist:
@@ -1631,11 +1704,11 @@ class TestCreateModelSplitCredentialWiring:
         assert ordered == ["warn", "apply"]
 
 
-class TestModelResultApplyToSettings:
-    """Tests for ModelResult.apply_to_settings propagation."""
+class TestModelResultApplyToRuntimeState:
+    """Tests for `ModelResult.apply_to_runtime_state` propagation."""
 
     def test_propagates_unsupported_modalities(self) -> None:
-        """Test that apply_to_settings writes unsupported_modalities to settings."""
+        """Test model results update all process-wide runtime metadata."""
         model_result = ModelResult(
             model=Mock(),
             model_name="deepseek-r1",
@@ -1643,21 +1716,24 @@ class TestModelResultApplyToSettings:
             context_limit=64000,
             unsupported_modalities=frozenset({"image", "audio"}),
         )
-        # `apply_to_settings` writes four fields to the process-global settings;
+        # The method writes four fields to process-global runtime state;
         # restore all of them or the values leak into every later test.
-        original_name = settings.model_name
-        original_provider = settings.model_provider
-        original_limit = settings.model_context_limit
-        original_modalities = settings.model_unsupported_modalities
+        original_name = runtime_state.model_name
+        original_provider = runtime_state.model_provider
+        original_limit = runtime_state.model_context_limit
+        original_modalities = runtime_state.model_unsupported_modalities
         try:
-            model_result.apply_to_settings()
+            model_result.apply_to_runtime_state()
             expected = frozenset({"image", "audio"})
-            assert settings.model_unsupported_modalities == expected
+            assert runtime_state.model_name == "deepseek-r1"
+            assert runtime_state.model_provider == "deepseek"
+            assert runtime_state.model_context_limit == 64000
+            assert runtime_state.model_unsupported_modalities == expected
         finally:
-            settings.model_name = original_name
-            settings.model_provider = original_provider
-            settings.model_context_limit = original_limit
-            settings.model_unsupported_modalities = original_modalities
+            runtime_state.model_name = original_name
+            runtime_state.model_provider = original_provider
+            runtime_state.model_context_limit = original_limit
+            runtime_state.model_unsupported_modalities = original_modalities
 
 
 class TestRetriesConfig:
@@ -1671,223 +1747,253 @@ class TestRetriesConfig:
         config_path.write_text("[models]\ndefault = 'openai:gpt-5.5'\n")
 
         with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            assert _read_config_toml_retries() is None
+            config = _read_retry_config()
+        assert config.max_retries is None
+        assert not config.providers
 
     def test_read_retries_returns_none_when_file_missing(self, tmp_path: Path) -> None:
         """Missing config file returns `None`."""
         config_path = tmp_path / "config.toml"
 
         with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            assert _read_config_toml_retries() is None
+            config = _read_retry_config()
+        assert config.max_retries is None
+        assert not config.providers
 
-    def test_read_retries_returns_none_when_unreadable(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_read_retries_returns_none_when_unreadable(self, tmp_path: Path) -> None:
         """Unreadable config returns `None` with a warning."""
         config_path = tmp_path / "config.toml"
 
         with (
             patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
             patch.object(Path, "open", side_effect=PermissionError("denied")),
-            caplog.at_level(logging.WARNING, logger="deepagents_code.config"),
         ):
-            assert _read_config_toml_retries() is None
+            config = _read_retry_config()
 
-        assert "Could not read retries config" in caplog.text
+        assert any("Could not read retries config" in text for text in config.warnings)
 
     def test_read_retries_allows_unknown_provider_with_param(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path
     ) -> None:
         """Unknown providers can opt into retries with an explicit param."""
         config_path = tmp_path / "config.toml"
         config_path.write_text("[retries.custom_provider]\nparam = 'max_retries'\n")
 
-        with (
-            patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
-            caplog.at_level(logging.WARNING, logger="deepagents_code.config"),
-        ):
-            assert _read_config_toml_retries() == {
-                "custom_provider": {"param": "max_retries"}
-            }
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            config = _read_retry_config()
 
-        assert "is not a known provider" not in caplog.text
+        assert config.providers["custom_provider"].param == "max_retries"
+        assert not any("unrecognized provider" in text for text in config.warnings)
 
     def test_read_retries_warns_unknown_provider_without_param(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self, tmp_path: Path
     ) -> None:
         """Unknown retry tables still warn when they cannot provide a kwarg."""
         config_path = tmp_path / "config.toml"
         config_path.write_text("[retries.custom_provider]\nmax_retries = 2\n")
 
-        with (
-            patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
-            caplog.at_level(logging.WARNING, logger="deepagents_code.config"),
-        ):
-            assert _read_config_toml_retries() == {
-                "custom_provider": {"max_retries": 2}
-            }
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            config = _read_retry_config()
 
-        assert "is not a known provider" in caplog.text
+        assert config.providers["custom_provider"].max_retries == 2
+        # Kept, not dropped: the diagnostic must not claim an override that
+        # never happens, since the table still applies if that provider is the
+        # one the langchain registry builds.
+        assert any("unrecognized provider" in text for text in config.warnings)
+        assert not any("Ignoring [retries." in text for text in config.warnings)
 
-    def test_resolve_retry_kwargs_global(self) -> None:
-        """Global retry config applies to supported providers."""
-        assert _resolve_retry_kwargs({"max_retries": 2}, "fireworks") == {
-            "max_retries": 2
+    def test_resolve_config_retry_count_provider_override_wins(self) -> None:
+        """Provider retry config beats the global model-node retry count."""
+        config = _parse_retry_config(
+            {"max_retries": 2, "fireworks": {"max_retries": 3}}
+        )
+        assert _resolve_config_retry_count(config, "fireworks") == 3
+
+    def test_resolve_config_retry_count_provider_only(self) -> None:
+        """Provider retry config works without a global count."""
+        assert (
+            _resolve_config_retry_count(
+                _parse_retry_config({"fireworks": {"max_retries": 3}}), "fireworks"
+            )
+            == 3
+        )
+
+    def test_provider_retry_disable_kwargs_uses_registered_param(self) -> None:
+        """Known providers have their SDK retry loop disabled."""
+        assert _provider_retry_disable_kwargs(
+            _parse_retry_config(None), "fireworks", {}
+        ) == {"max_retries": 0}
+
+    def test_provider_retry_disable_kwargs_uses_google_attempt_semantics(self) -> None:
+        """Google needs one total attempt because zero restores its default."""
+        assert _provider_retry_disable_kwargs(
+            _parse_retry_config(None), "google_genai", {}
+        ) == {"max_retries": 1}
+
+    def test_provider_retry_disable_kwargs_uses_configured_param(self) -> None:
+        """Custom providers can name the SDK retry constructor kwarg."""
+        config = _parse_retry_config({"custom_provider": {"param": "retries"}})
+        assert _provider_retry_disable_kwargs(config, "custom_provider", {}) == {
+            "retries": 0
+        }
+
+    def test_provider_retry_disable_kwargs_detects_model_param(self) -> None:
+        """An explicit conventional model param identifies custom SDK retries."""
+        assert _provider_retry_disable_kwargs(
+            _parse_retry_config(None), "custom_provider", {"max_retries": 9}
+        ) == {"max_retries": 0}
+
+    def test_configured_param_outranks_the_registry(self) -> None:
+        """An explicit `param` corrects the built-in registry, not the reverse.
+
+        Honoring the registry first would silently discard a directive the
+        config schema accepts and validates.
+        """
+        config = _parse_retry_config({"openai": {"param": "num_retries"}})
+        assert _provider_retry_disable_kwargs(config, "openai", {}) == {
+            "num_retries": 0
         }
 
     @pytest.mark.parametrize(
-        ("provider", "retry_param"),
-        [
-            ("anthropic", "max_retries"),
-            ("azure_openai", "max_retries"),
-            ("baseten", "max_retries"),
-            ("bedrock", "max_retries"),
-            ("deepseek", "max_retries"),
-            ("fireworks", "max_retries"),
-            ("google_anthropic_vertex", "max_retries"),
-            ("google_genai", "max_retries"),
-            ("google_vertexai", "max_retries"),
-            ("groq", "max_retries"),
-            ("litellm", "max_retries"),
-            ("mistralai", "max_retries"),
-            ("openai", "max_retries"),
-            ("openrouter", "max_retries"),
-            ("perplexity", "max_retries"),
-            ("together", "max_retries"),
-            ("xai", "max_retries"),
-        ],
+        "provider",
+        sorted(
+            name
+            for name, param in model_config.RETRY_PARAM_BY_PROVIDER.items()
+            if param is not None
+        ),
     )
-    def test_resolve_retry_kwargs_registered_providers(
-        self, provider: str, retry_param: str
+    def test_every_registered_provider_is_disabled(self, provider: str) -> None:
+        """Dropping a registry entry silently reactivates that provider's retries."""
+        param = model_config.RETRY_PARAM_BY_PROVIDER[provider]
+        expected = model_config.RETRY_DISABLE_VALUE_BY_PROVIDER.get(provider, 0)
+        config = _parse_retry_config(None)
+        assert _provider_retry_disable_kwargs(config, provider, {}) == {param: expected}
+
+    @pytest.mark.parametrize(
+        "provider",
+        sorted(
+            name
+            for name, param in model_config.RETRY_PARAM_BY_PROVIDER.items()
+            if param is None
+        ),
+    )
+    def test_provider_without_a_retry_kwarg_is_quiet(
+        self, provider: str, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Registered providers receive the retry kwarg their constructor expects."""
-        assert _resolve_retry_kwargs({"max_retries": 2}, provider) == {retry_param: 2}
+        """A `None` entry has no SDK retry loop, so there is nothing to warn about.
 
-    def test_resolve_retry_kwargs_provider_override_wins(self) -> None:
-        """Provider retry config beats the global value."""
-        section = {"max_retries": 2, "fireworks": {"max_retries": 3}}
-        assert _resolve_retry_kwargs(section, "fireworks") == {"max_retries": 3}
+        These providers used to hit the unidentifiable-provider warning, which
+        told the user to set `[retries.<provider>].param` -- a kwarg their
+        integration drops. The advice inverted the remediation it offered.
+        """
+        config_module._warned_unknown_retry_providers.discard(provider)
+        with caplog.at_level(logging.WARNING, logger="deepagents_code.config"):
+            config = _parse_retry_config(None)
+            assert _provider_retry_disable_kwargs(config, provider, {}) == {}
+        assert caplog.text == ""
 
-    def test_resolve_retry_kwargs_provider_only(self) -> None:
-        """Provider retry config works without a global value."""
-        assert _resolve_retry_kwargs(
-            {"fireworks": {"max_retries": 3}}, "fireworks"
-        ) == {"max_retries": 3}
+    def test_unidentifiable_provider_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An unknown provider's SDK retries multiply ours, so say so loudly."""
+        config_module._warned_unknown_retry_providers.discard("mystery")
+        with caplog.at_level(logging.WARNING, logger="deepagents_code.config"):
+            config = _parse_retry_config(None)
+            assert _provider_retry_disable_kwargs(config, "mystery", {}) == {}
 
-    def test_resolve_retry_kwargs_custom_provider_param(self) -> None:
-        """Custom providers can name the retry constructor kwarg."""
-        section = {
-            "max_retries": 2,
-            "custom_provider": {"param": "retries", "max_retries": 4},
-        }
-        assert _resolve_retry_kwargs(section, "custom_provider") == {"retries": 4}
+        assert "may multiply" in caplog.text
+        assert "[retries.mystery].param" in caplog.text
 
-    def test_resolve_retry_kwargs_custom_provider_param_uses_global(self) -> None:
-        """Custom provider param can use the global retry count."""
-        section = {"max_retries": 2, "custom_provider": {"param": "retries"}}
-        assert _resolve_retry_kwargs(section, "custom_provider") == {"retries": 2}
+    def test_unidentifiable_provider_warns_once_per_provider(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The warning is advice, not an event, so it must not repeat.
 
-    def test_resolve_retry_kwargs_param_overrides_registry(self) -> None:
-        """Known providers can override the registered retry kwarg name."""
-        section = {"max_retries": 2, "fireworks": {"param": "retries"}}
-        assert _resolve_retry_kwargs(section, "fireworks") == {"retries": 2}
+        `create_model` runs again for every subagent, rubric model, and runtime
+        `/model` switch. Repeating an unactionable warning on each one buries
+        the debug buffer that the same run relies on for real diagnostics.
+        """
+        config_module._warned_unknown_retry_providers.discard("enigma")
+        config = _parse_retry_config(None)
+        with caplog.at_level(logging.WARNING, logger="deepagents_code.config"):
+            for _ in range(3):
+                assert _provider_retry_disable_kwargs(config, "enigma", {}) == {}
+
+        assert len([r for r in caplog.records if "may multiply" in r.message]) == 1
+
+    def test_clobbering_an_explicit_value_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A user-supplied retry count is overridden, but never silently."""
+        with caplog.at_level(logging.WARNING, logger="deepagents_code.config"):
+            assert _provider_retry_disable_kwargs(
+                _parse_retry_config(None), "fireworks", {"max_retries": 3}
+            ) == {"max_retries": 0}
+
+        assert "Ignoring max_retries=3" in caplog.text
+        assert "--max-retries" in caplog.text
+
+    def test_no_warning_when_the_value_already_matches(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Nothing is being taken away, so stay quiet."""
+        with caplog.at_level(logging.WARNING, logger="deepagents_code.config"):
+            assert _provider_retry_disable_kwargs(
+                _parse_retry_config(None), "fireworks", {"max_retries": 0}
+            ) == {"max_retries": 0}
+
+        assert "Ignoring max_retries" not in caplog.text
 
     @pytest.mark.parametrize("value", [-1, 1.5, True, False, "3"])
-    def test_resolve_retry_kwargs_invalid_values_warn(
-        self, value: object, caplog: pytest.LogCaptureFixture
+    def test_resolve_config_retry_count_invalid_values_warn(
+        self, value: object
     ) -> None:
         """Invalid retry values are ignored with a warning."""
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.config"):
-            assert _resolve_retry_kwargs({"max_retries": value}, "fireworks") == {}
+        config = _parse_retry_config({"max_retries": value})
+        assert _resolve_config_retry_count(config, "fireworks") is None
 
-        assert "Ignoring [retries].max_retries" in caplog.text
-
-    def test_resolve_retry_kwargs_unknown_provider_warns(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Unsupported providers do not receive retry kwargs."""
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.config"):
-            assert _resolve_retry_kwargs({"max_retries": 2}, "custom_provider") == {}
-
-        assert (
-            "does not support a registered or configured retry parameter" in caplog.text
-        )
+        assert any("Ignoring [retries].max_retries" in text for text in config.warnings)
 
     @pytest.mark.parametrize("value", ["max-retries", "class", "", 2, True])
-    def test_resolve_retry_kwargs_invalid_param_warns(
-        self, value: object, caplog: pytest.LogCaptureFixture
+    def test_provider_retry_disable_kwargs_invalid_param_warns(
+        self, value: object
     ) -> None:
         """Invalid retry kwarg names are ignored with a warning."""
-        section = {"max_retries": 2, "custom_provider": {"param": value}}
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.config"):
-            assert _resolve_retry_kwargs(section, "custom_provider") == {}
+        config = _parse_retry_config({"custom_provider": {"param": value}})
+        assert _provider_retry_disable_kwargs(config, "custom_provider", {}) == {}
 
-        assert "Ignoring [retries.custom_provider].param" in caplog.text
-        assert (
-            "does not support a registered or configured retry parameter" in caplog.text
+        assert any(
+            "Ignoring [retries.custom_provider].param" in text
+            for text in config.warnings
         )
 
-    def test_resolve_retry_kwargs_unknown_keys_warn(
-        self, caplog: pytest.LogCaptureFixture
+    def test_resolve_config_retry_count_unknown_keys_warn(
+        self,
     ) -> None:
         """Unknown retry keys are ignored with warnings."""
-        section = {"max_retries": 2, "fireworks": {"other": 4}, "other": 5}
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.config"):
-            assert _resolve_retry_kwargs(section, "fireworks") == {"max_retries": 2}
+        config = _parse_retry_config(
+            {"max_retries": 2, "fireworks": {"other": 4}, "other": 5}
+        )
+        assert _resolve_config_retry_count(config, "fireworks") == 2
 
-        assert "Ignoring [retries].other" in caplog.text
-        assert "Ignoring [retries.fireworks].other" in caplog.text
-
-    def test_get_provider_kwargs_includes_retries(self, tmp_path: Path) -> None:
-        """Provider kwargs include retries from `[retries]`."""
-        config_path = tmp_path / "config.toml"
-        config_path.write_text("[retries.fireworks]\nmax_retries = 3\n")
-
-        clear_caches()
-        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            assert _get_provider_kwargs("fireworks")["max_retries"] == 3
-
-    def test_get_provider_kwargs_params_beat_retries(self, tmp_path: Path) -> None:
-        """Provider params keep precedence over `[retries]`."""
-        config_path = tmp_path / "config.toml"
-        config_path.write_text(
-            """
-[models.providers.fireworks.params]
-max_retries = 5
-
-[retries.fireworks]
-max_retries = 3
-"""
+        assert any("Ignoring [retries].other" in text for text in config.warnings)
+        assert any(
+            "Ignoring [retries.fireworks].other" in text for text in config.warnings
         )
 
-        clear_caches()
-        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            assert _get_provider_kwargs("fireworks")["max_retries"] == 5
-
-    def test_get_provider_kwargs_includes_global_retries(self, tmp_path: Path) -> None:
-        """A global `[retries]` default reaches provider kwargs via setdefault."""
-        config_path = tmp_path / "config.toml"
-        config_path.write_text("[retries]\nmax_retries = 2\n")
-
-        clear_caches()
-        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            assert _get_provider_kwargs("fireworks")["max_retries"] == 2
-
-    def test_resolve_retry_kwargs_zero_is_valid(self) -> None:
+    def test_resolve_config_retry_count_zero_is_valid(self) -> None:
         """`max_retries = 0` is a valid count (disables retries)."""
-        assert _resolve_retry_kwargs({"max_retries": 0}, "fireworks") == {
-            "max_retries": 0
-        }
+        config = _parse_retry_config({"max_retries": 0})
+        assert _resolve_config_retry_count(config, "fireworks") == 0
 
-    def test_resolve_retry_kwargs_provider_scalar_falls_back_to_global(
-        self, caplog: pytest.LogCaptureFixture
+    def test_resolve_config_retry_count_provider_scalar_falls_back_to_global(
+        self,
     ) -> None:
         """A non-table provider value warns and falls back to the global count."""
-        section = {"max_retries": 2, "fireworks": 5}
-        with caplog.at_level(logging.WARNING, logger="deepagents_code.config"):
-            assert _resolve_retry_kwargs(section, "fireworks") == {"max_retries": 2}
+        config = _parse_retry_config({"max_retries": 2, "fireworks": 5})
+        assert _resolve_config_retry_count(config, "fireworks") == 2
 
-        assert "expected table" in caplog.text
+        assert any("[retries].fireworks=5" in text for text in config.warnings)
 
     def test_read_retries_returns_none_when_not_table(self, tmp_path: Path) -> None:
         """A scalar `retries` value (not a table) yields `None`."""
@@ -1895,26 +2001,21 @@ max_retries = 3
         config_path.write_text("retries = 5\n")
 
         with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            assert _read_config_toml_retries() is None
+            config = _read_retry_config()
+        assert config.max_retries is None
+        assert not config.providers
 
-    def test_read_retries_returns_none_on_malformed_toml(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_read_retries_returns_none_on_malformed_toml(self, tmp_path: Path) -> None:
         """Malformed TOML returns `None` with a warning."""
         config_path = tmp_path / "config.toml"
         config_path.write_text("[retries\nmax_retries = 1\n")
 
-        with (
-            patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
-            caplog.at_level(logging.WARNING, logger="deepagents_code.config"),
-        ):
-            assert _read_config_toml_retries() is None
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            config = _read_retry_config()
 
-        assert "Could not read retries config" in caplog.text
+        assert any("Could not read retries config" in text for text in config.warnings)
 
-    def test_read_retries_warns_unknown_provider_table(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_read_retries_warns_unknown_provider_table(self, tmp_path: Path) -> None:
         """A mistyped provider sub-table warns; a valid one does not."""
         config_path = tmp_path / "config.toml"
         config_path.write_text(
@@ -1922,77 +2023,61 @@ max_retries = 3
             "[retries.fireorks]\nmax_retries = 2\n"
         )
 
-        with (
-            patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
-            caplog.at_level(logging.WARNING, logger="deepagents_code.config"),
-        ):
-            section = _read_config_toml_retries()
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            config = _read_retry_config()
 
-        assert section is not None
-        assert "'fireorks' is not a known provider" in caplog.text
+        assert "fireworks" in config.providers
+        assert any(
+            "[retries.fireorks]" in text and "unrecognized provider" in text
+            for text in config.warnings
+        )
         # The correctly spelled provider table must not be flagged.
-        assert "[retries.fireworks]" not in caplog.text
+        assert not any("[retries.fireworks]" in text for text in config.warnings)
 
-    def test_read_retries_allows_bedrock_table(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_read_retries_allows_bedrock_table(self, tmp_path: Path) -> None:
         """Retry-capable providers without API-key env entries are still known."""
         config_path = tmp_path / "config.toml"
         config_path.write_text("[retries.bedrock]\nmax_retries = 3\n")
 
-        with (
-            patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
-            caplog.at_level(logging.WARNING, logger="deepagents_code.config"),
-        ):
-            section = _read_config_toml_retries()
-
-        assert section == {"bedrock": {"max_retries": 3}}
-        assert "is not a known provider" not in caplog.text
-
-
-class TestResolveRetryParamName:
-    """`_resolve_retry_param_name` picks the constructor kwarg for a provider."""
-
-    def test_registered_provider_returns_mapped_name(self) -> None:
-        """A registered provider resolves to its mapped kwarg."""
-        assert _resolve_retry_param_name("openai") == "max_retries"
-
-    def test_unknown_provider_defaults_to_max_retries(self) -> None:
-        """An unregistered provider falls back to the universal `max_retries`."""
-        assert _resolve_retry_param_name("some_unregistered_provider") == "max_retries"
-
-    def test_config_param_override_wins_for_custom_provider(
-        self, tmp_path: Path
-    ) -> None:
-        """`[retries.<provider>].param` names the kwarg for a custom provider."""
-        config_path = tmp_path / "config.toml"
-        config_path.write_text('[retries.custom]\nparam = "num_retries"\n')
         with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            assert _resolve_retry_param_name("custom") == "num_retries"
+            config = _read_retry_config()
 
-    def test_config_param_override_wins_for_registered_provider(
-        self, tmp_path: Path
-    ) -> None:
-        """A configured `param` overrides even a registered provider's mapping."""
-        config_path = tmp_path / "config.toml"
-        config_path.write_text('[retries.openai]\nparam = "request_retries"\n')
-        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            assert _resolve_retry_param_name("openai") == "request_retries"
+        assert config.providers["bedrock"].max_retries == 3
+        assert not any("unrecognized provider" in text for text in config.warnings)
 
-    def test_invalid_config_param_falls_back_to_registry(self, tmp_path: Path) -> None:
-        """An invalid `param` value is ignored, falling back to the registry."""
+
+class TestResolveModelRetries:
+    """The retry resolver resolves the model-node retry budget."""
+
+    @staticmethod
+    def _resolve_retries(provider: str, *, cli_max_retries: int | None = None) -> int:
+        """Resolve a budget the way `create_model` does.
+
+        Returns:
+            The effective retry count.
+        """
+        return _resolve_model_retries_from_section(
+            _read_retry_config(), provider, cli_max_retries
+        )
+
+    def test_uses_default_when_config_is_absent(self, tmp_path: Path) -> None:
+        """The default retry budget applies without config or a CLI flag."""
         config_path = tmp_path / "config.toml"
-        config_path.write_text('[retries.openai]\nparam = "not an identifier"\n')
         with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            assert _resolve_retry_param_name("openai") == "max_retries"
+            assert self._resolve_retries("openai") == 5
+
+    def test_cli_value_beats_provider_and_global_config(self, tmp_path: Path) -> None:
+        """The CLI retry count has highest precedence."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(
+            "[retries]\nmax_retries = 2\n[retries.openai]\nmax_retries = 3\n"
+        )
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            assert self._resolve_retries("openai", cli_max_retries=4) == 4
 
 
 class TestCreateModelMaxRetries:
-    """`create_model` folds the `--max-retries` sentinel into the constructor.
-
-    The flag value rides `extra_kwargs` under `CLI_MAX_RETRIES_KEY`; these tests
-    mock `init_chat_model` and assert on the kwargs forwarded to it.
-    """
+    """`create_model` keeps CLI retries separate from provider kwargs."""
 
     @pytest.fixture(autouse=True)
     def _bypass_credential_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2001,60 +2086,91 @@ class TestCreateModelMaxRetries:
         )
 
     @patch("langchain.chat_models.init_chat_model")
-    def test_sentinel_folds_to_resolved_param(self, mock_init: Mock) -> None:
-        """A registered provider receives the value under `max_retries`."""
+    def test_cli_value_sets_model_retry_budget(self, mock_init: Mock) -> None:
+        """The CLI value becomes the model-node budget, not an SDK kwarg."""
         mock_init.return_value = Mock()
-        create_model(
-            "anthropic:claude-sonnet-4-5", extra_kwargs={CLI_MAX_RETRIES_KEY: 4}
-        )
+        result = create_model("anthropic:claude-sonnet-4-5", cli_max_retries=4)
         kwargs = mock_init.call_args.kwargs
-        assert kwargs["max_retries"] == 4
-        # The internal carrier must never reach the constructor.
-        assert CLI_MAX_RETRIES_KEY not in kwargs
+        assert result.model_retries == 4
+        assert kwargs["max_retries"] == 0
 
     @patch("langchain.chat_models.init_chat_model")
-    def test_sentinel_beats_model_params_max_retries(self, mock_init: Mock) -> None:
-        """The CLI flag outranks a `max_retries` supplied via `--model-params`."""
+    def test_budget_is_stamped_on_the_model_for_the_middleware(
+        self, mock_init: Mock
+    ) -> None:
+        """The middleware reads the model attribute, not the `ModelResult` field.
+
+        `CodeModelRetryMiddleware._request_max_retries` looks up
+        `MODEL_RETRIES_ATTR` on `request.model`, so asserting only on
+        `result.model_retries` would leave the real handoff unverified.
+        """
         mock_init.return_value = Mock()
-        create_model(
-            "anthropic:claude-sonnet-4-5",
-            extra_kwargs={CLI_MAX_RETRIES_KEY: 4, "max_retries": 1},
-        )
-        assert mock_init.call_args.kwargs["max_retries"] == 4
+        result = create_model("anthropic:claude-sonnet-4-5", cli_max_retries=4)
+        assert getattr(result.model, MODEL_RETRIES_ATTR) == 4
 
     @patch("langchain.chat_models.init_chat_model")
-    def test_sentinel_folds_to_configured_param(
+    def test_slotted_model_does_not_break_construction(self, mock_init: Mock) -> None:
+        """A model rejecting attribute writes still yields a usable result.
+
+        Retry metadata is advisory; the middleware falls back to its startup
+        budget. A custom provider class using `__slots__` must not turn that
+        into a failed model construction.
+        """
+
+        class _Slotted:
+            __slots__ = ()
+
+        mock_init.return_value = _Slotted()
+        result = create_model("anthropic:claude-sonnet-4-5", cli_max_retries=4)
+        assert result.model_retries == 4
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_sdk_retries_are_disabled_despite_model_params(
+        self, mock_init: Mock
+    ) -> None:
+        """Provider retries stay disabled even when model params set a count."""
+        mock_init.return_value = Mock()
+        result = create_model(
+            "anthropic:claude-sonnet-4-5",
+            extra_kwargs={"max_retries": 1},
+            cli_max_retries=4,
+        )
+        assert result.model_retries == 4
+        assert mock_init.call_args.kwargs["max_retries"] == 0
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_configured_param_disables_custom_provider_sdk_retries(
         self, mock_init: Mock, tmp_path: Path
     ) -> None:
-        """A `[retries.<provider>].param` override redirects the folded kwarg."""
+        """A `[retries.<provider>].param` targets a custom provider SDK kwarg."""
         config_path = tmp_path / "config.toml"
-        config_path.write_text('[retries.anthropic]\nparam = "request_retries"\n')
+        config_path.write_text('[retries.custom]\nparam = "request_retries"\n')
         mock_init.return_value = Mock()
         with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            create_model(
-                "anthropic:claude-sonnet-4-5",
-                extra_kwargs={CLI_MAX_RETRIES_KEY: 4},
-            )
+            result = create_model("custom:model", cli_max_retries=4)
         kwargs = mock_init.call_args.kwargs
-        assert kwargs["request_retries"] == 4
-        assert CLI_MAX_RETRIES_KEY not in kwargs
+        assert result.model_retries == 4
+        assert kwargs["request_retries"] == 0
 
     @patch("langchain.chat_models.init_chat_model")
-    def test_zero_is_forwarded(self, mock_init: Mock) -> None:
-        """`--max-retries 0` (disable retries) folds through, not dropped."""
+    def test_zero_disables_model_node_retries(self, mock_init: Mock) -> None:
+        """`--max-retries 0` disables model-node retries while SDK retries stay off."""
         mock_init.return_value = Mock()
-        create_model(
-            "anthropic:claude-sonnet-4-5", extra_kwargs={CLI_MAX_RETRIES_KEY: 0}
-        )
+        result = create_model("anthropic:claude-sonnet-4-5", cli_max_retries=0)
+        assert result.model_retries == 0
         assert mock_init.call_args.kwargs["max_retries"] == 0
 
     @patch("langchain.chat_models.init_chat_model")
     def test_caller_extra_kwargs_not_mutated(self, mock_init: Mock) -> None:
-        """The caller's dict keeps the sentinel for reuse (runtime model switch)."""
+        """Separating CLI retries leaves caller model kwargs untouched."""
         mock_init.return_value = Mock()
-        extra = {CLI_MAX_RETRIES_KEY: 4}
-        create_model("anthropic:claude-sonnet-4-5", extra_kwargs=extra)
-        assert extra == {CLI_MAX_RETRIES_KEY: 4}
+        extra = {"temperature": 0.2}
+        create_model(
+            "anthropic:claude-sonnet-4-5",
+            extra_kwargs=extra,
+            cli_max_retries=4,
+        )
+        assert extra == {"temperature": 0.2}
 
 
 class TestCreateModelProfileOverrides:
@@ -2474,8 +2590,8 @@ class TestGetLangsmithProjectName:
         with patch.dict("os.environ", env, clear=True):
             assert get_langsmith_project_name() is None
 
-    def test_returns_project_from_settings(self) -> None:
-        """Should prefer settings.deepagents_langchain_project."""
+    def test_returns_project_from_credentials(self) -> None:
+        """Should prefer `credentials.deepagents_langchain_project`."""
         env = {
             "LANGSMITH_API_KEY": "lsv2_test",
             "LANGSMITH_TRACING": "true",
@@ -2483,10 +2599,10 @@ class TestGetLangsmithProjectName:
         }
         with (
             patch.dict("os.environ", env, clear=False),
-            patch("deepagents_code.config.settings") as mock_settings,
+            patch("deepagents_code.config._credentials_instance") as mock_credentials,
         ):
-            mock_settings.deepagents_langchain_project = "settings-project"
-            assert get_langsmith_project_name() == "settings-project"
+            mock_credentials.deepagents_langchain_project = "credentials-project"
+            assert get_langsmith_project_name() == "credentials-project"
 
     def test_falls_back_to_env_project(self) -> None:
         """Should fall back to LANGSMITH_PROJECT env var."""
@@ -2497,9 +2613,9 @@ class TestGetLangsmithProjectName:
         }
         with (
             patch.dict("os.environ", env, clear=False),
-            patch("deepagents_code.config.settings") as mock_settings,
+            patch("deepagents_code.config._credentials_instance") as mock_credentials,
         ):
-            mock_settings.deepagents_langchain_project = None
+            mock_credentials.deepagents_langchain_project = None
             assert get_langsmith_project_name() == "env-project"
 
     def test_falls_back_to_default(self) -> None:
@@ -2512,9 +2628,9 @@ class TestGetLangsmithProjectName:
         }
         with (
             patch.dict("os.environ", env, clear=False),
-            patch("deepagents_code.config.settings") as mock_settings,
+            patch("deepagents_code.config._credentials_instance") as mock_credentials,
         ):
-            mock_settings.deepagents_langchain_project = None
+            mock_credentials.deepagents_langchain_project = None
             assert get_langsmith_project_name() == LANGSMITH_PROJECT_DEFAULT
 
     def test_accepts_langchain_api_key(self) -> None:
@@ -2528,9 +2644,9 @@ class TestGetLangsmithProjectName:
         }
         with (
             patch.dict("os.environ", env, clear=False),
-            patch("deepagents_code.config.settings") as mock_settings,
+            patch("deepagents_code.config._credentials_instance") as mock_credentials,
         ):
-            mock_settings.deepagents_langchain_project = None
+            mock_credentials.deepagents_langchain_project = None
             assert get_langsmith_project_name() == LANGSMITH_PROJECT_DEFAULT
 
     def test_agrees_with_config_manifest_resolution(self) -> None:
@@ -2571,7 +2687,7 @@ class TestGetLangsmithProjectName:
                 .value
             )
 
-        # Bare `LANGSMITH_PROJECT` set, no prefixed override, no settings value.
+        # Bare `LANGSMITH_PROJECT` set, no prefixed override, no credential value.
         bare_env = {
             "LANGSMITH_API_KEY": "lsv2_test",
             "LANGSMITH_TRACING": "true",
@@ -2580,9 +2696,9 @@ class TestGetLangsmithProjectName:
         }
         with (
             patch.dict("os.environ", bare_env, clear=False),
-            patch("deepagents_code.config.settings") as mock_settings,
+            patch("deepagents_code.config._credentials_instance") as mock_credentials,
         ):
-            mock_settings.deepagents_langchain_project = None
+            mock_credentials.deepagents_langchain_project = None
             manifest_value = resolve()
             assert get_langsmith_project_name() == manifest_value == "parity-bare"
 
@@ -2595,9 +2711,9 @@ class TestGetLangsmithProjectName:
         }
         with (
             patch.dict("os.environ", default_env, clear=False),
-            patch("deepagents_code.config.settings") as mock_settings,
+            patch("deepagents_code.config._credentials_instance") as mock_credentials,
         ):
-            mock_settings.deepagents_langchain_project = None
+            mock_credentials.deepagents_langchain_project = None
             manifest_value = resolve()
             assert (
                 get_langsmith_project_name()
@@ -5972,8 +6088,10 @@ max_tokens = 1024
 
         monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
         monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-east5")
-        runtime_settings = Settings.from_environment()
-        monkeypatch.setattr(config_module, "_get_settings", lambda: runtime_settings)
+        runtime_credentials = Credentials.from_environment()
+        monkeypatch.setattr(
+            config_module, "_get_credentials", lambda: runtime_credentials
+        )
         sync_client = Mock()
         async_client = Mock()
         monkeypatch.setattr(anthropic, "AnthropicVertex", sync_client)
@@ -5996,10 +6114,13 @@ max_tokens = 1024
     ) -> None:
         """Explicit model params outrank Google Cloud environment defaults."""
         mock_init_chat_model.return_value = _make_init_chat_model_mock()
-        with (
-            patch.object(settings, "google_cloud_project", "env-project"),
-            patch.object(settings, "google_cloud_location", "us-east5"),
-        ):
+        owner = config_module._get_credentials()
+        replacement = replace(
+            owner.active,
+            google_cloud_project="env-project",
+            google_cloud_location="us-east5",
+        )
+        with patch.object(owner, "_active", replacement):
             create_model(
                 "google_anthropic_vertex:claude-sonnet-4-6",
                 extra_kwargs={"project": "param-project", "location": "europe-west1"},
@@ -6010,9 +6131,14 @@ max_tokens = 1024
 
     def test_google_anthropic_vertex_requires_location(self) -> None:
         """Missing Claude-on-Vertex location produces an actionable error."""
+        owner = config_module._get_credentials()
+        replacement = replace(
+            owner.active,
+            google_cloud_project="test-project",
+            google_cloud_location=None,
+        )
         with (
-            patch.object(settings, "google_cloud_project", "test-project"),
-            patch.object(settings, "google_cloud_location", None),
+            patch.object(owner, "_active", replacement),
             pytest.raises(
                 ModelConfigError,
                 match=r"GOOGLE_CLOUD_LOCATION.*DEEPAGENTS_CODE_GOOGLE_CLOUD_LOCATION",
@@ -6070,11 +6196,11 @@ class TestCreateModelEdgeCaseParsing:
         mock_model.profile = None
         mock_init_chat_model.return_value = mock_model
 
-        settings.anthropic_api_key = "test"
+        credentials.anthropic_api_key = "test"
         try:
             result = create_model(":claude-opus-4-6")
         finally:
-            settings.anthropic_api_key = None
+            credentials.anthropic_api_key = None
 
         # Should have detected 'anthropic' provider and used 'claude-opus-4-6'
         assert result.model_name == "claude-opus-4-6"
@@ -6492,67 +6618,77 @@ class TestDetectProvider:
         """detect_provider returns the correct provider for known patterns."""
         # Ensure both Anthropic and Google credentials are "available" so the
         # default paths are taken (not the Vertex AI fallbacks).
-        settings.anthropic_api_key = "test"
-        settings.google_api_key = "test"
+        credentials.anthropic_api_key = "test"
+        credentials.google_api_key = "test"
         try:
             assert detect_provider(model_name) == expected
         finally:
-            settings.anthropic_api_key = None
-            settings.google_api_key = None
+            credentials.anthropic_api_key = None
+            credentials.google_api_key = None
 
     def test_claude_falls_back_to_vertex_when_no_anthropic(self) -> None:
         """Claude models route to Anthropic Vertex when only Vertex is configured."""
-        settings.anthropic_api_key = None
-        settings.google_cloud_project = "my-project"
-        settings.google_api_key = None
+        credentials.anthropic_api_key = None
+        credentials.google_cloud_project = "my-project"
+        credentials.google_api_key = None
         try:
             assert detect_provider("claude-sonnet-4-5") == "google_anthropic_vertex"
         finally:
-            settings.google_cloud_project = None
+            credentials.google_cloud_project = None
 
     def test_gemini_falls_back_to_vertex_when_no_google(self) -> None:
         """Gemini models route to google_vertexai when only Vertex AI is configured."""
-        settings.google_api_key = None
-        settings.google_cloud_project = "my-project"
+        credentials.google_api_key = None
+        credentials.google_cloud_project = "my-project"
         try:
             assert detect_provider("gemini-3-pro") == "google_vertexai"
         finally:
-            settings.google_cloud_project = None
+            credentials.google_cloud_project = None
 
     def test_gemini_prefers_google_genai_when_both_available(self) -> None:
         """Gemini prefers google_genai when both Google and Vertex AI are configured."""
-        settings.google_api_key = "test"
-        settings.google_cloud_project = "my-project"
+        credentials.google_api_key = "test"
+        credentials.google_cloud_project = "my-project"
         try:
             # has_vertex_ai is False when google_api_key is set, so this
             # tests the google_genai path which is preferred.
             assert detect_provider("gemini-3-pro") == "google_genai"
         finally:
-            settings.google_api_key = None
-            settings.google_cloud_project = None
+            credentials.google_api_key = None
+            credentials.google_cloud_project = None
 
     def test_case_insensitive(self) -> None:
         """detect_provider is case-insensitive."""
-        settings.anthropic_api_key = "test"
+        credentials.anthropic_api_key = "test"
         try:
             assert detect_provider("Claude-Sonnet-4-5") == "anthropic"
             assert detect_provider("gpt-5.5") == "openai"
         finally:
-            settings.anthropic_api_key = None
+            credentials.anthropic_api_key = None
 
 
-class TestLazyModuleAttributes:
-    """Tests for lazy `__getattr__` resolution of `settings` and `console`."""
+class TestLazySingletons:
+    """Tests for lazy process-wide state and console resolution."""
 
-    def test_getattr_returns_settings(self) -> None:
-        """Module __getattr__ resolves 'settings' to a Settings instance."""
-        from deepagents_code.config import _get_settings
+    def test_settings_surface_is_removed(self) -> None:
+        """The dissolved `Settings` class and module hook stay absent."""
+        import deepagents_code.config as config_mod
 
-        result = _get_settings()
-        assert isinstance(result, Settings)
+        assert "Settings" not in config_mod.__dict__
+        assert "settings" not in config_mod.__dict__
+        assert "__getattr__" not in config_mod.__dict__
+
+    def test_getattr_returns_credentials(self) -> None:
+        """The credentials accessor returns the typed singleton."""
+        from deepagents_code.config import _get_credentials
+
+        result = _get_credentials()
+        assert isinstance(result, Credentials)
+        assert result is _get_credentials()
+        assert result.active is result.active
 
     def test_getattr_returns_console(self) -> None:
-        """Module __getattr__ resolves 'console' to a Console instance."""
+        """The console accessor returns a Console instance."""
         from rich.console import Console
 
         from deepagents_code.config import _get_console
@@ -6561,7 +6697,7 @@ class TestLazyModuleAttributes:
         assert isinstance(result, Console)
 
     def test_getattr_raises_for_unknown(self) -> None:
-        """Module __getattr__ raises AttributeError for unknown names."""
+        """Unknown module attributes raise `AttributeError`."""
         import deepagents_code.config as config_mod
 
         with pytest.raises(AttributeError, match="no attribute"):
@@ -6571,10 +6707,12 @@ class TestLazyModuleAttributes:
         """_ensure_bootstrap is a no-op on second call."""
         from deepagents_code.config import _ensure_bootstrap
 
-        # First call already ran (settings was imported above).
+        # First call already ran (credentials were used above).
         # Calling again should be a harmless no-op.
         _ensure_bootstrap()
-        assert isinstance(settings, Settings)
+        from deepagents_code.config import _get_credentials
+
+        assert isinstance(_get_credentials(), Credentials)
 
     def test_ensure_bootstrap_marks_done_on_failure(self) -> None:
         """_ensure_bootstrap sets flag even when the try body raises."""
@@ -6596,12 +6734,12 @@ class TestLazyModuleAttributes:
         finally:
             config_mod._bootstrap_state.done = original
 
-    def test_get_settings_returns_same_instance(self) -> None:
-        """_get_settings caches in globals — two calls return the same object."""
-        from deepagents_code.config import _get_settings
+    def test_get_credentials_returns_same_instance(self) -> None:
+        """The credentials accessor returns one process-wide object."""
+        from deepagents_code.config import _get_credentials
 
-        a = _get_settings()
-        b = _get_settings()
+        a = _get_credentials()
+        b = _get_credentials()
         assert a is b
 
     def test_ensure_bootstrap_langsmith_override(
@@ -7500,18 +7638,28 @@ class TestDetectModePrefix:
 class TestInterpreterSettings:
     """Tests for `[interpreter]` config.toml loading and validation."""
 
+    @staticmethod
+    def _resolve() -> tuple[bool, InterpreterConfig]:
+        from deepagents_code.config_manifest import get_option
+        from deepagents_code.configuration.resolver import get_config_resolver
+
+        option = get_option("interpreter.enable_interpreter")
+        assert option is not None
+        enabled = bool(get_config_resolver().get(option).value)
+        return enabled, InterpreterConfig.from_resolver()
+
     def test_defaults_when_config_absent(self, tmp_path: Path) -> None:
         config_path = tmp_path / "config.toml"  # does not exist
         with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            settings_obj = Settings.from_environment(start_path=tmp_path)
+            enabled, interpreter = self._resolve()
 
-        assert settings_obj.enable_interpreter is True
-        assert settings_obj.interpreter_timeout_seconds == pytest.approx(5.0)
-        assert settings_obj.interpreter_memory_limit_mb == 64
-        assert settings_obj.interpreter_max_ptc_calls == 256
-        assert settings_obj.interpreter_max_result_chars == 4000
-        assert settings_obj.interpreter_ptc == "safe"
-        assert settings_obj.interpreter_ptc_acknowledge_unsafe is False
+        assert enabled is True
+        assert interpreter.timeout_seconds == pytest.approx(5.0)
+        assert interpreter.memory_limit_mb == 64
+        assert interpreter.max_ptc_calls == 256
+        assert interpreter.max_result_chars == 4000
+        assert interpreter.ptc == "safe"
+        assert interpreter.ptc_acknowledge_unsafe is False
 
     def test_round_trip_through_toml(self, tmp_path: Path) -> None:
         config_path = tmp_path / "config.toml"
@@ -7528,15 +7676,15 @@ ptc_acknowledge_unsafe = true
 """
         )
         with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            settings_obj = Settings.from_environment(start_path=tmp_path)
+            enabled, interpreter = self._resolve()
 
-        assert settings_obj.enable_interpreter is True
-        assert settings_obj.interpreter_timeout_seconds == pytest.approx(12.5)
-        assert settings_obj.interpreter_memory_limit_mb == 128
-        assert settings_obj.interpreter_max_ptc_calls == 64
-        assert settings_obj.interpreter_max_result_chars == 8000
-        assert settings_obj.interpreter_ptc == "safe"
-        assert settings_obj.interpreter_ptc_acknowledge_unsafe is True
+        assert enabled is True
+        assert interpreter.timeout_seconds == pytest.approx(12.5)
+        assert interpreter.memory_limit_mb == 128
+        assert interpreter.max_ptc_calls == 64
+        assert interpreter.max_result_chars == 8000
+        assert interpreter.ptc == "safe"
+        assert interpreter.ptc_acknowledge_unsafe is True
 
     def test_ptc_explicit_list_round_trip(self, tmp_path: Path) -> None:
         config_path = tmp_path / "config.toml"
@@ -7547,9 +7695,9 @@ ptc = ["grep", "read_file"]
 """
         )
         with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            settings_obj = Settings.from_environment(start_path=tmp_path)
+            _, interpreter = self._resolve()
 
-        assert settings_obj.interpreter_ptc == ["grep", "read_file"]
+        assert interpreter.ptc == ["grep", "read_file"]
 
     def test_invalid_ptc_list_entry_falls_back(self, tmp_path: Path) -> None:
         config_path = tmp_path / "config.toml"
@@ -7560,9 +7708,9 @@ ptc = [""]
 """
         )
         with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            settings_obj = Settings.from_environment(start_path=tmp_path)
+            _, interpreter = self._resolve()
 
-        assert settings_obj.interpreter_ptc == "safe"
+        assert interpreter.ptc == "safe"
 
     def test_ptc_list_with_safe_preset_round_trip(self, tmp_path: Path) -> None:
         """`"safe"` is preserved as a list entry until agent-build expansion."""
@@ -7574,9 +7722,9 @@ ptc = ["safe", "task"]
 """
         )
         with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            settings_obj = Settings.from_environment(start_path=tmp_path)
+            _, interpreter = self._resolve()
 
-        assert settings_obj.interpreter_ptc == ["safe", "task"]
+        assert interpreter.ptc == ["safe", "task"]
 
     def test_ptc_list_with_all_falls_back(self, tmp_path: Path) -> None:
         """`"all"` inside a list is rejected, falling back to the default."""
@@ -7588,9 +7736,9 @@ ptc = ["all", "task"]
 """
         )
         with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
-            settings_obj = Settings.from_environment(start_path=tmp_path)
+            _, interpreter = self._resolve()
 
-        assert settings_obj.interpreter_ptc == "safe"
+        assert interpreter.ptc == "safe"
 
 
 class TestCreateModelCodex:
@@ -7844,6 +7992,90 @@ class TestResolveGoalAutoAcceptCriteria:
         )
 
 
+class TestCollectRetryConfigWarnings:
+    """Retry config problems must reach the user, not just the debug buffer."""
+
+    @staticmethod
+    def _warnings(tmp_path: Path, toml: str) -> list[str]:
+        from deepagents_code.config import collect_retry_config_startup
+
+        config_path = tmp_path / "config.toml"
+        config_path.write_text(toml)
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            warnings, _ = collect_retry_config_startup()
+        return warnings
+
+    def test_clean_config_reports_nothing(self, tmp_path: Path) -> None:
+        """A valid budget must not produce noise on every launch."""
+        assert self._warnings(tmp_path, "[retries]\nmax_retries = 3\n") == []
+
+    def test_non_integer_budget_is_reported(self, tmp_path: Path) -> None:
+        """`max_retries = "five"` silently ran with the default before."""
+        warnings = self._warnings(tmp_path, '[retries]\nmax_retries = "five"\n')
+        assert any("[retries].max_retries" in text for text in warnings)
+
+    def test_bad_provider_param_is_reported(self, tmp_path: Path) -> None:
+        """A `param` that is not an identifier cannot disable SDK retries."""
+        warnings = self._warnings(
+            tmp_path, '[retries.openai]\nparam = "not an identifier"\n'
+        )
+        assert any("[retries.openai].param" in text for text in warnings)
+
+    def test_unknown_global_key_is_reported(self, tmp_path: Path) -> None:
+        """A misspelled global retry key reaches startup diagnostics."""
+        warnings = self._warnings(tmp_path, "[retries]\nmax_retry = 3\n")
+        assert any("[retries].max_retry=3" in text for text in warnings)
+
+    def test_unknown_provider_key_is_reported(self, tmp_path: Path) -> None:
+        """A misspelled provider retry key reaches startup diagnostics."""
+        warnings = self._warnings(tmp_path, "[retries.openai]\nmax_retry = 3\n")
+        assert any("[retries.openai].max_retry=3" in text for text in warnings)
+
+    def test_custom_provider_param_is_returned_for_startup(
+        self, tmp_path: Path
+    ) -> None:
+        """Startup can identify custom retry kwargs that model params override."""
+        from deepagents_code.config import collect_retry_config_startup
+
+        config_path = tmp_path / "config.toml"
+        config_path.write_text('[retries.foo]\nparam = "retry_attempts"\n')
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            warnings, param_names = collect_retry_config_startup("foo")
+
+        assert warnings == []
+        assert param_names == {"retry_attempts"}
+
+    def test_another_providers_param_is_not_reported_as_forced(
+        self, tmp_path: Path
+    ) -> None:
+        """A kwarg configured for a different provider is passed through.
+
+        `create_model` forces the retry kwarg of the provider it actually
+        builds. Reporting every configured name would tell the user their
+        `--model-params` value was ignored when it reaches the constructor
+        untouched -- the opposite of what happens.
+        """
+        from deepagents_code.config import collect_retry_config_startup
+
+        config_path = tmp_path / "config.toml"
+        config_path.write_text('[retries.foo]\nparam = "retry_attempts"\n')
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            _warnings, param_names = collect_retry_config_startup("openai")
+
+        assert param_names == {"max_retries"}
+
+    def test_unresolved_provider_reports_no_forced_param(self, tmp_path: Path) -> None:
+        """Nothing can be claimed as overridden before the provider is known."""
+        from deepagents_code.config import collect_retry_config_startup
+
+        config_path = tmp_path / "config.toml"
+        config_path.write_text('[retries.foo]\nparam = "retry_attempts"\n')
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            _warnings, param_names = collect_retry_config_startup(None)
+
+        assert param_names == set()
+
+
 class TestDeniedHomeKeyReporting:
     """A denied `DEEPAGENTS_HOME` must be loud in the user's own dotenv.
 
@@ -7992,15 +8224,11 @@ class TestReservedAgentNames:
 
     @pytest.mark.parametrize("name", ["bin", "plugins", "conversation_history"])
     def test_reserved_names_are_rejected(self, name: str) -> None:
-        settings = Settings.__new__(Settings)
-
         with pytest.raises(ValueError, match="reserved"):
-            settings.get_agent_dir(name)
+            get_agent_dir(name)
 
     def test_ordinary_names_still_resolve(self) -> None:
-        settings = Settings.__new__(Settings)
-
-        assert settings.get_agent_dir("coder").name == "coder"
+        assert get_agent_dir("coder").name == "coder"
 
     @pytest.mark.parametrize(
         "name", ["BIN", "Plugins", "CONVERSATION_HISTORY", "pLuGiNs"]
@@ -8015,10 +8243,9 @@ class TestReservedAgentNames:
         through and stamp agent state into app-owned directories.
         """
         monkeypatch.setattr(sys, "platform", "darwin")
-        settings = Settings.__new__(Settings)
 
         with pytest.raises(ValueError, match="reserved"):
-            settings.get_agent_dir(name)
+            get_agent_dir(name)
 
     def test_case_alias_is_allowed_on_case_sensitive_linux(
         self, monkeypatch: pytest.MonkeyPatch
@@ -8030,9 +8257,8 @@ class TestReservedAgentNames:
         must not be rejected.
         """
         monkeypatch.setattr(sys, "platform", "linux")
-        settings = Settings.__new__(Settings)
 
-        assert settings.get_agent_dir("Plugins").name == "Plugins"
+        assert get_agent_dir("Plugins").name == "Plugins"
 
     def test_windows_trailing_space_alias_is_rejected(
         self, monkeypatch: pytest.MonkeyPatch
@@ -8045,10 +8271,9 @@ class TestReservedAgentNames:
         it there; on POSIX `plugins ` is a genuinely different directory.
         """
         monkeypatch.setattr(sys, "platform", "win32")
-        settings = Settings.__new__(Settings)
 
         with pytest.raises(ValueError, match="reserved"):
-            settings.get_agent_dir("plugins ")
+            get_agent_dir("plugins ")
 
     def test_trailing_dot_never_reaches_the_reserved_check(self) -> None:
         """The character allowlist already rejects `.` on every platform.
@@ -8056,19 +8281,16 @@ class TestReservedAgentNames:
         A trailing-dot alias such as `plugins.` is refused as an invalid name
         before the reserved-name comparison runs.
         """
-        settings = Settings.__new__(Settings)
-
         with pytest.raises(ValueError, match="Invalid agent name"):
-            settings.get_agent_dir("plugins.")
+            get_agent_dir("plugins.")
 
     def test_trailing_space_is_allowed_off_windows(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """On POSIX a trailing space names a different, non-reserved directory."""
         monkeypatch.setattr(sys, "platform", "linux")
-        settings = Settings.__new__(Settings)
 
-        assert settings.get_agent_dir("plugins ").name == "plugins "
+        assert get_agent_dir("plugins ").name == "plugins "
 
     @pytest.mark.parametrize("name", ["bin", "plugins", "conversation_history"])
     def test_the_agents_md_accessor_rejects_them_too(self, name: str) -> None:
@@ -8078,17 +8300,13 @@ class TestReservedAgentNames:
         parent directory, so leaving it unchecked is what would stamp
         `AGENTS.md` into app-owned state.
         """
-        settings = Settings.__new__(Settings)
-
         with pytest.raises(ValueError, match="reserved"):
-            settings.get_user_agent_md_path(name)
+            get_user_agent_md_path(name)
 
     def test_the_agents_md_accessor_rejects_invalid_characters(self) -> None:
         """It skipped the character check as well, not only reserved names."""
-        settings = Settings.__new__(Settings)
-
         with pytest.raises(ValueError, match="Invalid agent name"):
-            settings.get_user_agent_md_path("../escape")
+            get_user_agent_md_path("../escape")
 
 
 class TestAgentDirStaysOffTheHeavyImportPath:
@@ -8105,9 +8323,9 @@ class TestAgentDirStaysOffTheHeavyImportPath:
         source = textwrap.dedent(
             """
             import sys
-            from deepagents_code.config import Settings
+            from deepagents_code._paths import get_agent_dir
 
-            Settings.get_agent_dir(object.__new__(Settings), "demo")
+            get_agent_dir("demo")
             heavy = sorted(
                 name
                 for name in sys.modules
@@ -8125,3 +8343,91 @@ class TestAgentDirStaysOffTheHeavyImportPath:
         )
 
         assert result.stdout.strip() == ""
+
+
+class TestBuildStreamConfigRecursionLimit:
+    """`build_stream_config` carries the resolved graph step budget."""
+
+    def test_omitted_when_nothing_is_configured(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No configured limit leaves the server default in force.
+
+        Sending an explicit value here would override `langgraph_api`'s own
+        default, so the key must be absent rather than `None`.
+        """
+        import deepagents_code.config as config_mod
+        from deepagents_code import _env_vars, model_config
+        from deepagents_code.configuration import service
+
+        monkeypatch.delenv(_env_vars.RECURSION_LIMIT, raising=False)
+        monkeypatch.delenv("LANGGRAPH_DEFAULT_RECURSION_LIMIT", raising=False)
+        empty = tmp_path / "config.toml"
+        empty.write_text("", encoding="utf-8")
+        monkeypatch.setattr(model_config, "DEFAULT_CONFIG_PATH", empty)
+        service.invalidate_config_sources()
+        model_config.clear_caches()
+        try:
+            assert "recursion_limit" not in config_mod.build_stream_config(
+                "thread-123", assistant_id=None
+            )
+        finally:
+            service.invalidate_config_sources()
+            model_config.clear_caches()
+
+    def test_resolved_limit_reaches_the_run_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A configured limit rides in the run config, not just the binding.
+
+        The graph runs inside the `langgraph dev` server, which stamps its own
+        `recursion_limit` over whatever `create_cli_agent` bound onto the
+        compiled graph. The run config is the only channel that survives, so a
+        regression here silently restores the server default.
+        """
+        import deepagents_code.config as config_mod
+        from deepagents_code import _env_vars, model_config
+        from deepagents_code.configuration import service
+
+        monkeypatch.setenv(_env_vars.RECURSION_LIMIT, "3000")
+        empty = tmp_path / "config.toml"
+        empty.write_text("", encoding="utf-8")
+        monkeypatch.setattr(model_config, "DEFAULT_CONFIG_PATH", empty)
+        service.invalidate_config_sources()
+        model_config.clear_caches()
+        try:
+            config = config_mod.build_stream_config("thread-123", assistant_id=None)
+        finally:
+            service.invalidate_config_sources()
+            model_config.clear_caches()
+
+        assert config["recursion_limit"] == 3000
+
+    def test_inherited_langgraph_limit_reaches_the_run_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The upstream environment fallback is sent with each run."""
+        import deepagents_code.config as config_mod
+        from deepagents_code import _env_vars, model_config
+        from deepagents_code.configuration import service
+
+        monkeypatch.delenv(_env_vars.RECURSION_LIMIT, raising=False)
+        monkeypatch.setenv("LANGGRAPH_DEFAULT_RECURSION_LIMIT", "12000")
+        empty = tmp_path / "config.toml"
+        empty.write_text("", encoding="utf-8")
+        monkeypatch.setattr(model_config, "DEFAULT_CONFIG_PATH", empty)
+        service.invalidate_config_sources()
+        model_config.clear_caches()
+        try:
+            config = config_mod.build_stream_config("thread-123", assistant_id=None)
+        finally:
+            service.invalidate_config_sources()
+            model_config.clear_caches()
+
+        assert config["recursion_limit"] == 12_000

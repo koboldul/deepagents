@@ -19,9 +19,8 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import Field
 
-from deepagents_code._paths import PATHS
+from deepagents_code._paths import PATHS, get_built_in_skills_dir
 from deepagents_code.agent import create_cli_agent
-from deepagents_code.config import Settings
 from deepagents_code.offload import _ArtifactsStorage
 
 if TYPE_CHECKING:
@@ -101,7 +100,7 @@ def _assert_snapshot(
 
 @contextmanager
 def _mock_settings(tmp_path: Path) -> Generator[None, None, None]:
-    """Patch ``settings`` with temporary directories and fixed model identity.
+    """Patch filesystem settings and fixed runtime model identity.
 
     Mirrors the ``mock_settings`` pattern from ``test_end_to_end.py`` but
     fixes ``model_name``/``model_provider``/``model_context_limit`` so the
@@ -114,23 +113,46 @@ def _mock_settings(tmp_path: Path) -> Generator[None, None, None]:
     skills_dir = tmp_path / "skills"
     skills_dir.mkdir(parents=True)
 
-    with patch("deepagents_code.agent.settings") as mock_s:
-        mock_s.ensure_agent_dir.return_value = agent_dir
-        mock_s.ensure_user_skills_dir.return_value = skills_dir
-        mock_s.get_project_skills_dir.return_value = None
-        mock_s.get_built_in_skills_dir.return_value = Settings.get_built_in_skills_dir()
-        mock_s.get_user_agent_md_path.return_value = agent_dir / "AGENTS.md"
-        mock_s.get_project_agent_md_path.return_value = []
-        mock_s.get_user_agents_dir.return_value = tmp_path / "agents"
-        mock_s.get_project_agents_dir.return_value = None
-        mock_s.get_user_agent_skills_dir.return_value = tmp_path / "agents_skills"
-        mock_s.get_project_agent_skills_dir.return_value = None
-        mock_s.get_user_claude_skills_dir.return_value = tmp_path / "claude_skills"
-        mock_s.get_project_claude_skills_dir.return_value = None
-        mock_s.model_name = _FIXED_MODEL_NAME
-        mock_s.model_provider = _FIXED_MODEL_PROVIDER
-        mock_s.model_context_limit = _FIXED_CONTEXT_LIMIT
-        mock_s.model_unsupported_modalities = frozenset()
+    with (
+        patch("deepagents_code.agent.credentials") as mock_s,
+        patch("deepagents_code.agent.runtime_state") as mock_runtime_state,
+        patch("deepagents_code.agent.ensure_agent_dir", return_value=agent_dir),
+        patch(
+            "deepagents_code.agent.ensure_user_skills_dir",
+            return_value=skills_dir,
+        ),
+        patch(
+            "deepagents_code.agent.get_user_agent_md_path",
+            return_value=agent_dir / "AGENTS.md",
+        ),
+        patch("deepagents_code.agent.get_project_skills_dir", return_value=None),
+        patch("deepagents_code.agent.get_project_agent_md_path", return_value=[]),
+        patch(
+            "deepagents_code.agent.get_user_agents_dir",
+            return_value=tmp_path / "agents",
+        ),
+        patch("deepagents_code.agent.get_project_agents_dir", return_value=None),
+        patch(
+            "deepagents_code.agent.get_user_agent_skills_dir",
+            return_value=tmp_path / "agents_skills",
+        ),
+        patch(
+            "deepagents_code.agent.get_project_agent_skills_dir",
+            return_value=None,
+        ),
+        patch(
+            "deepagents_code.agent.get_user_claude_skills_dir",
+            return_value=tmp_path / "claude_skills",
+        ),
+        patch(
+            "deepagents_code.agent.get_project_claude_skills_dir",
+            return_value=None,
+        ),
+    ):
+        mock_runtime_state.model_name = _FIXED_MODEL_NAME
+        mock_runtime_state.model_provider = _FIXED_MODEL_PROVIDER
+        mock_runtime_state.model_context_limit = _FIXED_CONTEXT_LIMIT
+        mock_runtime_state.model_unsupported_modalities = frozenset()
         mock_s.has_tavily = False
         mock_s.project_root = None
         mock_s.user_langchain_project = None
@@ -207,7 +229,7 @@ def test_system_prompt_snapshot(
     actual = actual.replace(str(tmp_path).replace("\\", "\\\\"), "<tmp_path>")
     actual = actual.replace(tmp_path.as_posix(), "<tmp_path>")
     actual = actual.replace(str(tmp_path), "<tmp_path>")
-    built_in_skills_dir = Settings.get_built_in_skills_dir()
+    built_in_skills_dir = get_built_in_skills_dir()
     actual = actual.replace(str(built_in_skills_dir), "<built_in_skills_dir>")
     actual = actual.replace(
         built_in_skills_dir.as_posix(),

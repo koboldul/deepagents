@@ -3567,16 +3567,16 @@ class TestResumeThread:
 
     @pytest.mark.parametrize(
         "output_type",
-        ["ASSISTANT", "TOOL", "SKILL"],
+        ["ASSISTANT", "REASONING", "TOOL", "SKILL"],
     )
     async def test_switch_hints_for_any_server_output_type(
         self, output_type: str
     ) -> None:
         """Every `_SERVER_OUTPUT_MESSAGE_TYPES` member counts as work done.
 
-        A turn can leave behind tool calls or a skill invocation without any
-        assistant text, so narrowing the constant to `ASSISTANT` would strand
-        those threads.
+        A turn can leave behind reasoning, tool calls, or a skill invocation
+        without any assistant text, so narrowing the constant to `ASSISTANT`
+        would strand those threads.
         """
         from deepagents_code.tui.widgets.message_store import MessageData, MessageType
 
@@ -4076,10 +4076,17 @@ class TestFetchThreadHistoryData:
         module-wide stub would silently disable unrelated work and hand back a
         false pass.
         """
+
+        def prepare(
+            _messages: list[Any], *, show_reasoning: bool = False
+        ) -> tuple[list[MessageData], tuple[()]]:
+            assert not show_reasoning
+            return converted, ()
+
         return patch.object(
             DeepAgentsApp,
             "_prepare_thread_history_messages",
-            staticmethod(lambda _messages: (converted, ())),
+            staticmethod(prepare),
         )
 
     async def test_offloads_conversion_to_thread(self) -> None:
@@ -4108,6 +4115,7 @@ class TestFetchThreadHistoryData:
         to_thread_mock.assert_awaited_once_with(
             DeepAgentsApp._prepare_thread_history_messages,
             raw_messages,
+            show_reasoning=False,
         )
 
     async def test_extracts_nonzero_context_tokens(self) -> None:
@@ -4629,7 +4637,7 @@ class TestResumeAdoptionFailureMessage:
 
     async def test_omits_fallback_when_no_current_model(self) -> None:
         """With no resolvable current model, the fallback clause is dropped."""
-        from deepagents_code.config import settings
+        from deepagents_code.config import runtime_state
 
         app = DeepAgentsApp()
         app._model_override = None
@@ -4639,8 +4647,8 @@ class TestResumeAdoptionFailureMessage:
         )
 
         with (
-            patch.object(settings, "model_provider", ""),
-            patch.object(settings, "model_name", ""),
+            patch.object(runtime_state, "model_provider", ""),
+            patch.object(runtime_state, "model_name", ""),
         ):
             await app._mount_resume_adoption_failure(
                 "anthropic:claude-opus-4-8", "the model could not be initialized"
@@ -4655,38 +4663,38 @@ class TestEffectiveModelSpec:
     """Tests for DeepAgentsApp._effective_model_spec."""
 
     async def test_prefers_session_override(self) -> None:
-        """A `/model` override wins over the startup default in `settings`."""
-        from deepagents_code.config import settings
+        """A `/model` override wins over process-wide runtime model state."""
+        from deepagents_code.config import runtime_state
 
         app = DeepAgentsApp()
         app._model_override = "openai:gpt-5.1"
         with (
-            patch.object(settings, "model_provider", "anthropic"),
-            patch.object(settings, "model_name", "claude-sonnet-4-5"),
+            patch.object(runtime_state, "model_provider", "anthropic"),
+            patch.object(runtime_state, "model_name", "claude-sonnet-4-5"),
         ):
             assert app._effective_model_spec() == "openai:gpt-5.1"
 
     async def test_falls_back_to_settings_spec(self) -> None:
-        """With no override, the resolved `provider:model` from settings is used."""
-        from deepagents_code.config import settings
+        """With no override, the resolved runtime `provider:model` is used."""
+        from deepagents_code.config import runtime_state
 
         app = DeepAgentsApp()
         app._model_override = None
         with (
-            patch.object(settings, "model_provider", "anthropic"),
-            patch.object(settings, "model_name", "claude-sonnet-4-5"),
+            patch.object(runtime_state, "model_provider", "anthropic"),
+            patch.object(runtime_state, "model_name", "claude-sonnet-4-5"),
         ):
             assert app._effective_model_spec() == "anthropic:claude-sonnet-4-5"
 
     async def test_none_when_spec_incomplete(self) -> None:
         """No override and a blank model yields `None` (no malformed spec)."""
-        from deepagents_code.config import settings
+        from deepagents_code.config import runtime_state
 
         app = DeepAgentsApp()
         app._model_override = None
         with (
-            patch.object(settings, "model_provider", "anthropic"),
-            patch.object(settings, "model_name", ""),
+            patch.object(runtime_state, "model_provider", "anthropic"),
+            patch.object(runtime_state, "model_name", ""),
         ):
             assert app._effective_model_spec() is None
 
@@ -4997,6 +5005,31 @@ class TestConvertMessagesToData:
         assert len(result) == 1
         assert result[0].type == MessageType.ASSISTANT
         assert result[0].content == "Part 1. Part 2."
+
+    def test_ai_message_reasoning_blocks_follow_preference(self) -> None:
+        from deepagents_code.tui.widgets.message_store import MessageType
+
+        messages = [
+            self._make_ai(
+                [
+                    {"type": "text", "text": "Before "},
+                    {"type": "reasoning", "reasoning": "Thinking"},
+                    {"type": "text", "text": "after"},
+                ]
+            )
+        ]
+
+        hidden = DeepAgentsApp._convert_messages_to_data(messages)
+        visible = DeepAgentsApp._convert_messages_to_data(messages, show_reasoning=True)
+
+        assert [(message.type, message.content) for message in hidden] == [
+            (MessageType.ASSISTANT, "Before after")
+        ]
+        assert [(message.type, message.content) for message in visible] == [
+            (MessageType.ASSISTANT, "Before "),
+            (MessageType.REASONING, "Thinking"),
+            (MessageType.ASSISTANT, "after"),
+        ]
 
     def test_ai_message_empty_text_skipped(self) -> None:
         """AIMessage with empty text should not produce an ASSISTANT entry."""

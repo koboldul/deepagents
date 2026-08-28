@@ -59,6 +59,7 @@ from deepagents_code.mcp_tools import (
     MCPConfigScope,
     ProjectServerSummary,
 )
+from deepagents_code.model_config import ModelConfig
 from deepagents_code.update_check import format_log_follow_command, update_install_lock
 
 # Most unit tests set `DEEPAGENTS_CODE_NO_UPDATE_CHECK=1` and patch
@@ -2864,6 +2865,67 @@ class TestRunTextualCliAsyncMcp:
 
         assert _classifier_model_after_policy("openai:anything") == "openai:anything"
 
+    async def test_resolves_summarization_model_precedence(self) -> None:
+        app_result = AppResult(return_code=0, thread_id="thread-123")
+        captured_kwargs: dict[str, Any] = {}
+        config = ModelConfig(summarization_default_model="openai:config-summary")
+
+        async def _run_textual_app_stub(**kwargs: Any) -> AppResult:
+            captured_kwargs.update(kwargs)
+            await asyncio.sleep(0)
+            return app_result
+
+        with (
+            patch("deepagents_code.app.run_textual_app", new=_run_textual_app_stub),
+            patch.object(ModelConfig, "load", return_value=config),
+            patch(
+                "deepagents_code.config.create_model",
+                side_effect=AssertionError("summary model constructed before TUI"),
+            ) as create_model,
+        ):
+            await run_textual_cli_async(
+                "agent",
+                model_name="openai:gpt-5.5",
+                summarization_model="openai:flag-summary",
+            )
+
+        create_model.assert_not_called()
+        assert captured_kwargs["summarization_model"] == "openai:flag-summary"
+        assert (
+            captured_kwargs["server_kwargs"]["summarization_model"]
+            == "openai:flag-summary"
+        )
+
+    async def test_forwards_no_summarization_model_when_unset(self) -> None:
+        """An unset spec reaches the app as `None`.
+
+        `cli_main` resolves `[models].summarization_default` before any launch
+        mode, so this entry point forwards whatever it is given rather than
+        consulting the config itself.
+        """
+        app_result = AppResult(return_code=0, thread_id="thread-123")
+        captured_kwargs: dict[str, Any] = {}
+        config = ModelConfig(summarization_default_model="openai:config-summary")
+
+        async def _run_textual_app_stub(**kwargs: Any) -> AppResult:
+            captured_kwargs.update(kwargs)
+            await asyncio.sleep(0)
+            return app_result
+
+        with (
+            patch("deepagents_code.app.run_textual_app", new=_run_textual_app_stub),
+            patch.object(ModelConfig, "load", return_value=config),
+            patch(
+                "deepagents_code.config.create_model",
+                side_effect=AssertionError("summary model constructed before TUI"),
+            ) as create_model,
+        ):
+            await run_textual_cli_async("agent", model_name="openai:gpt-5.5")
+
+        create_model.assert_not_called()
+        assert captured_kwargs["summarization_model"] is None
+        assert captured_kwargs["server_kwargs"]["summarization_model"] is None
+
     async def test_resolves_configured_auto_classifier_before_tui_launch(self) -> None:
         """The TUI and server receive the same effective env/TOML classifier."""
         app_result = AppResult(return_code=0, thread_id="thread-123")
@@ -3225,9 +3287,9 @@ class TestCheckOptionalTools:
 
     @pytest.fixture(autouse=True)
     def _tavily_available(self) -> Iterator[None]:
-        """Patch settings.has_tavily to True so ripgrep-only tests stay isolated."""
+        """Patch credentials.has_tavily so ripgrep-only tests stay isolated."""
         with patch(
-            "deepagents_code.config.settings",
+            "deepagents_code.config.credentials",
             SimpleNamespace(has_tavily=True),
         ):
             yield
@@ -3307,7 +3369,7 @@ class TestCheckOptionalTools:
         with (
             patch("deepagents_code.main.shutil.which", return_value="/usr/bin/rg"),
             patch(
-                "deepagents_code.config.settings",
+                "deepagents_code.config.credentials",
                 SimpleNamespace(has_tavily=False),
             ),
         ):
@@ -3330,7 +3392,7 @@ class TestCheckOptionalTools:
         with (
             patch("deepagents_code.main.shutil.which", return_value="/usr/bin/rg"),
             patch(
-                "deepagents_code.config.settings",
+                "deepagents_code.config.credentials",
                 SimpleNamespace(has_tavily=False),
             ),
         ):
