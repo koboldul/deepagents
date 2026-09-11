@@ -24,6 +24,10 @@ ever renamed, only the value here changes.
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 # ---------------------------------------------------------------------------
 # Constants — import these instead of bare string literals.
@@ -276,7 +280,16 @@ EXTERNAL_EVENT_SOCKET_PATH = "DEEPAGENTS_CODE_EXTERNAL_EVENT_SOCKET_PATH"
 """Override the default Unix-socket path for the external event listener."""
 
 EXTRA_SKILLS_DIRS = "DEEPAGENTS_CODE_EXTRA_SKILLS_DIRS"
-"""Colon-separated paths added to the skill containment allowlist."""
+"""Paths added to the skill containment allowlist, split with `os.pathsep`."""
+
+FORKED_SUBAGENTS = "DEEPAGENTS_CODE_FORKED_SUBAGENTS"
+"""Whether dcode's built-in `general-purpose` subagent runs in fork mode.
+
+On by default. Set to a falsy value to make the subagent receive only the delegated
+task instead of inheriting the parent agent's conversation and state. Parsed by
+`is_env_truthy`; set this only through the launching shell or global
+`~/.deepagents/.env`, never a project `.env`.
+"""
 
 GOAL_AUTO_ACCEPT_CRITERIA = "DEEPAGENTS_CODE_GOAL_AUTO_ACCEPT_CRITERIA"
 """Apply generated goal criteria automatically in Auto mode.
@@ -493,6 +506,9 @@ hostile values the dotenv denylist does not yet enumerate. The global
 repo file, so a project `.env` cannot disable itself.
 """
 
+RECENT_THREADS = "DEEPAGENTS_CODE_RECENT_THREADS"
+"""Maximum number of recent threads loaded and displayed (default: 20)."""
+
 RECURSION_LIMIT = "DEEPAGENTS_CODE_RECURSION_LIMIT"
 """Override the main agent's LangGraph `recursion_limit` (graph step budget).
 
@@ -685,7 +701,12 @@ def classify_env_bool(raw: str) -> bool | None:
     return None
 
 
-def is_env_truthy(name: str, *, default: bool = False) -> bool:
+def is_env_truthy(
+    name: str,
+    *,
+    default: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
     """Return whether env var *name* is set to a recognizably truthy value.
 
     Unlike `bool(os.environ.get(name))`, this does not treat `"0"` or
@@ -697,12 +718,14 @@ def is_env_truthy(name: str, *, default: bool = False) -> bool:
             constant from this module).
         default: Value returned when the variable is unset OR set to a
             value that is neither recognizably truthy nor falsy.
+        environ: Environment to read, defaulting to the process environment.
+            Pass a workspace snapshot to keep the read scoped.
 
     Returns:
         `True` for `1`/`true`/`yes`/`on` (case-insensitive), `False` for
         `0`/`false`/`no`/`off`/empty string, or `default` otherwise.
     """
-    raw = os.environ.get(name)
+    raw = (os.environ if environ is None else environ).get(name)
     if raw is None:
         return default
     classified = classify_env_bool(raw)

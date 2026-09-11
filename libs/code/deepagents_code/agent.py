@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import functools
 import inspect
 import logging
 import os
@@ -41,6 +40,7 @@ if TYPE_CHECKING:
     from langgraph.store.base import BaseStore
     from langgraph.types import Command
 
+    from deepagents_code.config import CredentialsSnapshot, ModelResult
     from deepagents_code.extensions.registry import ExtensionRegistry
     from deepagents_code.mcp_tools import MCPServerInfo
     from deepagents_code.output import OutputFormat
@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 from langchain.agents.middleware import (
     HumanInTheLoopMiddleware,
     InterruptOnConfig,
+    ToolErrorMiddleware,
 )
 from langchain.agents.middleware.types import (
     AgentMiddleware,
@@ -66,6 +67,11 @@ from langchain_core.tools import StructuredTool, tool
 from deepagents_code import theme
 from deepagents_code._cli_context import CLIContextSchema
 from deepagents_code._constants import DEFAULT_AGENT_NAME
+from deepagents_code._env_vars import (
+    EXPERIMENTAL,
+    FORKED_SUBAGENTS,
+    is_env_truthy,
+)
 from deepagents_code._glm_5p2_profile import (
     _ensure_glm_5p2_profile_registered,
     _GlmTerminalStallRecovery,
@@ -103,13 +109,13 @@ from deepagents_code.config import (
     _INHERITED_PYTHONPATH_ENV,
     DEFAULT_MODEL_RETRIES,
     _ShellAllowAll,
+    active_environment,
     console,
     credentials,
     get_default_coding_instructions,
     get_glyphs,
     get_langsmith_project_name,
-    restore_user_tracing_api_keys,
-    restore_user_tracing_env,
+    restore_user_langsmith_env,
     runtime_state,
 )
 from deepagents_code.configurable_model import ConfigurableModelMiddleware
@@ -132,6 +138,7 @@ from deepagents_code.offload_middleware import (
     attach_offload_operation,
 )
 from deepagents_code.plugins.adapters.skills_middleware import PluginSkillsMiddleware
+from deepagents_code.project_utils import get_server_project_context
 from deepagents_code.reliable_rubric import ReliableRubricMiddleware
 from deepagents_code.subagents import list_subagents
 from deepagents_code.unicode_security import (
@@ -139,6 +146,7 @@ from deepagents_code.unicode_security import (
     detect_dangerous_unicode,
     format_warning_detail,
     render_with_unicode_markers,
+    sanitize_control_chars,
     strip_dangerous_unicode,
     summarize_issues,
 )
@@ -149,6 +157,17 @@ logger = logging.getLogger(__name__)
 def _use_virtual_local_paths() -> bool:
     """Return whether local file tools need Windows virtual-root semantics."""
     return os.name == "nt"
+
+
+def _format_task_error(error: Exception, request: ToolCallRequest) -> str | None:
+    from langgraph.errors import NodeCancelledError
+
+    if isinstance(error, NodeCancelledError):
+        return None
+    subagent_type = request.tool_call.get("args", {}).get("subagent_type")
+    subagent_name = subagent_type if isinstance(subagent_type, str) else "unknown"
+    logger.debug("Subagent %r failed", subagent_name, exc_info=error)
+    return f"Subagent {subagent_name!r} failed. You may retry this task."
 
 
 _MEMORY_READONLY_SYSTEM_PROMPT = (
@@ -1555,6 +1574,8 @@ def get_system_prompt(
     interactive: bool = True,
     cwd: str | Path | None = None,
     fs_tools: list[FsToolName] | None = None,
+    has_tavily: bool | None = None,
+    model_result: ModelResult | None = None,
 ) -> str:
     """Get the base system prompt for the agent.
 
@@ -1573,6 +1594,8 @@ def get_system_prompt(
         cwd: Override the working directory shown in the prompt.
         fs_tools: Filesystem tool allowlist. Restricted prompts omit guidance
             for unavailable tools; `None` retains all guidance.
+        has_tavily: Workspace credential availability override.
+        model_result: Workspace model metadata override.
 
     Returns:
         The system prompt string
@@ -1626,16 +1649,23 @@ def get_system_prompt(
             "available. Never run commands that block waiting for stdin."
         )
 
-    model_identity_section = build_model_identity_section(
-        runtime_state.model_name,
-        provider=runtime_state.model_provider,
-        context_limit=runtime_state.model_context_limit,
-        unsupported_modalities=runtime_state.model_unsupported_modalities,
-    )
+    if model_result is not None:
+        model_identity_section = build_model_identity_section(
+            model_result.model_name,
+            provider=model_result.provider,
+            context_limit=model_result.context_limit,
+            unsupported_modalities=model_result.unsupported_modalities,
+        )
+    else:
+        model_identity_section = build_model_identity_section(
+            runtime_state.model_name,
+            provider=runtime_state.model_provider,
+            context_limit=runtime_state.model_context_limit,
+            unsupported_modalities=runtime_state.model_unsupported_modalities,
+        )
     filesystem_tool_guidance = _build_fs_tool_prompt_guidance(fs_tools)
-    web_search_tool_guidance = (
-        _WEB_SEARCH_TOOL_GUIDANCE if credentials.has_tavily else ""
-    )
+    tavily_available = credentials.has_tavily if has_tavily is None else has_tavily
+    web_search_tool_guidance = _WEB_SEARCH_TOOL_GUIDANCE if tavily_available else ""
 
     # Build working directory section (local vs sandbox)
     if sandbox_type:
@@ -1843,13 +1873,15 @@ def _format_task_description(
 
 
 def _format_execute_description(
-    tool_call: ToolCall,
-    _state: AgentState[Any],
-    _runtime: Runtime[Any],
-    *,
-    working_directory: str | Path = ".",
+    tool_call: ToolCall, _state: AgentState[Any], runtime: Runtime[Any]
 ) -> str:
     """Format execute tool call for approval prompt.
+
+    The working directory comes from the run's bound workspace, which
+    `require_thread_workspace` validates against the durable binding before
+    the run starts. A run with no workspace falls back to the process-global
+    server project context and then the process CWD; both can name a
+    directory the command will not run in, so the fallback warns.
 
     Returns:
         Formatted description string for the execute tool call.
@@ -1857,10 +1889,25 @@ def _format_execute_description(
     args = tool_call["args"]
     command_raw = str(args.get("command", "N/A"))
     command = strip_dangerous_unicode(command_raw)
-    lines = [
-        f"Execute Command: {command}",
-        f"Working Directory: {working_directory}",
-    ]
+    context = CLIContextSchema.from_payload(runtime.context)
+    workspace = context.workspace if context is not None else {}
+    effective_cwd = workspace.get("cwd") if isinstance(workspace, dict) else None
+    # An empty or non-str `cwd` would render a blank directory line, which
+    # reads as "no directory" rather than as missing data. Fall through.
+    if not isinstance(effective_cwd, str) or not effective_cwd:
+        logger.warning(
+            "Shell approval prompt has no bound workspace cwd; the directory "
+            "shown may not be where this command runs (workspace=%r)",
+            workspace,
+        )
+        project_context = get_server_project_context()
+        effective_cwd = (
+            str(project_context.user_cwd)
+            if project_context is not None
+            else str(Path.cwd())
+        )
+    display_cwd = sanitize_control_chars(effective_cwd, collapse_whitespace=False)
+    lines = [f"Execute Command: {command}", f"Working Directory: {display_cwd}"]
 
     issues = detect_dangerous_unicode(command_raw)
     if issues:
@@ -2179,7 +2226,6 @@ def _add_interrupt_on(
     *,
     mcp_tools: Sequence[BaseTool] = (),
     auto_mode_enabled: bool = True,
-    working_directory: str | Path = ".",
 ) -> dict[str, InterruptOnConfig]:
     """Configure human-in-the-loop interrupt settings for all gated tools.
 
@@ -2196,7 +2242,6 @@ def _add_interrupt_on(
         mcp_tools: Exact MCP tools to extend the static interrupt map with.
         auto_mode_enabled: Whether `auto` bypasses stock HITL for delegated
             subagents. Ineligible runtimes treat `auto` as Manual.
-        working_directory: Working directory displayed for `execute` approvals.
 
     Returns:
         Dictionary mapping tool names to their interrupt configuration.
@@ -2206,13 +2251,9 @@ def _add_interrupt_on(
         if auto_mode_enabled
         else _interrupt_predicate(auto_mode_enabled=False)
     )
-    execute_description = functools.partial(
-        _format_execute_description,
-        working_directory=working_directory,
-    )
     execute_interrupt_config: InterruptOnConfig = {
         "allowed_decisions": ["approve", "reject"],
-        "description": execute_description,  # ty: ignore[invalid-argument-type]  # Callable description narrower than TypedDict expects
+        "description": _format_execute_description,  # ty: ignore[invalid-argument-type]  # Callable description narrower than TypedDict expects
         "when": when,
     }
 
@@ -2415,7 +2456,12 @@ def get_skill_sources(
     user_claude_skills_dir = get_user_claude_skills_dir()
     if user_claude_skills_dir is not None and user_claude_skills_dir.exists():
         sources.append((str(user_claude_skills_dir), "User Claude"))
-    project_claude_skills_dir = get_project_claude_skills_dir(credentials.project_root)
+    project_claude_root = (
+        project_context.project_root
+        if project_context is not None
+        else credentials.project_root
+    )
+    project_claude_skills_dir = get_project_claude_skills_dir(project_claude_root)
     if project_claude_skills_dir:
         sources.append((str(project_claude_skills_dir), "Project Claude"))
 
@@ -2461,6 +2507,9 @@ def create_cli_agent(
     summarization_model: str | None = None,
     enforce_model_policy: bool = True,
     extension_registry: ExtensionRegistry | None = None,
+    environ: Mapping[str, str] | None = None,
+    credentials_snapshot: CredentialsSnapshot | None = None,
+    model_result: ModelResult | None = None,
 ) -> tuple[Pregel[Any, Any, Any, Any], CompositeBackend]:
     """Create a CLI-configured agent with flexible options.
 
@@ -2631,6 +2680,9 @@ def create_cli_agent(
             listing rather than raising. Any caller that can run the graph must
             leave this `True`.
         extension_registry: Server-owned Python extension registrations.
+        environ: Environment snapshot frozen into local shell execution.
+        credentials_snapshot: Credentials resolved from `environ` for this runtime.
+        model_result: Workspace model metadata used in the generated prompt.
 
     Returns:
         2-tuple of `(agent_graph, backend)`
@@ -2652,11 +2704,15 @@ def create_cli_agent(
             a prebuilt `BaseChatModel` came from a path that already checked.
     """  # noqa: DOC502 - propagates from `ModelConfig.require_model_allowed`
     tools = list(tools or [])
-    if extension_registry is not None:
-        from deepagents_code._env_vars import EXPERIMENTAL, is_env_truthy
-
-        if not is_env_truthy(EXPERIMENTAL):
-            extension_registry = None
+    environment = active_environment() if environ is None else environ
+    runtime_credentials = (
+        credentials if credentials_snapshot is None else credentials_snapshot
+    )
+    user_tracing_project = runtime_credentials.user_langchain_project
+    if extension_registry is not None and not is_env_truthy(
+        EXPERIMENTAL, environ=environment
+    ):
+        extension_registry = None
     mcp_tools = tuple(mcp_tools or ())
     if auto_mode_enabled and sandbox is not None:
         logger.warning(
@@ -2668,14 +2724,8 @@ def create_cli_agent(
         if cwd is not None
         else (project_context.user_cwd if project_context is not None else None)
     )
-    if sandbox is None:
-        if effective_cwd is None:
-            effective_cwd = Path.cwd()
-        approval_working_directory: str | Path = effective_cwd
-    else:
-        approval_working_directory = (
-            get_default_working_dir(sandbox_type) if sandbox_type is not None else "/"
-        )
+    if sandbox is None and effective_cwd is None:
+        effective_cwd = Path.cwd()
 
     # Setup agent directory for persistent memory (if enabled)
     if enable_memory or enable_skills:
@@ -2712,7 +2762,6 @@ def create_cli_agent(
         _add_interrupt_on(
             mcp_tools=mcp_tools,
             auto_mode_enabled=auto_mode_enabled,
-            working_directory=approval_working_directory,
         )
         if hitl_active
         else None
@@ -2722,7 +2771,7 @@ def create_cli_agent(
     project_agents_dir = (
         project_context.project_agents_dir()
         if project_context is not None
-        else get_project_agents_dir(credentials.project_root)
+        else get_project_agents_dir(runtime_credentials.project_root)
     )
 
     def _subagent_cli_middleware(
@@ -2739,6 +2788,7 @@ def create_cli_agent(
                 ConfigurableModelMiddleware(
                     persist_model_state=False,
                     cli_max_retries=cli_max_retries,
+                    environ=environment,
                 )
             )
         # Checkpoint nested spend before HITL can pause the subgraph, then hand
@@ -2882,13 +2932,19 @@ def create_cli_agent(
             "system_prompt": GENERAL_PURPOSE_SUBAGENT["system_prompt"],
             "middleware": _subagent_cli_middleware(has_explicit_model=False),
         }
+        if is_env_truthy(FORKED_SUBAGENTS, default=True):
+            general_purpose_subagent["mode"] = "fork"
         if resolved_interrupt_on is not None:
             general_purpose_subagent["interrupt_on"] = {}
         custom_subagents.append(general_purpose_subagent)
 
     # Build middleware stack based on enabled features
     agent_middleware: list[AgentMiddleware[Any, Any]] = [
-        ConfigurableModelMiddleware(cli_max_retries=cli_max_retries),
+        ConfigurableModelMiddleware(
+            cli_max_retries=cli_max_retries,
+            environ=environment,
+            model_result=model_result,
+        ),
     ]
     if not interactive:
         agent_middleware.append(_GlmTerminalStallRecovery())
@@ -2940,7 +2996,7 @@ def create_cli_agent(
         project_agent_md_paths = (
             project_context.project_agent_md_paths()
             if project_context is not None
-            else get_project_agent_md_path(credentials.project_root)
+            else get_project_agent_md_path(runtime_credentials.project_root)
         )
         memory_sources.extend(str(p) for p in project_agent_md_paths)
 
@@ -2995,19 +3051,12 @@ def create_cli_agent(
             raise RuntimeError(msg)
         root_dir = effective_cwd
         if enable_shell:
-            # Create environment for shell commands.
-            # Restore the user's original LANGSMITH_PROJECT so their code traces
-            # separately. When they had none, drop the agent's override (the
-            # `deepagents-code` default applied at bootstrap) entirely so shell
-            # commands don't inherit it.
-            shell_env = os.environ.copy()
+            # Restore launch and project-dotenv LangSmith settings instead of
+            # agent-only credentials in the workspace environment.
+            shell_env = dict(environment)
             shell_env["GIT_TERMINAL_PROMPT"] = "0"
-            if credentials.user_langchain_project is not None:
-                shell_env["LANGSMITH_PROJECT"] = credentials.user_langchain_project
-            else:
-                shell_env.pop("LANGSMITH_PROJECT", None)
-            restore_user_tracing_env(shell_env)
-            restore_user_tracing_api_keys(shell_env)
+            restore_user_langsmith_env(shell_env, start_path=effective_cwd)
+            user_tracing_project = shell_env.get("LANGSMITH_PROJECT")
             # Re-apply a launch-time PYTHONPATH that was stripped from the server
             # interpreter but relayed for approval-gated `execute` commands.
             _apply_inherited_pythonpath(shell_env)
@@ -3023,11 +3072,8 @@ def create_cli_agent(
             # The SDK's FilesystemMiddleware exposes per-command timeout
             # on the execute tool natively.
             # `inherit_env=False`: `shell_env` is already a complete, curated
-            # copy of `os.environ`. Inheriting again would re-copy `os.environ`
-            # and resurrect the popped carrier var, leaking it into `execute`.
-            # `restore_user_tracing_api_keys` above depends on this too: flipping
-            # to `inherit_env=True` would re-copy the agent's overridden
-            # `LANGSMITH_API_KEY` and undo the restore, leaking it into `execute`.
+            # copy of the active environment. Inheriting again would resurrect
+            # carrier vars and agent-only LangSmith credentials in `execute`.
             backend = LocalShellBackend(
                 root_dir=root_dir,
                 virtual_mode=use_virtual_project_root,
@@ -3095,7 +3141,7 @@ def create_cli_agent(
                 local_root=effective_cwd if sandbox is None else None,
                 mcp_server_info=mcp_server_info,
                 tracing_project=get_langsmith_project_name(),
-                user_tracing_project=credentials.user_langchain_project,
+                user_tracing_project=user_tracing_project,
             )
         )
 
@@ -3111,6 +3157,8 @@ def create_cli_agent(
             interactive=interactive,
             cwd=effective_cwd,
             fs_tools=fs_tools,
+            has_tavily=runtime_credentials.has_tavily,
+            model_result=model_result,
         )
 
     interrupt_on: dict[str, bool | InterruptOnConfig] = {}
@@ -3210,6 +3258,7 @@ def create_cli_agent(
         composite_backend,
         cli_max_retries=cli_max_retries,
         summarization_model_spec=summarization_model,
+        environ=environment,
     )
     if auto_mode_config is not None and resolved_interrupt_on is not None:
         from deepagents_code.auto_mode import AutoModeHITLMiddleware
@@ -3236,6 +3285,7 @@ def create_cli_agent(
                 shell_allow_list=narrow_allow_list,
                 classifier_model=classifier_model,
                 cli_max_retries=cli_max_retries,
+                environ=environment,
                 classifier_timeout_seconds=resolve_auto_classifier_timeout(),
                 trusted_ask_user_tool=trusted_ask_user_tool,
                 trusted_compaction_tool=compaction_middleware.tools[0],
@@ -3331,11 +3381,13 @@ def create_cli_agent(
             fs_tools=fs_tools,
             model_retries=model_retries,
             cli_max_retries=cli_max_retries,
+            environ=environment,
         )
         criteria_fallback_agent = create_goal_criteria_fallback_agent(
             model=model,
             model_retries=model_retries,
             cli_max_retries=cli_max_retries,
+            environ=environment,
         )
         agent_middleware.append(
             GoalCriteriaMiddleware(criteria_agent, criteria_fallback_agent)
@@ -3350,7 +3402,12 @@ def create_cli_agent(
     # with a non-zero request-time budget.
     from deepagents_code.model_retry import CodeModelRetryMiddleware
 
-    agent_middleware.append(CodeModelRetryMiddleware(max_retries=model_retries))
+    agent_middleware.extend(
+        [
+            CodeModelRetryMiddleware(max_retries=model_retries),
+            ToolErrorMiddleware(_format_task_error, tools=["task"]),
+        ]
+    )
 
     grader_context_tools = _normalize_rubric_grader_context_tools(
         rubric_grader_tools or ()
@@ -3385,8 +3442,11 @@ def create_cli_agent(
         fs_tools=fs_tools,
     )
     from deepagents_code.goal_rubric import (
+        RubricGraderState,
         _ContextToolCallBudgetMiddleware,
         _CriteriaContextBudgetMiddleware,
+        _rubric_grader_messages,
+        _rubric_grader_state,
         _rubric_interrupt_on,
         _WebSearchBudgetMiddleware,
     )
@@ -3396,6 +3456,7 @@ def create_cli_agent(
             persist_model_state=False,
             cli_max_retries=cli_max_retries,
             strict_model_resolution=True,
+            environ=environment,
         ),
         # Both clients filter this nested message stream. A transient fault can
         # safely retry the failed model node without replaying grader tools.
@@ -3463,6 +3524,9 @@ def create_cli_agent(
             "tools": grader_tools,
             "grader_middleware": grader_middleware,
             "grader_context_schema": CLIContextSchema,
+            "grader_state_schema": RubricGraderState,
+            "prepare_messages_for_grader": _rubric_grader_messages,
+            "build_grader_state": _rubric_grader_state,
             # The bootstrap only scaffolds the runtime grader's graph;
             # `ConfigurableModelMiddleware` swaps in the thread-selected model
             # before any call. Pass the main model through even as an
@@ -3511,19 +3575,25 @@ def create_cli_agent(
         from deepagents_code.extensions.hosting import ExtensionRuntimeMiddleware
 
         agent_middleware.append(ExtensionRuntimeMiddleware(extension_registry))
-    agent = create_deep_agent(
-        model=model,
-        system_prompt=system_prompt,
-        tools=tools,
-        backend=composite_backend,
-        middleware=agent_middleware,
-        interrupt_on=interrupt_on,
-        context_schema=CLIContextSchema,
-        checkpointer=checkpointer,
-        store=store,
-        subagents=all_subagents or None,
-        name=_sanitize_agent_message_name(assistant_id),
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="The feature `forked subagents` is in beta",
+            category=Warning,
+        )
+        agent = create_deep_agent(
+            model=model,
+            system_prompt=system_prompt,
+            tools=tools,
+            backend=composite_backend,
+            middleware=agent_middleware,
+            interrupt_on=interrupt_on,
+            context_schema=CLIContextSchema,
+            checkpointer=checkpointer,
+            store=store,
+            subagents=all_subagents or None,
+            name=_sanitize_agent_message_name(assistant_id),
+        )
     if effective_recursion_limit is not None:
         # `Pregel.with_config` uses `merge_configs`, which discards a value equal
         # to LangGraph's environment-derived default. Replace the copied graph's

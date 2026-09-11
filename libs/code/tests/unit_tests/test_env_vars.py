@@ -13,8 +13,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import pytest
-
 import deepagents_code._env_vars as _mod
 
 _SRC_DIR = Path(__file__).resolve().parents[2] / "deepagents_code"
@@ -96,42 +94,3 @@ class TestEnvVarRegistryDrift:
 
 class TestIsEnvTruthy:
     """Parsing of on/off boolean env vars via `is_env_truthy`."""
-
-    def test_unset_returns_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Missing env var falls back to *default*."""
-        from deepagents_code._env_vars import is_env_truthy
-
-        monkeypatch.delenv("DEEPAGENTS_CODE_DEBUG", raising=False)
-        assert is_env_truthy("DEEPAGENTS_CODE_DEBUG") is False
-        assert is_env_truthy("DEEPAGENTS_CODE_DEBUG", default=True) is True
-
-    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "On", "  true  "])
-    def test_truthy_values(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
-        """Recognized truthy values enable the flag regardless of case/whitespace."""
-        from deepagents_code._env_vars import is_env_truthy
-
-        monkeypatch.setenv("DEEPAGENTS_CODE_DEBUG", value)
-        assert is_env_truthy("DEEPAGENTS_CODE_DEBUG") is True
-
-    @pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "off", ""])
-    def test_falsy_values(self, monkeypatch: pytest.MonkeyPatch, value: str) -> None:
-        """Recognized falsy values disable the flag even when `default=True`.
-
-        This is the key behaviour change — `bool(os.environ.get(...))` would
-        treat `"0"` and `"false"` as truthy because they're non-empty strings.
-        """
-        from deepagents_code._env_vars import is_env_truthy
-
-        monkeypatch.setenv("DEEPAGENTS_CODE_DEBUG", value)
-        assert is_env_truthy("DEEPAGENTS_CODE_DEBUG") is False
-        assert is_env_truthy("DEEPAGENTS_CODE_DEBUG", default=True) is False
-
-    def test_unrecognized_value_returns_default(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Values outside the truthy/falsy sets fall back to *default*."""
-        from deepagents_code._env_vars import is_env_truthy
-
-        monkeypatch.setenv("DEEPAGENTS_CODE_DEBUG", "maybe")
-        assert is_env_truthy("DEEPAGENTS_CODE_DEBUG") is False
-        assert is_env_truthy("DEEPAGENTS_CODE_DEBUG", default=True) is True

@@ -21,6 +21,7 @@ from deepagents.backends.protocol import FileData, FileInfo as _FileInfo, GrepMa
 logger = logging.getLogger(__name__)
 
 EMPTY_CONTENT_WARNING = "System reminder: File exists but has empty contents"
+EMPTY_OLD_STRING_ERROR = "Error: old_string cannot be empty. Provide the exact text to replace."
 
 
 class InvalidGlobPatternError(ValueError):
@@ -534,6 +535,9 @@ def perform_string_replacement(
     Returns:
         Tuple of `(new_content, occurrences)` on success, or error message string
     """
+    if not old_string:
+        return EMPTY_OLD_STRING_ERROR
+
     occurrences = content.count(old_string)
 
     if occurrences == 0:
@@ -584,14 +588,19 @@ def truncate_if_too_long(result: str) -> str: ...
 
 def truncate_if_too_long(result: list[str] | str) -> list[str] | str:
     """Truncate list or string result if it exceeds token limit (rough estimate: 4 chars/token)."""
+    limit = TOOL_RESULT_TOKEN_LIMIT * 4
     if isinstance(result, list):
-        total_chars = sum(len(item) for item in result)
-        if total_chars > TOOL_RESULT_TOKEN_LIMIT * 4:
-            return result[: len(result) * TOOL_RESULT_TOKEN_LIMIT * 4 // total_chars] + [TRUNCATION_GUIDANCE]  # noqa: RUF005  # Concatenation preferred for clarity
+        # Callers render the list with `str()`, so each item costs its repr plus ", ".
+        budget = limit - len(repr(TRUNCATION_GUIDANCE)) - 2
+        used = 0
+        for kept, item in enumerate(result):
+            used += len(repr(item)) + 2
+            if used > budget:
+                return result[:kept] + [TRUNCATION_GUIDANCE]  # noqa: RUF005  # Concatenation preferred for clarity
         return result
     # string
-    if len(result) > TOOL_RESULT_TOKEN_LIMIT * 4:
-        return result[: TOOL_RESULT_TOKEN_LIMIT * 4] + "\n" + TRUNCATION_GUIDANCE
+    if len(result) > limit:
+        return result[: limit - len(TRUNCATION_GUIDANCE) - 1] + "\n" + TRUNCATION_GUIDANCE
     return result
 
 
@@ -860,7 +869,8 @@ def _glob_search_files(
         relative = _relative_to_root(file_path, normalized_path)
 
         if matcher(relative):
-            matches.append((file_path, file_data["modified_at"]))
+            # `modified_at` is NotRequired on `FileData`; undated files sort last.
+            matches.append((file_path, file_data.get("modified_at", "")))
 
     matches.sort(key=lambda x: x[1], reverse=True)
 

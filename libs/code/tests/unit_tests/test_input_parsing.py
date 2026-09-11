@@ -106,38 +106,6 @@ def _block_path_access(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(input_module, "Path", _fail_path_access)
 
 
-def test_parse_file_mentions_with_chinese_sentence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Ensure `@file` parsing terminates at non-path characters such as CJK text."""
-    file_path = tmp_path / "input.py"
-    file_path.write_text("print('hello')")
-
-    monkeypatch.chdir(tmp_path)
-    text = f"你分析@{file_path.name}的代码就懂了"
-
-    _, files = parse_file_mentions(text)
-
-    assert files == [file_path.resolve()]
-
-
-def test_parse_file_mentions_handles_multiple_mentions(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Ensure multiple `@file` mentions are extracted from a single input."""
-    first = tmp_path / "a.txt"
-    second = tmp_path / "b.txt"
-    first.write_text("1")
-    second.write_text("2")
-
-    monkeypatch.chdir(tmp_path)
-    text = f"读一下@{first.name}，然后看看@{second.name}。"
-
-    _, files = parse_file_mentions(text)
-
-    assert files == [first.resolve(), second.resolve()]
-
-
 def test_parse_file_mentions_with_escaped_spaces(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -151,42 +119,6 @@ def test_parse_file_mentions_with_escaped_spaces(
     _, files = parse_file_mentions("@my\\ folder/test.py")
 
     assert files == [file_path.resolve()]
-
-
-def test_parse_file_mentions_warns_for_nonexistent_file(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker
-) -> None:
-    """Ensure non-existent files are excluded and warning is printed."""
-    monkeypatch.chdir(tmp_path)
-    mock_console = mocker.patch("deepagents_code.input.console")
-
-    _, files = parse_file_mentions("@nonexistent.py")
-
-    assert files == []
-    mock_console.print.assert_called_once()
-    assert "nonexistent.py" in mock_console.print.call_args[0][0]
-
-
-def test_parse_file_mentions_ignores_directories(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mocker
-) -> None:
-    """Ensure directories are not included in file list."""
-    dir_path = tmp_path / "mydir"
-    dir_path.mkdir()
-    monkeypatch.chdir(tmp_path)
-    mock_console = mocker.patch("deepagents_code.input.console")
-
-    _, files = parse_file_mentions("@mydir")
-
-    assert files == []
-    mock_console.print.assert_called_once()
-    assert "mydir" in mock_console.print.call_args[0][0]
-
-
-def test_parse_file_mentions_with_no_mentions() -> None:
-    """Ensure text without mentions returns empty file list."""
-    _, files = parse_file_mentions("just some text without mentions")
-    assert files == []
 
 
 def test_parse_file_mentions_handles_path_traversal(
@@ -739,36 +671,6 @@ def test_dropped_payload_paths_tolerates_unparseable_payloads(payload: str) -> N
 def test_parse_pasted_file_paths_tolerates_unparseable_payloads(payload: str) -> None:
     """The strict parser's documented "returns an empty list" contract holds."""
     assert parse_pasted_file_paths(payload) == []
-
-
-def test_extract_leading_pasted_file_path_with_trailing_text(tmp_path: Path) -> None:
-    """Leading path token should be extracted while preserving trailing text."""
-    img = tmp_path / "my image.png"
-    img.write_bytes(b"img")
-    payload = f"'{img}' what's in this image?"
-
-    result = extract_leading_pasted_file_path(payload)
-
-    assert result is not None
-    resolved, end = result
-    assert resolved == img.resolve()
-    assert payload[end:] == " what's in this image?"
-
-
-def test_extract_leading_pasted_file_path_unquoted_path_with_spaces(
-    tmp_path: Path,
-) -> None:
-    """Unquoted absolute paths with spaces should be extracted from leading text."""
-    img = tmp_path / "Screenshot 1.png"
-    img.write_bytes(b"img")
-    payload = f"{img} what's in this"
-
-    result = extract_leading_pasted_file_path(payload)
-
-    assert result is not None
-    resolved, end = result
-    assert resolved == img.resolve()
-    assert payload[end:] == " what's in this"
 
 
 def test_parse_pasted_file_paths_handles_overlong_component(

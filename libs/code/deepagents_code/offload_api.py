@@ -8,6 +8,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from ipaddress import ip_address
 from typing import TYPE_CHECKING, Any, Literal, cast
 from weakref import WeakValueDictionary
@@ -32,18 +33,27 @@ from deepagents_code.offload_middleware import (
     _archive_lock,
     unchanged_offload_result,
 )
-from deepagents_code.server_graph import get_server_runtime
+from deepagents_code.server_graph import _workspace_runtime as get_server_runtime
+from deepagents_code.workspace import (
+    WorkspaceConflictError,
+    bind_thread_workspace,
+    get_thread_workspace,
+    require_thread_workspace,
+)
 
 if TYPE_CHECKING:
     from langchain_core.runnables import RunnableConfig
     from starlette.requests import Request
 
+    from deepagents_code._server_config import ServerConfig
     from deepagents_code.cost_tracking import PreparedOperationCost
+    from deepagents_code.mcp_tools import MCPServerInfo
     from deepagents_code.offload_middleware import (
         OffloadExecution,
         OffloadResponse,
         _OffloadState,
     )
+    from deepagents_code.workspace import WorkspaceBinding
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +86,16 @@ _TRACE_FLUSH_TIMEOUT = 2.0
 """Seconds allowed for the shutdown trace flush."""
 _TRACE_FLUSH_POLL_INTERVAL = 0.05
 """Seconds between completion checks while the daemon flush thread runs."""
+_WORKSPACE_REQUEST_FIELDS = frozenset(
+    {"config_fingerprint", "cwd", "validate_only", "workspace_config"}
+)
+"""Every field a workspace bind request may carry.
+
+One of the allowlists that gate this trust boundary; an unknown key is rejected
+rather than ignored, so a client cannot smuggle policy past the claim check.
+Declared here, beside the other request-shape constants, so the set of gates is
+visible in one place.
+"""
 
 
 def _run_trace_flush(done: threading.Event, failures: list[BaseException]) -> None:
@@ -161,6 +181,166 @@ async def _lifespan(_app: Starlette) -> AsyncIterator[None]:
             await shutdown_server_extensions()
         finally:
             await _flush_traces()
+
+
+def _runtime_unavailable_detail(consequence: str) -> str:
+    """Describe a contained runtime-build failure for a client response.
+
+    `_make_graphs` exits on sandbox construction failure. That barrier is right
+    at graph-load time; in request scope it would take the server down for every
+    thread, so each request-scoped caller contains the `SystemExit` and reports
+    this instead.
+
+    Args:
+        consequence: What the caller cannot do, phrased to follow "so".
+
+    Returns:
+        The shared detail message, pointing the operator at the server log.
+    """
+    return (
+        f"The server could not build its agent runtime, so {consequence}. "
+        "Check the server log for the startup failure."
+    )
+
+
+def _mcp_server_info_payload(
+    server_info: list[MCPServerInfo] | None,
+) -> list[dict[str, Any]] | None:
+    return None if server_info is None else [asdict(server) for server in server_info]
+
+
+async def workspace(request: Request) -> JSONResponse:
+    """Create or verify the durable workspace assigned to a thread.
+
+    Returns:
+        A validated workspace descriptor and its MCP metadata, or an error.
+    """
+    thread_id = request.path_params["thread_id"]
+    body = await request.json()
+    if not isinstance(body, dict):
+        return JSONResponse(
+            {"detail": "request body must be an object"}, status_code=422
+        )
+    try:
+        from deepagents_code._server_config import (
+            PROJECT_WORKSPACE_FIELDS,
+            ServerConfig,
+        )
+        from deepagents_code.workspace import resolve_workspace
+
+        if unknown := body.keys() - _WORKSPACE_REQUEST_FIELDS:
+            names = ", ".join(sorted(unknown))
+            return JSONResponse(
+                {"detail": f"unknown workspace request field(s): {names}"},
+                status_code=422,
+            )
+        server_config = ServerConfig.from_env()
+
+        def _resolve() -> tuple[WorkspaceBinding, ServerConfig]:
+            identity = resolve_workspace(body.get("cwd"))
+            return identity, server_config.resolve_workspace(
+                identity.cwd,
+                identity.project_root,
+            )
+
+        identity, trusted = await asyncio.to_thread(_resolve)
+        if "workspace_config" in body or "config_fingerprint" in body:
+            claim = body.get("workspace_config")
+            if not isinstance(claim, dict):
+                return JSONResponse(
+                    {"detail": "workspace_config must be an object"},
+                    status_code=422,
+                )
+            if claim.keys() & PROJECT_WORKSPACE_FIELDS:
+                return JSONResponse(
+                    {"detail": "clients cannot claim project workspace policy"},
+                    status_code=409,
+                )
+            claimed_config_fingerprint = body.get("config_fingerprint")
+            if (
+                claimed_config_fingerprint != trusted.session_workspace_fingerprint()
+                or claim != trusted.to_session_workspace_claim()
+            ):
+                return JSONResponse(
+                    {"detail": "workspace configuration does not match server policy"},
+                    status_code=409,
+                )
+        existing = await get_thread_workspace(thread_id)
+        if existing is not None and existing.workspace_id == identity.workspace_id:
+            trusted = trusted.preserve_bound_extension_trust(
+                existing.workspace_config()
+            )
+        proposed = await asyncio.to_thread(
+            resolve_workspace,
+            identity.cwd,
+            trusted.to_workspace_payload(),
+            config_fingerprint=trusted.workspace_fingerprint(),
+        )
+        validate_only = body.get("validate_only", False)
+        if not isinstance(validate_only, bool):
+            return JSONResponse(
+                {"detail": "validate_only must be a boolean"}, status_code=422
+            )
+        if validate_only:
+            binding = proposed
+        else:
+            binding = await bind_thread_workspace(
+                thread_id,
+                identity.cwd,
+                trusted.to_workspace_payload(),
+                config_fingerprint=trusted.workspace_fingerprint(),
+            )
+    except (TypeError, ValueError) as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=422)
+    except WorkspaceConflictError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=409)
+
+    # Build the runtime here so a refusal reaches the client as a 409 before any
+    # thread state exists. This is its own block: request validation above maps
+    # `ValueError` to 422, but a `ValueError` out of the runtime build is server
+    # misconfiguration, not a malformed request.
+    try:
+        runtime = await get_server_runtime(binding)
+    except WorkspaceConflictError as exc:
+        return JSONResponse({"detail": str(exc)}, status_code=409)
+    except SystemExit:
+        logger.exception("Workspace runtime build failed for thread %s", thread_id)
+        detail = _runtime_unavailable_detail("this workspace cannot be used")
+        return JSONResponse({"detail": detail}, status_code=503)
+
+    if not validate_only:
+        client = _thread_client()
+        metadata = {
+            "cwd": binding.cwd,
+            "dcode_workspace_id": binding.workspace_id,
+            "dcode_workspace_generation": binding.generation,
+        }
+        try:
+            await client.threads.create(
+                thread_id=thread_id,
+                if_exists="do_nothing",
+                metadata=metadata,
+                graph_id="agent",
+            )
+            await client.threads.update(thread_id, metadata=metadata)
+        except Exception:
+            logger.exception(
+                "Failed to mirror workspace metadata for thread %s", thread_id
+            )
+            return JSONResponse(
+                {
+                    "detail": (
+                        "Workspace was bound but thread metadata could not be updated."
+                    )
+                },
+                status_code=503,
+            )
+    return JSONResponse(
+        {
+            "workspace": binding.to_payload(),
+            "mcp_server_info": _mcp_server_info_payload(runtime.mcp_server_info),
+        }
+    )
 
 
 def _extensions(request: Request) -> JSONResponse:
@@ -249,9 +429,9 @@ class _OffloadConflictError(RuntimeError):
 class _OffloadUnavailableError(RuntimeError):
     """The server runtime could not be built, so no operation can run.
 
-    `get_server_runtime` converts a construction failure into a startup-error
-    marker and `sys.exit(1)`. That barrier was written for the `langgraph.json`
-    graph factory, where exiting is right; reached from a request handler it
+    Runtime construction can emit a startup-error marker and `sys.exit(1)`.
+    That barrier was written for the `langgraph.json` graph factory, where
+    exiting is right; reached from a request handler it
     would kill the server process mid-request, and `SystemExit` is a
     `BaseException`, so the route's own handler could not turn it into a
     response. Server-owned offload cannot run without that runtime, so report
@@ -284,7 +464,11 @@ _CONTEXT_STR_OR_NONE_FIELDS = (
     "hooks_snapshot_id",
     "prompt_id",
 )
-_CONTEXT_DICT_FIELDS = ("model_params", "profile_overrides")
+_CONTEXT_DICT_FIELDS = (
+    "model_params",
+    "profile_overrides",
+    "workspace",
+)
 
 _TRANSPORT_MODEL_PARAM_KEYS = frozenset(
     {
@@ -823,6 +1007,13 @@ async def _execute_offload(
         checkpoint_id = _checkpoint_id(before)
         context = _checkpoint_model_context(context, state)
         context["thread_id"] = thread_id
+        try:
+            binding = await require_thread_workspace(
+                thread_id,
+                context.get("workspace"),
+            )
+        except (TypeError, ValueError, WorkspaceConflictError) as exc:
+            raise _OffloadConflictError(str(exc)) from exc
         namespace = f"dcode_offload:{operation_id}"
         info = ExecutionInfo(
             checkpoint_id=checkpoint_id,
@@ -832,12 +1023,15 @@ async def _execute_offload(
             run_id=operation_id,
         )
         try:
-            server = await get_server_runtime()
+            schema = CLIContextSchema.from_payload(context)
+            if schema is None:
+                msg = "Offload requires workspace runtime context."
+                raise _OffloadConflictError(msg)
+            server = await get_server_runtime(binding)
+        except WorkspaceConflictError as exc:
+            raise _OffloadConflictError(str(exc)) from exc
         except SystemExit as exc:
-            msg = (
-                "The server could not build its agent runtime, so /offload is "
-                "unavailable. Check the server log for the startup failure."
-            )
+            msg = _runtime_unavailable_detail("/offload is unavailable")
             raise _OffloadUnavailableError(msg) from exc
         runtime = Runtime[CLIContextSchema](
             context=cast("CLIContextSchema", context),
@@ -1042,6 +1236,11 @@ async def cancel_offload(request: Request) -> JSONResponse:
 app = Starlette(
     lifespan=_lifespan,
     routes=[
+        Route(
+            "/dcode/threads/{thread_id:str}/workspace",
+            workspace,
+            methods=["POST"],
+        ),
         Route(
             "/dcode/threads/{thread_id:str}/offload",
             offload,

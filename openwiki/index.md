@@ -4,8 +4,7 @@ okf_version: "0.2"
 
 # Files
 
-- [Quickstart & Wiki Map](quickstart.md) - Repository orientation for the independently versioned Deep Agents packages and a task-routing map for SDK work, dcode, ACP, evaluations, operations, and tests. Use this page to choose an owning package and detailed guide before changing behavior.
-- [Runtime Behavior & Findings](runtime-behavior.md) - Source-grounded operational behavior for dcode and the Deep Agents SDK, with explicit separation between code-derived checks and trace observations. Covers execution limits, recoverable tool behavior, accounting, context compaction, and model retries.
+- [Repository Quickstart](quickstart.md) - Route Deep Agents maintainer work to the SDK, dcode product, ACP bridge, Talon host, evaluation suite, partner integrations, and their focused architecture, workflow, operations, and test guides.
 
 # Directories
 
