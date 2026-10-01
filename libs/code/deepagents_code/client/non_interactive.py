@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import threading
 import time
@@ -29,6 +30,7 @@ from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from functools import wraps
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 from langchain.agents.middleware.human_in_the_loop import ActionRequest, HITLRequest
@@ -115,7 +117,6 @@ from deepagents_code.unicode_security import (
 if TYPE_CHECKING:
     from asyncio.subprocess import Process
     from collections.abc import Awaitable, Callable, Hashable, Mapping
-    from pathlib import Path
     from uuid import UUID
 
     from deepagents import FsToolName
@@ -310,11 +311,14 @@ class _ConsoleSpinner:
 
 async def _start_startup_process(
     command: str,
+    *,
+    env: dict[str, str] | None = None,
 ) -> tuple[Process, _WindowsJobObject | None, _PosixOwnerGuard | None]:
     """Start a shell command in an owned process tree.
 
     Args:
         command: Shell command to execute.
+        env: Environment for the process. Defaults to the current environment.
 
     Returns:
         The subprocess and its platform ownership handle, when applicable.
@@ -329,12 +333,13 @@ async def _start_startup_process(
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
             creationflags=_WINDOWS_CREATE_SUSPENDED,
         )
         windows_job = await _assign_windows_job_and_resume(proc)
         return proc, windows_job, None
 
-    proc, owner_guard = await _start_posix_shell_process(command)
+    proc, owner_guard = await _start_posix_shell_process(command, env=env)
     return proc, None, owner_guard
 
 
@@ -752,14 +757,14 @@ class StreamState:
     )
     """Requests already counted in this headless run.
 
-    Keyed by message ID, or by `(attempt_scope, message_id)` while a model
-    attempt lifecycle scope is open (see `UsageLedgerKey`). Monotonic across
+    Keyed by `ModelInvocationKey` when known, with `MessageUsageKey` aliases or
+    fallbacks scoped to the model attempt (see `UsageLedgerKey`). Monotonic across
     HITL resume passes so a replayed message does not add its request, tokens,
     or cost to `stats` again. Each pass closes its entries via
     `finalize_recorded_requests`, which is what extends that guarantee to
     replayed *chunks* -- an open chunked request accepts revisions, so without
     the round boundary a replayed chunk would merge into it a second time -- and
-    which also projects each scoped key down to its bare message ID, since a
+    which also exposes unscoped message aliases, since a
     resume pass replays with no attempt scope open.
     """
 
@@ -2365,6 +2370,9 @@ async def _run_agent_loop(
         spinner=spinner,
         show_rubric_iterations=show_rubric_iterations,
     )
+    state.stats.record_invocation(
+        runtime_state.model_name or "", runtime_state.model_provider or ""
+    )
     user_msg: dict[str, Any] = {"role": "user", "content": message}
     if message_kwargs:
         user_msg.update(message_kwargs)
@@ -2741,7 +2749,14 @@ async def _run_startup_command(
         console.print(Text(f"Running startup command: {command}", style="dim"))
 
     try:
-        proc, windows_job, posix_owner_guard = await _start_startup_process(command)
+        from deepagents_code.config import restore_user_langsmith_env
+
+        shell_env = os.environ.copy()
+        restore_user_langsmith_env(shell_env, start_path=Path.cwd())
+        proc, windows_job, posix_owner_guard = await _start_startup_process(
+            command,
+            env=shell_env,
+        )
     except OSError as exc:
         console.print(
             "[yellow]Warning:[/yellow] startup command failed to launch: "

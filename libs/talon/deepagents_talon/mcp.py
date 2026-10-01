@@ -14,16 +14,17 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, cast
 
+from fastmcp.client import Client as FastMCPClient
+from fastmcp.mcp_config import RemoteMCPServer, StdioMCPServer
 from httpx import HTTPError
+from httpx2 import HTTPError as MCPHTTPError
+from langchain_core._api import suppress_langchain_beta_warning
 from langchain_core.tools import InjectedToolCallId, tool
-from langchain_mcp_adapters.client import MultiServerMCPClient
 from mcp.client.auth import OAuthFlowError
-from mcp.shared.exceptions import McpError
-from mcp.types import CallToolResult, TextContent
+from mcp.shared.exceptions import MCPError
 
 from deepagents_talon.authorization import (
     AuthorizationAttempt,
@@ -48,15 +49,21 @@ from deepagents_talon.mcp_config import (
     MCPConfigStore,
     agent_workspace_root,
 )
+from deepagents_talon.mcp_oauth import parse_oauth_config
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 
+    import httpx2
+    from fastmcp.client.transports import ClientTransport
+    from langchain.mcp.elicitation import MCPElicitationResume
     from langchain_core.tools import BaseTool
-    from langchain_mcp_adapters.client import Connection
-    from langchain_mcp_adapters.interceptors import MCPToolCallRequest, MCPToolCallResult
 
     from deepagents_talon.config import TalonConfig
+
+with suppress_langchain_beta_warning():
+    from langchain.mcp import MCPAdapter
+    from langchain.mcp.elicitation import ELICITATION_INTERRUPT_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -315,7 +322,10 @@ class MCPToolProvider:
         reauthenticate: bool = False,
     ) -> dict[str, str]:
         if server_name not in self._oauth_servers:
-            return {"status": "failed"}
+            return {
+                "status": "failed",
+                "message": "Configure this remote MCP server with auth set to oauth, then reload.",
+            }
         attempt = AuthorizationAttempt(terminal=True)
         try:
             path = mcp_config_path(self._config)
@@ -342,16 +352,21 @@ class MCPToolProvider:
         except (
             ExceptionGroup,
             HTTPError,
-            McpError,
+            MCPHTTPError,
+            MCPError,
             OAuthFlowError,
             OSError,
             RuntimeError,
             TimeoutError,
             TypeError,
             ValueError,
-        ):
+        ) as exc:
             if not attempt.completed:
-                return {"status": "failed", "server_name": server_name}
+                return {
+                    "status": "failed",
+                    "server_name": server_name,
+                    "message": format_login_error(exc),
+                }
             logger.debug(
                 "MCP authorization session failed after credentials persisted",
                 exc_info=True,
@@ -391,42 +406,23 @@ async def load_mcp_tools(config: TalonConfig) -> MCPTools:
     infos: list[MCPServerInfo] = []
     for name, server in servers.items():
         transport = _transport_label(server)
-        input_schemas: dict[str, dict[str, object]] = {}
         try:
             connection, transport = await _connection(name, server)
-            client = MultiServerMCPClient(
-                {name: connection},
-                tool_interceptors=[
-                    # Outermost: the authorization layer below still observes the
-                    # raw exception for its own failure bookkeeping, and only what
-                    # escapes it is converted into a model-visible tool error.
-                    _protocol_error_interceptor,
-                    _authorization_interceptor,
-                    partial(
-                        _argument_normalization_interceptor,
-                        input_schemas=input_schemas,
-                    ),
-                ],
-                tool_name_prefix=True,
-                handle_tool_errors=True,
-            )
-            loaded = await asyncio.wait_for(
-                client.get_tools(server_name=name),
-                timeout=_MCP_LOAD_TIMEOUT_SECONDS,
-            )
-            loaded = _filter_tools(name, server, loaded)
-            prefix = f"{name}_"
-            input_schemas.update(
-                {
-                    tool.name.removeprefix(prefix): tool.args_schema
-                    for tool in loaded
-                    if isinstance(tool.args_schema, dict)
+            adapter = MCPAdapter(connection)
+            async with asyncio.timeout(_MCP_LOAD_TIMEOUT_SECONDS):
+                loaded = await adapter.list_tools()
+            for tool in loaded:
+                tool.name = f"{name}_{tool.name}"
+                tool.metadata = {
+                    **(tool.metadata or {}),
+                    "_deepagents_talon_mcp": True,
                 }
-            )
+            loaded = list(_filter_tools(name, server, loaded))
         except (
             ExceptionGroup,
             HTTPError,
-            McpError,
+            MCPHTTPError,
+            MCPError,
             OAuthFlowError,
             OSError,
             RuntimeError,
@@ -438,7 +434,7 @@ async def load_mcp_tools(config: TalonConfig) -> MCPTools:
                 f"MCP server {name!r} needs authentication"
                 if authentication_required
                 else format_login_error(exc)
-                if isinstance(exc, ExceptionGroup)
+                if isinstance(exc, (ExceptionGroup, HTTPError, MCPHTTPError))
                 else str(exc)
             )
             logger.warning("MCP server %s failed to load: %s", name, error)
@@ -503,8 +499,7 @@ async def login_mcp_server(
         if transport not in {"sse", "streamable_http"}:
             msg = f"MCP server {server_name!r} does not use a remote transport"
             raise MCPConfigError(msg)
-        client = MultiServerMCPClient({server_name: connection})
-        await _open_mcp_session(client, server_name)
+        await _open_mcp_session(FastMCPClient(connection))
     except DeviceAuthorizationCompletedError:
         pass
     except ExceptionGroup as group:
@@ -527,7 +522,8 @@ async def login_mcp_server(
             )
     except (
         HTTPError,
-        McpError,
+        MCPHTTPError,
+        MCPError,
         OAuthFlowError,
         OSError,
         RuntimeError,
@@ -541,8 +537,26 @@ async def login_mcp_server(
     return 0
 
 
-async def _open_mcp_session(client: MultiServerMCPClient, server_name: str) -> None:
-    async with client.session(server_name):
+def _cancel_mcp_elicitation(value: object) -> MCPElicitationResume | None:
+    """Cancel MCP input requests until Talon provides an elicitation UI."""
+    if not isinstance(value, dict) or value.get("type") != ELICITATION_INTERRUPT_TYPE:
+        return None
+    requests = value.get("requests")
+    if not isinstance(requests, list) or not requests:
+        msg = "MCP elicitation interrupt has no requests"
+        raise ValueError(msg)
+    response: MCPElicitationResume = {"responses": {}}
+    for request in requests:
+        key = request.get("key") if isinstance(request, dict) else None
+        if not isinstance(key, str) or not key or key in response["responses"]:
+            msg = "MCP elicitation interrupt has invalid request keys"
+            raise ValueError(msg)
+        response["responses"][key] = {"action": "cancel"}
+    return response
+
+
+async def _open_mcp_session(client: FastMCPClient[ClientTransport]) -> None:
+    async with client:
         pass
 
 
@@ -560,78 +574,8 @@ async def _open_authenticated_session(
     )
     if transport not in {"sse", "streamable_http"}:
         return False
-    client = MultiServerMCPClient({server_name: connection})
-    await _open_mcp_session(client, server_name)
+    await _open_mcp_session(FastMCPClient(connection))
     return True
-
-
-async def _protocol_error_interceptor(
-    request: MCPToolCallRequest,
-    handler: Callable[[MCPToolCallRequest], Awaitable[MCPToolCallResult]],
-) -> MCPToolCallResult:
-    """Report MCP protocol errors to the model instead of failing the turn.
-
-    `handle_tool_errors=True` only covers execution errors the server reports as
-    `CallToolResult(isError=True)`; langchain-mcp-adapters deliberately raises its
-    `ToolException` subclass for those alone. A JSON-RPC protocol error such as
-    invalid-params instead raises `McpError`, which is a plain `Exception` and so
-    reaches LangGraph's `ToolNode`, whose default handler re-raises anything that
-    is not a `ToolInvocationError`. That aborts the whole agent turn -- and a
-    scheduled job records `last_status: error` -- without the model ever seeing
-    why, so it cannot retry without the rejected arguments.
-
-    Converting the error to an `isError=True` result puts it back on the path the
-    adapter already handles, producing a `ToolMessage` with `status="error"`.
-
-    Only the server's `code` and `message` are forwarded. The optional `data`
-    payload is dropped: it is unbounded server-controlled content that would be
-    injected into model context, and it carries no argument detail the model
-    needs to correct the call.
-    """
-    try:
-        return await handler(request)
-    except McpError as exc:
-        logger.debug(
-            "MCP protocol error from server %s calling %s",
-            request.server_name,
-            request.name,
-            exc_info=True,
-        )
-        return CallToolResult(
-            isError=True,
-            content=[
-                TextContent(
-                    type="text",
-                    text=(
-                        f"MCP server {request.server_name!r} rejected this call to "
-                        f"{request.name!r} with protocol error {exc.error.code}: "
-                        f"{exc.error.message}"
-                    ),
-                )
-            ],
-        )
-
-
-async def _authorization_interceptor(
-    request: MCPToolCallRequest,
-    handler: Callable[[MCPToolCallRequest], Awaitable[MCPToolCallResult]],
-) -> MCPToolCallResult:
-    """Bind OAuth prompts to the exact LangGraph MCP tool invocation."""
-    invocation_id = getattr(request.runtime, "tool_call_id", None)
-    normalized_id = invocation_id if isinstance(invocation_id, str) and invocation_id else None
-    return await _run_authorized(normalized_id, lambda: handler(request))
-
-
-async def _argument_normalization_interceptor(
-    request: MCPToolCallRequest,
-    handler: Callable[[MCPToolCallRequest], Awaitable[MCPToolCallResult]],
-    *,
-    input_schemas: Mapping[str, dict[str, object]],
-) -> MCPToolCallResult:
-    schema = input_schemas.get(request.name)
-    arguments = _normalize_mcp_arguments(request.args, schema)
-    normalized = request if arguments == request.args else request.override(args=arguments)
-    return await handler(normalized)
 
 
 def _normalize_mcp_arguments(
@@ -687,7 +631,7 @@ async def _run_authorized[AuthorizedResult](
             raise
         if attempt.binding is not None:
             await _finish_authorization(attempt, reason=_authorization_failure_reason(exc))
-            msg = "MCP authorization failed"
+            msg = format_login_error(exc)
             raise MCPAuthorizationError(msg) from None
         raise
     else:
@@ -816,7 +760,7 @@ async def _connection(
     interactive: bool = False,
     channel_authorization: bool = False,
     force_authorization: bool = False,
-) -> tuple[Connection, str]:
+) -> tuple[ClientTransport, str]:
     raw_transport = server.get("transport", server.get("type"))
     if raw_transport is None:
         raw_transport = "stdio" if "command" in server else "http"
@@ -851,7 +795,7 @@ def _transport_label(server: Mapping[str, object]) -> str:
     return raw.replace("-", "_") if isinstance(raw, str) else "unknown"
 
 
-def _stdio_connection(name: str, server: Mapping[str, object]) -> Connection:
+def _stdio_connection(name: str, server: Mapping[str, object]) -> ClientTransport:
     command = server.get("command")
     args = server.get("args", [])
     values = server.get("env")
@@ -863,14 +807,10 @@ def _stdio_connection(name: str, server: Mapping[str, object]) -> Connection:
         raise MCPConfigError(msg)
     if values is not None:
         _validate_stdio_env(name, values)
-    connection: dict[str, object] = {
-        "transport": "stdio",
-        "command": command,
-        "args": args,
-    }
+    config: dict[str, object] = {"command": command, "args": args, "keep_alive": False}
     if values is not None:
-        connection["env"] = values
-    return cast("Connection", connection)
+        config["env"] = values
+    return StdioMCPServer.model_validate(config).to_transport()
 
 
 def _validate_stdio_env(name: str, values: object) -> None:
@@ -893,7 +833,7 @@ async def _remote_connection(  # noqa: PLR0913  # keeps distinct OAuth modes exp
     interactive: bool = False,
     channel_authorization: bool = False,
     force_authorization: bool = False,
-) -> Connection:
+) -> ClientTransport:
     url = server.get("url")
     headers = server.get("headers")
     if not isinstance(url, str) or not url:
@@ -907,34 +847,40 @@ async def _remote_connection(  # noqa: PLR0913  # keeps distinct OAuth modes exp
     ):
         msg = f"MCP remote server {name!r} headers must contain strings"
         raise MCPConfigError(msg)
-    connection: dict[str, object] = {"transport": transport, "url": url, "timeout": 30.0}
-    if headers is not None:
-        connection["headers"] = headers
+    auth: httpx2.Auth | None = None
     if server.get("auth") == "oauth" or interactive:
         if isinstance(headers, dict) and any(
             isinstance(key, str) and key.lower() == "authorization" for key in headers
         ):
             msg = f"MCP server {name!r} cannot combine OAuth with an Authorization header"
             raise MCPConfigError(msg)
-        storage = (
-            FileTokenStorage(name, server_url=url, force_authorization=True)
-            if force_authorization
-            else FileTokenStorage(name, server_url=url)
+        oauth = parse_oauth_config(server.get("oauth"))
+        storage = FileTokenStorage(
+            name, server_url=url, force_authorization=force_authorization, oauth=oauth
         )
         if not interactive and not channel_authorization and await storage.get_tokens() is None:
             msg = f"MCP server {name!r} needs authentication; run deepagents-talon mcp login {name}"
             raise _MCPLoginRequiredError(msg)
-        await prepare_oauth_login(server_url=url, storage=storage)
-        connection["auth"] = build_oauth_provider(
+        await prepare_oauth_login(server_url=url, storage=storage, oauth=oauth)
+        auth = build_oauth_provider(
             server_name=name,
             server_url=url,
             storage=storage,
             interactive=interactive,
+            oauth=oauth,
         )
     elif server.get("auth") is not None:
         msg = f"MCP server {name!r} uses unsupported auth {server['auth']!r}"
         raise MCPConfigError(msg)
-    return cast("Connection", connection)
+    remote = RemoteMCPServer.model_validate(
+        {
+            "url": url,
+            "transport": "sse" if transport == "sse" else "http",
+            "headers": headers or {},
+        }
+    )
+    remote.auth = auth
+    return remote.to_transport()
 
 
 def _filter_tools(

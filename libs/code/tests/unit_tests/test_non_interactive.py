@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from rich.console import Console
 
 if TYPE_CHECKING:
@@ -112,12 +112,13 @@ def console() -> Console:
     return Console(quiet=True)
 
 
-def test_nested_usage_event_updates_headless_stats(console: Console) -> None:
+def test_mixed_id_usage_counts_once_in_headless_stats(console: Console) -> None:
     state = StreamState(thread_id="thread-1")
     event = {
         "type": "model_usage",
         "version": 1,
         "request_id": "child-1",
+        "invocation_id": "child-run",
         "usage_metadata": {
             "input_tokens": 1_000,
             "output_tokens": 100,
@@ -129,12 +130,23 @@ def test_nested_usage_event_updates_headless_stats(console: Console) -> None:
         "scope": "tools:task",
     }
 
-    _process_stream_chunk(
-        (("tools:task",), "custom", event),
-        state,
-        console,
-        FileOpTracker(assistant_id="assistant"),
+    message = AIMessageChunk(
+        content="",
+        id="lc_run--child-run",
+        usage_metadata={
+            "input_tokens": 1_000,
+            "output_tokens": 100,
+            "total_tokens": 1_100,
+        },
     )
+    deliveries = [
+        (("tools:task",), "messages", (message, {})),
+        (("tools:task",), "custom", event),
+    ]
+    for delivery in deliveries:
+        _process_stream_chunk(
+            delivery, state, console, FileOpTracker(assistant_id="assistant")
+        )
 
     assert state.stats.request_count == 1
     assert state.stats.per_kind["subagent"].request_count == 1
@@ -2372,7 +2384,7 @@ class TestRunStartupCommand:
                 posix_shell_module,
                 "_serialize_environment",
                 return_value=b"environment",
-            ),
+            ) as serialize_environment,
             patch.object(
                 posix_shell_module.asyncio,
                 "create_subprocess_exec",
@@ -2390,10 +2402,12 @@ class TestRunStartupCommand:
             ) = await posix_shell_module._start_posix_shell_process(
                 "printf ready",
                 cwd=str(tmp_path),
+                env={"STARTUP_TEST": "preserved"},
             )
 
         assert started_process is process
         assert started_guard is owner_guard
+        serialize_environment.assert_called_once_with({"STARTUP_TEST": "preserved"})
         assert create_process.call_args.kwargs["start_new_session"] is True
         assert create_process.call_args.kwargs["pass_fds"] == (10, 12)
         assert events == [
@@ -2431,13 +2445,70 @@ class TestRunStartupCommand:
         ):
             await _run_startup_command("sleep 999", console, quiet=False)
 
-        start_process.assert_awaited_once_with("sleep 999")
+        start_process.assert_awaited_once()
+        start_args = start_process.await_args
+        assert start_args is not None
+        assert start_args.args == ("sleep 999",)
+        assert isinstance(start_args.kwargs["env"], dict)
         assert mock_killpg.call_args_list == [
             call(12345, signal.SIGTERM),
             call(12345, 0),
         ]
         mock_proc.kill.assert_not_called()
         assert "timed out" in buf.getvalue()
+
+    async def test_uses_project_langsmith_environment_when_launch_value_absent(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Headless startup commands receive project values, not dcode values."""
+        import json
+
+        import deepagents_code.config as config_mod
+
+        (tmp_path / ".env").write_text("LANGSMITH_API_KEY=project-key\n")
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(
+            config_mod,
+            "_GLOBAL_DOTENV_PATH",
+            tmp_path / "missing-global.env",
+        )
+        launch = dict.fromkeys(config_mod._USER_LANGSMITH_ENV_VARS)
+        carrier = json.dumps({"launch": launch, "user": dict(launch)})
+        monkeypatch.setenv("LANGSMITH_API_KEY", "dcode-key")
+        monkeypatch.setenv("DEEPAGENTS_CODE_LANGSMITH_API_KEY", "prefixed-key")
+        monkeypatch.setenv(config_mod._USER_LANGSMITH_ENV_CARRIER, carrier)
+        monkeypatch.setenv("STARTUP_TEST_UNRELATED", "preserved")
+        mock_proc = MagicMock()
+        mock_proc.communicate = AsyncMock(return_value=(b"startup-output\n", b""))
+        mock_proc.returncode = 0
+        mock_proc.pid = 12345
+        mock_proc._transport = MagicMock()
+        buf = io.StringIO()
+        console = Console(file=buf, width=200, highlight=False)
+
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch.object(
+                non_interactive_module,
+                "_start_startup_process",
+                new=AsyncMock(
+                    return_value=(mock_proc, None, _mock_posix_owner_guard()),
+                ),
+            ) as start_process,
+        ):
+            await _run_startup_command("echo startup-output", console, quiet=False)
+
+        child_env = start_process.call_args.kwargs["env"]
+        assert child_env["LANGSMITH_API_KEY"] == "project-key"
+        assert child_env["STARTUP_TEST_UNRELATED"] == "preserved"
+        assert config_mod._USER_LANGSMITH_ENV_CARRIER not in child_env
+        assert not any(
+            key.startswith("DEEPAGENTS_CODE_LANGSMITH_") for key in child_env
+        )
+        assert os.environ["LANGSMITH_API_KEY"] == "dcode-key"
+        assert "startup-output" in buf.getvalue()
 
     async def test_cancellation_kills_process_group_on_posix(self) -> None:
         """Outer cancellation should still clean up the startup process group."""
@@ -2676,8 +2747,13 @@ class TestRunStartupCommand:
 
         async def start_after_descendant_ready(
             startup_command: str,
+            *,
+            env: dict[str, str] | None = None,
         ) -> tuple[asyncio.subprocess.Process, Any, Any]:
-            proc, windows_job, posix_owner_guard = await real_start(startup_command)
+            proc, windows_job, posix_owner_guard = await real_start(
+                startup_command,
+                env=env,
+            )
             started_processes.append(proc)
             await _wait_for_file(pid_file)
             return proc, windows_job, posix_owner_guard
@@ -2745,8 +2821,13 @@ class TestRunStartupCommand:
 
         async def capture_start(
             startup_command: str,
+            *,
+            env: dict[str, str] | None = None,
         ) -> tuple[asyncio.subprocess.Process, Any, Any]:
-            proc, windows_job, posix_owner_guard = await real_start(startup_command)
+            proc, windows_job, posix_owner_guard = await real_start(
+                startup_command,
+                env=env,
+            )
             started_processes.append(proc)
             return proc, windows_job, posix_owner_guard
 
@@ -2815,8 +2896,13 @@ class TestRunStartupCommand:
 
         async def capture_start(
             startup_command: str,
+            *,
+            env: dict[str, str] | None = None,
         ) -> tuple[asyncio.subprocess.Process, Any, Any]:
-            proc, windows_job, posix_owner_guard = await real_start(startup_command)
+            proc, windows_job, posix_owner_guard = await real_start(
+                startup_command,
+                env=env,
+            )
             started_processes.append(proc)
             return proc, windows_job, posix_owner_guard
 
@@ -5203,8 +5289,8 @@ class TestAttemptLifecycle:
         assert "Retrying model request 1/5" in output.getvalue()
         assert () in state.active_attempts  # scope untouched
 
-    def test_unscoped_usage_remains_legacy(self) -> None:
-        """Without a lifecycle scope, message usage keys stay bare IDs."""
+    def test_unscoped_usage_deduplicates_replayed_messages(self) -> None:
+        """Without a lifecycle scope, replayed messages still count only once."""
         console = Console(quiet=True)
         state = StreamState(thread_id="thread-1")
         tracker = FileOpTracker(assistant_id="assistant")
@@ -5217,7 +5303,11 @@ class TestAttemptLifecycle:
 
         _process_stream_chunk(((), "messages", (msg, {})), state, console, tracker)
 
-        assert list(state.recorded_usage_requests) == ["msg-1"]
+        _process_stream_chunk(((), "messages", (msg, {})), state, console, tracker)
+
+        assert state.stats.request_count == 1
+        assert state.stats.input_tokens == 1
+        assert state.stats.output_tokens == 1
 
     def test_usage_is_scoped_per_attempt(self) -> None:
         """A retry reusing the provider message ID records both attempts."""
@@ -5265,8 +5355,6 @@ class TestAttemptLifecycle:
         # The same provider message ID under a new attempt scope counts again
         # rather than being deduped as a replay.
         assert state.stats.request_count == 2
-        assert len(state.recorded_usage_requests) == 2
-        assert all(isinstance(key, tuple) for key in state.recorded_usage_requests)
 
     def _lifecycle_state(self, tmp_path: Path, **kwargs: Any) -> StreamState:
         transcripts = TranscriptStore(tmp_path / "transcripts")

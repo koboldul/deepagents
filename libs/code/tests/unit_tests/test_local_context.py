@@ -40,6 +40,7 @@ from deepagents_code.local_context import (
     _resolve_path_executable,
     _section_files,
     _section_gh_cli,
+    _section_gh_stack,
     _section_git,
     _section_header,
     _section_makefile,
@@ -1980,6 +1981,43 @@ class TestSectionGhCli:
             in result.stdout
         )
         assert "does not expose `mergedAt`" in result.stdout
+
+
+@skip_win32_remote_bash
+@requires_bash
+class TestSectionGhStack:
+    """Tests for `_section_gh_stack`."""
+
+    def test_surfaces_local_stack_state(self, tmp_path: Path) -> None:
+        _git_init_commit(tmp_path, branch="feature")
+        stack_file = tmp_path / ".git" / "gh-stack"
+        stack_file.write_text('{"stacks":[{"branches":[{"branch":"feature"}]}]}')
+
+        result = subprocess.run(
+            ["/bin/bash", "-c", _section_gh_stack()],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+            check=False,
+        )
+
+        assert result.stderr == ""
+        assert "**GitHub Stack** (local tracking; may be stale):" in result.stdout
+        assert stack_file.read_text() in result.stdout
+
+    def test_omits_missing_stack_state(self, tmp_path: Path) -> None:
+        _git_init_commit(tmp_path, branch="feature")
+
+        result = subprocess.run(
+            ["/bin/bash", "-c", _section_gh_stack()],
+            capture_output=True,
+            text=True,
+            cwd=tmp_path,
+            check=False,
+        )
+
+        assert result.stderr == ""
+        assert "**GitHub Stack**" not in result.stdout
 
 
 @skip_win32_remote_bash

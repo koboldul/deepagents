@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import stat
@@ -9,6 +10,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePath
+from typing import BinaryIO
 
 from deepagents_code._paths import get_deepagents_home
 
@@ -300,6 +302,66 @@ def _history_retention_days() -> int:
     return HISTORY_RETENTION_DAYS_DEFAULT
 
 
+def _open_archive_for_delete(candidate: Path) -> BinaryIO:
+    """Open an archive with delete sharing on Windows.
+
+    Args:
+        candidate: Archive path to open.
+
+    Returns:
+        A binary file object for the archive.
+
+    Raises:
+        OSError: If the archive cannot be opened or wrapped as a file object.
+        WinError: If Windows cannot open the archive with delete sharing.
+    """
+    if not _NATIVE_WINDOWS:
+        return candidate.open("rb")
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    generic_read = 0x80000000
+    share_read_write_delete = 0x1 | 0x2 | 0x4
+    open_existing = 3
+    backup_semantics = 0x02000000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateFileW(
+        str(candidate),
+        generic_read,
+        share_read_write_delete,
+        None,
+        open_existing,
+        backup_semantics,
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except OSError:
+        kernel32.CloseHandle(handle)
+        raise
+    try:
+        return os.fdopen(descriptor, "rb")
+    except OSError:
+        os.close(descriptor)
+        raise
+
+
 def _delete_expired_archive(candidate: Path, archive_dir: Path, cutoff: float) -> bool:
     """Delete one expired regular markdown archive.
 
@@ -324,7 +386,7 @@ def _delete_expired_archive(candidate: Path, archive_dir: Path, cutoff: float) -
     if candidate.parent != archive_dir or candidate.suffix != ".md":
         return False
     try:
-        with candidate.open("rb") as archive_file:
+        with _open_archive_for_delete(candidate) as archive_file:
             info = os.fstat(archive_file.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_mtime >= cutoff:
                 return False
@@ -380,13 +442,64 @@ def sweep_offloaded_history() -> int:
         return 0
 
 
+def _handoff_archive_prefix(thread_id: str) -> str:
+    """Persist source ownership in filenames without embedding paths or globs.
+
+    Returns:
+        The stable filename prefix for this source thread's handoffs.
+    """
+    owner = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()
+    return f"handoff_{owner}_"
+
+
+def _delete_archive(archive_path: Path) -> bool:
+    """Remove one archive, logging filesystem failures for best-effort cleanup.
+
+    Returns:
+        Whether the archive was removed.
+    """
+    try:
+        archive_path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        logger.warning(
+            "Failed to delete offloaded conversation history %s",
+            archive_path,
+            exc_info=True,
+        )
+        return False
+    logger.debug("Deleted offloaded conversation history %s", archive_path)
+    return True
+
+
+def _delete_handoff_archives(archive_dir: Path, thread_id: str) -> bool:
+    """Remove every recovery snapshot owned by the deleted source thread.
+
+    Returns:
+        Whether at least one snapshot was removed.
+    """
+    deleted = False
+    try:
+        for archive in archive_dir.glob(f"{_handoff_archive_prefix(thread_id)}*.md"):
+            deleted = _delete_archive(archive) or deleted
+    except OSError:
+        logger.warning(
+            "Could not list handoff archives for thread %s", thread_id, exc_info=True
+        )
+    return deleted
+
+
 def delete_offloaded_history(thread_id: str) -> bool:
-    """Remove a thread's offloaded conversation-history archive.
+    """Remove a thread's compaction archive and handoff recovery snapshots.
 
     Deletes the per-thread markdown file written by the local-mode
     `conversation_history` backend (`{root}/conversation_history/{thread_id}.md`),
     resolving `root` with `_offload_fallback_root` so the persistent
     `~/.deepagents` location and any temporary fallback are both covered.
+    Handoff snapshots encode their source thread's ownership in their filenames
+    and are removed with that source, including snapshots from failed handoffs.
+    A child summary's recovery link lasts only as long as its source archive.
 
     Best-effort: filesystem failures are logged and swallowed rather than
     raised, so a failed cleanup never blocks thread deletion. Resolving the
@@ -402,7 +515,7 @@ def delete_offloaded_history(thread_id: str) -> bool:
         thread_id: Thread whose offloaded history should be removed.
 
     Returns:
-        `True` only if an archive file was removed. `False` in every other case:
+        `True` if at least one archive file was removed. `False` otherwise:
         an empty or rejected `thread_id`, an unresolvable offload root, a missing
         archive, or an `unlink` failure.
     """
@@ -428,16 +541,5 @@ def delete_offloaded_history(thread_id: str) -> bool:
             thread_id,
         )
         return False
-    try:
-        archive_path.unlink()
-    except FileNotFoundError:
-        return False
-    except OSError:
-        logger.warning(
-            "Failed to delete offloaded conversation history for thread %s",
-            thread_id,
-            exc_info=True,
-        )
-        return False
-    logger.debug("Deleted offloaded conversation history for thread %s", thread_id)
-    return True
+    deleted = _delete_archive(archive_path)
+    return _delete_handoff_archives(archive_dir, thread_id) or deleted

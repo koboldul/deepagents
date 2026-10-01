@@ -7,9 +7,10 @@ Warning:
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, TypeVar, cast
 
-from langchain_core.messages import BaseMessage, convert_to_messages
+from langchain_core.messages import BaseMessage, HumanMessage, convert_to_messages
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.serde.types import _DeltaSnapshot
 
@@ -54,6 +55,7 @@ class ConversationSaver(BaseCheckpointSaver[V]):
         self.checkpointer = checkpointer
         self.archive = archive
         self._lock = asyncio.Lock()
+        self._active_sessions: dict[str, int] = {}
 
     @property
     def config_specs(self) -> list[ConfigurableFieldSpec]:
@@ -79,7 +81,27 @@ class ConversationSaver(BaseCheckpointSaver[V]):
             self.checkpointer.with_allowlist(extra_allowlist), archive=self.archive
         )
         clone._lock = self._lock
+        clone._active_sessions = self._active_sessions
         return clone
+
+    @asynccontextmanager
+    async def protect_session(self, session: str) -> AsyncIterator[None]:
+        """Protect a running graph from conversation-tool deletion.
+
+        Args:
+            session: Trusted graph thread identifier.
+
+        Yields:
+            Control while the session is protected.
+        """
+        async with self._lock:
+            self._active_sessions[session] = self._active_sessions.get(session, 0) + 1
+        try:
+            yield
+        finally:
+            self._active_sessions[session] -= 1
+            if not self._active_sessions[session]:
+                del self._active_sessions[session]
 
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """Read checkpoint state from the backend.
@@ -169,22 +191,38 @@ class ConversationSaver(BaseCheckpointSaver[V]):
         session = str(config["configurable"]["thread_id"])
         if scope is not None:
             await self.archive.append(scope, session, checkpoint["ts"], [])
-            messages = await self._messages(config, checkpoint)
+            parent_id = str(config["configurable"].get("checkpoint_id", ""))
+            acknowledged = await self.archive.checkpoint_acknowledged(session, parent_id)
+            changed = "messages" in new_versions or "messages" not in checkpoint["channel_versions"]
+            # Keep ownership for erasure without archiving a scheduled run's transcript.
+            read_only = config.get("metadata", {}).get("talon_history_read_only") is True
+            messages = (
+                await self._messages(config, checkpoint, acknowledged=acknowledged)
+                if not read_only and (changed or not acknowledged)
+                else []
+            )
         result = await self.checkpointer.aput(config, checkpoint, metadata, new_versions)
         if scope is not None:
             await self.archive.append(scope, session, checkpoint["ts"], messages)
+            await self.archive.acknowledge_checkpoint(session, checkpoint["id"])
         return result
 
-    async def _messages(self, config: RunnableConfig, checkpoint: Checkpoint) -> list[BaseMessage]:
+    async def _messages(
+        self, config: RunnableConfig, checkpoint: Checkpoint, *, acknowledged: bool
+    ) -> list[BaseMessage]:
         messages: list[BaseMessage] = []
+        previous: dict[str, BaseMessage] = {}
         if config["configurable"].get("checkpoint_id"):
             parent = await self.checkpointer.aget_tuple(config)
             if parent is not None:
+                if acknowledged:
+                    snapshot = _messages(parent.checkpoint["channel_values"].get("messages", []))
+                    previous = {message.id: message for message in snapshot if message.id}
                 for _, channel, value in parent.pending_writes or []:
                     if channel == "messages":
                         messages.extend(_messages(value))
         messages.extend(_messages(checkpoint["channel_values"].get("messages", [])))
-        return messages
+        return _changed_messages(messages, previous)
 
     async def aput_writes(
         self,
@@ -233,7 +271,7 @@ class ConversationSaver(BaseCheckpointSaver[V]):
             Deleted IDs and IDs not found in this chat.
 
         Raises:
-            ValueError: If IDs are empty or include the active session.
+            ValueError: If IDs are empty or include an active session.
         """
         if not session_ids or any(not session.strip() for session in session_ids):
             msg = "Provide one or more nonempty session IDs"
@@ -244,6 +282,9 @@ class ConversationSaver(BaseCheckpointSaver[V]):
         result: dict[str, list[str]] = {"deleted": [], "not_found": []}
         async with self._lock:
             owned = set(await self.archive.sessions(scope))
+            if owned.intersection(session_ids, self._active_sessions):
+                msg = "Cannot delete a running conversation; wait for it to finish first"
+                raise ValueError(msg)
             for session in dict.fromkeys(session_ids):
                 if session in owned:
                     await self._delete_session(session)
@@ -280,4 +321,38 @@ def _messages(value: object) -> list[BaseMessage]:
     if isinstance(value, _DeltaSnapshot):
         value = value.value
     values = value if isinstance(value, list) else [value]
-    return convert_to_messages(cast("list[MessageLikeRepresentation]", values))
+    messages = convert_to_messages(cast("list[MessageLikeRepresentation]", values))
+    return [_archive_message(message) for message in messages]
+
+
+def _archive_message(message: BaseMessage) -> BaseMessage:
+    source = message.additional_kwargs.get("talon_history_source")
+    if isinstance(message, HumanMessage):
+        if source is not None:
+            return message
+        source = "unknown"
+    else:
+        if source != "delivered":
+            return message
+        source = "internal"
+    return message.model_copy(
+        update={
+            "additional_kwargs": {
+                **message.additional_kwargs,
+                "talon_history_source": source,
+            }
+        }
+    )
+
+
+def _changed_messages(
+    messages: list[BaseMessage], previous: dict[str, BaseMessage]
+) -> list[BaseMessage]:
+    changed: list[BaseMessage] = []
+    for message in messages:
+        if message.id:
+            if message == previous.get(message.id):
+                continue
+            previous[message.id] = message
+        changed.append(message)
+    return changed

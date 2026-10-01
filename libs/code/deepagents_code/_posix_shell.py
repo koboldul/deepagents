@@ -635,12 +635,14 @@ async def _start_posix_shell_process(
     command: str,
     *,
     cwd: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> tuple[asyncio.subprocess.Process, _PosixOwnerGuard]:
     """Gate shell execution until its independent owner watchdog is active.
 
     Args:
         command: Shell command to execute.
         cwd: Optional working directory for the shell.
+        env: Optional environment for the shell process.
 
     Returns:
         The gated shell process and its armed watchdog ownership handle.
@@ -654,7 +656,7 @@ async def _start_posix_shell_process(
     owner_guard: _PosixOwnerGuard | None = None
 
     try:
-        environment = dict(os.environ)
+        environment = os.environ.copy() if env is None else dict(env)
         environment_payload = _serialize_environment(environment)
         gate_read_fd, gate_write_fd = os.pipe()
         environment_read_fd, environment_write_fd = os.pipe()

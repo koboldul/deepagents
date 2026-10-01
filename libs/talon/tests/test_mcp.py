@@ -3,26 +3,25 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, ClassVar, Self
+from unittest.mock import MagicMock
 
 import anyio
 import pytest
-from langchain_mcp_adapters.interceptors import MCPToolCallRequest
+from fastmcp.client.transports import SSETransport, StreamableHttpTransport
+from httpx2 import ConnectError
+from langchain_core.tools import StructuredTool
 from mcp.client.auth import OAuthFlowError
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
-from mcp.shared.exceptions import McpError
-from mcp.types import CallToolResult, ErrorData
 from pydantic import SecretStr
 
+from deepagents_talon import mcp
 from deepagents_talon.authorization import (
     AuthorizationAttempt,
     AuthorizationBinding,
     AuthorizationCompleted,
     AuthorizationEvent,
-    AuthorizationURL,
-    CallbackURLRequested,
     DeviceCode,
     current_authorization_attempt,
     reset_authorization_handler,
@@ -34,11 +33,8 @@ from deepagents_talon.mcp import (
     MCPServerInfo,
     MCPToolInfo,
     MCPToolProvider,
-    _argument_normalization_interceptor,
-    _authorization_interceptor,
     _connection,
     _normalize_mcp_arguments,
-    _protocol_error_interceptor,
     _run_authorized,
     load_mcp_tools,
     login_mcp_server,
@@ -50,36 +46,38 @@ from deepagents_talon.mcp_auth import (
     MCPAuthorizationError,
     _DeviceCodeResponse,
     _present_device_code,
-    build_oauth_provider,
 )
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from fastmcp.client.transports import ClientTransport
 
-@dataclass(frozen=True)
-class DummyTool:
-    name: str
-    description: str = ""
-    args_schema: dict[str, object] | None = None
+    from deepagents_talon.mcp_oauth import MCPOAuthConfig
 
 
-class FakeMCPClient:
-    calls: ClassVar[list[dict[str, object]]] = []
+class FakeMCPAdapter:
+    connections: ClassVar[list[ClientTransport]] = []
 
-    def __init__(self, connections: dict[str, object], **kwargs: object) -> None:
-        self.connections = connections
-        self.calls.append({"connections": connections, **kwargs})
+    def __init__(self, connection: ClientTransport) -> None:
+        self.connection = connection
+        self.connections.append(connection)
 
-    async def get_tools(self, *, server_name: str | None = None) -> list[DummyTool]:
-        assert server_name is not None
+    async def list_tools(self) -> list[StructuredTool]:
         return [
-            DummyTool(
-                f"{server_name}_read",
-                "Read files",
-                {"type": "object", "properties": {"path": {"type": "string"}}},
+            StructuredTool(
+                name="read",
+                description="Read files",
+                args_schema={"type": "object", "properties": {"path": {"type": "string"}}},
             )
         ]
+
+
+@pytest.fixture(autouse=True)
+def _fake_mcp(monkeypatch: pytest.MonkeyPatch) -> None:
+    FakeMCPAdapter.connections.clear()
+    monkeypatch.setattr(mcp, "FastMCPClient", MagicMock())
+    monkeypatch.setattr(mcp, "MCPAdapter", FakeMCPAdapter)
 
 
 def _oauth_token() -> OAuthToken:
@@ -123,7 +121,9 @@ async def _assert_refresh_scheduled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def load() -> SimpleNamespace:
-        return SimpleNamespace(tools=(DummyTool("refreshed"),))
+        return SimpleNamespace(
+            tools=(StructuredTool(name="refreshed", description="", args_schema={}),)
+        )
 
     monkeypatch.setattr(provider, "load", load)
     refreshed = await provider.refresh_if_needed()
@@ -198,10 +198,8 @@ def test_mcp_config_path_uses_standard_path_or_env_override(
 async def test_load_mcp_tools_uses_standard_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    FakeMCPClient.calls.clear()
     home = tmp_path / "home"
     monkeypatch.setattr("deepagents_talon.mcp.Path.home", lambda: home)
-    monkeypatch.setattr("deepagents_talon.mcp.MultiServerMCPClient", FakeMCPClient)
     _write_config(
         home / ".deepagents" / ".mcp.json",
         {"remote": {"type": "http", "url": "https://example.com/mcp"}},
@@ -209,74 +207,18 @@ async def test_load_mcp_tools_uses_standard_config(
     result = await load_mcp_tools(_config(tmp_path))
 
     assert [tool.name for tool in result.tools] == ["remote_read"]
+    assert result.tools[0].metadata == {
+        "_deepagents_talon_mcp": True,
+    }
     assert [server.name for server in result.servers] == ["remote"]
     assert result.servers[0].tools[0].input_schema == {
         "type": "object",
         "properties": {"path": {"type": "string"}},
     }
-    assert FakeMCPClient.calls[0]["connections"] == {
-        "remote": {
-            "transport": "streamable_http",
-            "url": "https://example.com/mcp",
-            "timeout": 30.0,
-        }
-    }
-
-
-async def test_mcp_interceptor_resumes_same_bound_invocation_without_secret_output(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("deepagents_talon.mcp_auth.Path.home", lambda: tmp_path)
-    storage = FileTokenStorage("notion", server_url="https://mcp.example")
-    provider = build_oauth_provider(
-        server_name="notion",
-        server_url="https://mcp.example",
-        storage=storage,
-        interactive=False,
-    )
-    events: list[AuthorizationEvent] = []
-    callback = "http://localhost:3000/callback?code=secret-code&state=secret-state"
-
-    async def authorize(event: AuthorizationEvent) -> str | None:
-        events.append(event)
-        return callback if isinstance(event, CallbackURLRequested) else None
-
-    async def execute(_request: MCPToolCallRequest) -> CallToolResult:
-        redirect_handler = provider.context.redirect_handler
-        callback_handler = provider.context.callback_handler
-        assert redirect_handler is not None
-        assert callback_handler is not None
-        await redirect_handler("https://auth.example/authorize?state=secret-state")
-        assert await callback_handler() == ("secret-code", "secret-state")
-        await storage.set_tokens(_oauth_token())
-        return CallToolResult(content=[])
-
-    token = set_authorization_handler(authorize)
-    try:
-        result = await _authorization_interceptor(
-            MCPToolCallRequest(
-                name="search",
-                args={},
-                server_name="notion",
-                runtime=SimpleNamespace(tool_call_id="tool-call-42"),
-            ),
-            execute,
-        )
-    finally:
-        reset_authorization_handler(token)
-
-    assert result.content == []
-    assert [event.type for event in events] == [
-        "authorization_url",
-        "callback_url_requested",
-        "completed",
-    ]
-    assert all(event.binding.invocation_id == "tool-call-42" for event in events)
-    assert isinstance(events[0], AuthorizationURL)
-    assert isinstance(events[-1], AuthorizationCompleted)
-    assert "secret-state" not in repr(events[0])
-    assert "secret-code" not in repr(events)
+    connection = FakeMCPAdapter.connections[0]
+    assert isinstance(connection, StreamableHttpTransport)
+    assert connection.url == "https://example.com/mcp"
+    assert connection.headers == {}
 
 
 async def test_github_device_code_is_bound_outside_model_context(
@@ -343,123 +285,6 @@ def test_normalize_mcp_arguments_omits_only_optional_empty_strings() -> None:
     assert arguments == {"query": "", "fetchMode": {}}
 
 
-async def test_protocol_error_interceptor_reports_error_to_model() -> None:
-    """An McpError becomes a failed result instead of aborting the agent turn."""
-    request = MCPToolCallRequest(
-        name="listVulnerabilities",
-        args={"severity": "NOPE"},
-        server_name="vanta",
-    )
-
-    async def execute(_request: MCPToolCallRequest) -> CallToolResult:
-        raise McpError(
-            ErrorData(
-                code=-32602,
-                message="severity must be one of CRITICAL, HIGH, MEDIUM, LOW",
-                data={
-                    "internal_trace": "/srv/vanta/handler.py:81",
-                    "token": "do-not-leak-this-fixture",
-                },
-            )
-        )
-
-    result = await _protocol_error_interceptor(request, execute)
-
-    assert isinstance(result, CallToolResult)
-    assert result.isError is True
-    text = "".join(block.text for block in result.content if block.type == "text")
-    assert "severity must be one of CRITICAL, HIGH, MEDIUM, LOW" in text
-    assert "-32602" in text
-    assert "listVulnerabilities" in text
-    # The unbounded server-controlled `data` payload is never fed to the model.
-    assert "internal_trace" not in text
-    assert "do-not-leak-this-fixture" not in text
-    assert "handler.py" not in text
-
-
-async def test_protocol_error_interceptor_passes_success_through_unchanged() -> None:
-    request = MCPToolCallRequest(name="listVulnerabilities", args={}, server_name="vanta")
-    expected = CallToolResult(content=[])
-
-    async def execute(_request: MCPToolCallRequest) -> CallToolResult:
-        return expected
-
-    assert await _protocol_error_interceptor(request, execute) is expected
-
-
-async def test_protocol_error_interceptor_lets_cancellation_propagate() -> None:
-    """Cancellation must not be converted into a tool result."""
-    request = MCPToolCallRequest(name="listVulnerabilities", args={}, server_name="vanta")
-
-    async def execute(_request: MCPToolCallRequest) -> CallToolResult:
-        raise asyncio.CancelledError
-
-    with pytest.raises(asyncio.CancelledError):
-        await _protocol_error_interceptor(request, execute)
-
-
-async def test_protocol_error_interceptor_keeps_authorization_bookkeeping() -> None:
-    """Nesting order leaves the authorization layer observing the raw McpError.
-
-    `_protocol_error_interceptor` is registered outermost so `_authorization_interceptor`
-    still sees the failure and reports it, rather than being handed a successful-looking
-    result.
-    """
-    request = MCPToolCallRequest(name="listVulnerabilities", args={}, server_name="vanta")
-    events: list[AuthorizationEvent] = []
-
-    async def handler(event: AuthorizationEvent) -> None:
-        events.append(event)
-
-    async def execute(_request: MCPToolCallRequest) -> CallToolResult:
-        raise McpError(ErrorData(code=-32602, message="invalid params"))
-
-    async def authorized(inner: MCPToolCallRequest) -> CallToolResult:
-        return await _authorization_interceptor(inner, execute)
-
-    token = set_authorization_handler(handler)
-    try:
-        result = await _protocol_error_interceptor(request, authorized)
-    finally:
-        reset_authorization_handler(token)
-
-    assert isinstance(result, CallToolResult)
-    assert result.isError is True
-    assert not any(isinstance(event, AuthorizationCompleted) for event in events)
-
-
-async def test_argument_normalization_interceptor_overrides_request_arguments() -> None:
-    request = MCPToolCallRequest(
-        name="listVulnerabilities",
-        args={"severity": "CRITICAL", "integrationId": ""},
-        server_name="vanta",
-    )
-    received: list[MCPToolCallRequest] = []
-    expected = CallToolResult(content=[])
-
-    async def execute(normalized: MCPToolCallRequest) -> CallToolResult:
-        received.append(normalized)
-        return expected
-
-    result = await _argument_normalization_interceptor(
-        request,
-        execute,
-        input_schemas={
-            "listVulnerabilities": {
-                "type": "object",
-                "properties": {
-                    "severity": {"type": "string"},
-                    "integrationId": {"type": "string"},
-                },
-            }
-        },
-    )
-
-    assert result is expected
-    assert received[0].args == {"severity": "CRITICAL"}
-    assert request.args == {"severity": "CRITICAL", "integrationId": ""}
-
-
 async def test_mcp_tool_provider_exposes_only_configured_server_authentication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -500,7 +325,9 @@ async def test_mcp_tool_provider_exposes_only_configured_server_authentication(
         "title": "Reauthenticate",
         "type": "boolean",
     }
-    assert await provider._authenticate("unconfigured", "tool-call") == {"status": "failed"}
+    result = await provider._authenticate("unconfigured", "tool-call")
+    assert result["status"] == "failed"
+    assert "auth set to oauth" in result["message"]
 
 
 async def test_mcp_reload_tool_schedules_refresh_without_configuration(
@@ -521,7 +348,9 @@ async def test_mcp_reload_tool_schedules_refresh_without_configuration(
     assert result == {"status": "scheduled", "available": "after_successful_reload"}
 
     async def load() -> SimpleNamespace:
-        return SimpleNamespace(tools=(DummyTool("refreshed"),))
+        return SimpleNamespace(
+            tools=(StructuredTool(name="refreshed", description="", args_schema={}),)
+        )
 
     monkeypatch.setattr(provider, "load", load)
     refreshed = await provider.refresh_if_needed()
@@ -541,7 +370,16 @@ async def test_mcp_tool_provider_serializes_concurrent_refreshes(
     async def load() -> SimpleNamespace:
         load_started.set()
         await release_load.wait()
-        return SimpleNamespace(tools=(DummyTool("refreshed"),))
+        return SimpleNamespace(
+            tools=(
+                StructuredTool(
+                    name="refreshed",
+                    description="refreshed",
+                    args_schema={},
+                    coroutine=lambda: None,
+                ),
+            )
+        )
 
     monkeypatch.setattr(provider, "load", load)
     first = asyncio.create_task(provider.refresh_if_needed())
@@ -575,7 +413,9 @@ async def test_mcp_tool_provider_preserves_refresh_requested_during_load(
         if loads == 1:
             load_started.set()
             await release_load.wait()
-        return SimpleNamespace(tools=(DummyTool(f"refreshed-{loads}"),))
+        return SimpleNamespace(
+            tools=(StructuredTool(name=f"refreshed-{loads}", description="", args_schema={}),)
+        )
 
     monkeypatch.setattr(provider, "load", load)
     first = asyncio.create_task(provider.refresh_if_needed())
@@ -608,7 +448,9 @@ async def test_mcp_tool_provider_retries_cancelled_refresh(
         if loads == 1:
             load_started.set()
             await release_load.wait()
-        return SimpleNamespace(tools=(DummyTool("refreshed"),))
+        return SimpleNamespace(
+            tools=(StructuredTool(name="refreshed", description="", args_schema={}),)
+        )
 
     monkeypatch.setattr(provider, "load", load)
     refresh = asyncio.create_task(provider.refresh_if_needed())
@@ -658,7 +500,7 @@ async def test_mcp_tool_provider_reports_existing_authorization_without_refresh(
         lambda _self: _stored_tokens(),
     )
 
-    async def open_existing_session(_client: object, _server_name: str) -> None:
+    async def open_existing_session(_client: object) -> None:
         return None
 
     monkeypatch.setattr("deepagents_talon.mcp._open_mcp_session", open_existing_session)
@@ -694,7 +536,7 @@ async def test_mcp_tool_provider_forces_explicit_reauthentication(
         forced.append(force_authorization)
         return {}, "streamable_http"
 
-    async def complete_authorization(_client: object, _server_name: str) -> None:
+    async def complete_authorization(_client: object) -> None:
         attempt = current_authorization_attempt()
         assert attempt is not None
         attempt.binding = AuthorizationBinding(
@@ -731,7 +573,7 @@ def _provider_with_post_persistence_error(
         lambda _self: _no_tokens(),
     )
 
-    async def complete_then_fail(_client: object, _server_name: str) -> None:
+    async def complete_then_fail(_client: object) -> None:
         attempt = current_authorization_attempt()
         assert attempt is not None
         attempt.binding = AuthorizationBinding(
@@ -801,8 +643,6 @@ async def test_mcp_tool_provider_propagates_cancellation_after_credentials_persi
 async def test_explicit_config_interpolates_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    FakeMCPClient.calls.clear()
-    monkeypatch.setattr("deepagents_talon.mcp.MultiServerMCPClient", FakeMCPClient)
     config_path = tmp_path / "custom.mcp.json"
     _write_config(
         config_path,
@@ -820,14 +660,10 @@ async def test_explicit_config_interpolates_environment(
 
     await load_mcp_tools(_config(tmp_path, {"DEEPAGENTS_TALON_MCP_CONFIG": str(config_path)}))
 
-    assert FakeMCPClient.calls[0]["connections"] == {
-        "remote": {
-            "transport": "sse",
-            "url": "https://example.com/sse",
-            "timeout": 30.0,
-            "headers": {"Authorization": "Bearer secret"},
-        }
-    }
+    connection = FakeMCPAdapter.connections[0]
+    assert isinstance(connection, SSETransport)
+    assert connection.url == "https://example.com/sse"
+    assert connection.headers == {"Authorization": "Bearer secret"}
 
 
 @pytest.mark.parametrize(
@@ -840,33 +676,29 @@ async def test_explicit_config_interpolates_environment(
 )
 async def test_invalid_config_fails_before_connecting(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     document: object,
     match: str,
 ) -> None:
-    FakeMCPClient.calls.clear()
-    monkeypatch.setattr("deepagents_talon.mcp.MultiServerMCPClient", FakeMCPClient)
     config_path = tmp_path / "invalid.mcp.json"
     config_path.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(MCPConfigError, match=match):
         await load_mcp_tools(_config(tmp_path, {"DEEPAGENTS_TALON_MCP_CONFIG": str(config_path)}))
 
-    assert FakeMCPClient.calls == []
+    assert FakeMCPAdapter.connections == []
 
 
 async def test_server_connection_error_is_reported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class FailingMCPClient(FakeMCPClient):
-        async def get_tools(self, *, server_name: str | None = None) -> list[DummyTool]:
-            assert server_name is not None
+    class FailingMCPAdapter(FakeMCPAdapter):
+        async def list_tools(self) -> list[StructuredTool]:
             msg = "connection failed"
             raise RuntimeError(msg)
 
     config_path = tmp_path / "custom.mcp.json"
     _write_config(config_path, {"remote": {"url": "https://example.com/mcp"}})
-    monkeypatch.setattr("deepagents_talon.mcp.MultiServerMCPClient", FailingMCPClient)
+    monkeypatch.setattr("deepagents_talon.mcp.MCPAdapter", FailingMCPAdapter)
 
     result = await load_mcp_tools(
         _config(tmp_path, {"DEEPAGENTS_TALON_MCP_CONFIG": str(config_path)})
@@ -905,9 +737,8 @@ async def test_wrapped_channel_authorization_error_does_not_abort_startup(
     caplog: pytest.LogCaptureFixture,
     wrapped: Exception,
 ) -> None:
-    class AuthorizationRequiredClient(FakeMCPClient):
-        async def get_tools(self, *, server_name: str | None = None) -> list[DummyTool]:
-            assert server_name == "notion"
+    class AuthorizationRequiredAdapter(FakeMCPAdapter):
+        async def list_tools(self) -> list[StructuredTool]:
             raise wrapped
 
     config_path = tmp_path / "oauth.mcp.json"
@@ -915,7 +746,7 @@ async def test_wrapped_channel_authorization_error_does_not_abort_startup(
         config_path,
         {"notion": {"url": "https://mcp.example", "auth": "oauth"}},
     )
-    monkeypatch.setattr("deepagents_talon.mcp.MultiServerMCPClient", AuthorizationRequiredClient)
+    monkeypatch.setattr("deepagents_talon.mcp.MCPAdapter", AuthorizationRequiredAdapter)
     monkeypatch.setattr(
         "deepagents_talon.mcp.FileTokenStorage.get_tokens",
         lambda _self: _stored_tokens(),
@@ -936,16 +767,15 @@ async def test_unrelated_exception_group_remains_server_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class GroupedFailureClient(FakeMCPClient):
-        async def get_tools(self, *, server_name: str | None = None) -> list[DummyTool]:
-            assert server_name == "remote"
+    class GroupedFailureAdapter(FakeMCPAdapter):
+        async def list_tools(self) -> list[StructuredTool]:
             msg = "nested detail"
             group_msg = "internal detail"
             raise ExceptionGroup(group_msg, [RuntimeError(msg)])
 
     config_path = tmp_path / "custom.mcp.json"
     _write_config(config_path, {"remote": {"url": "https://example.com/mcp"}})
-    monkeypatch.setattr("deepagents_talon.mcp.MultiServerMCPClient", GroupedFailureClient)
+    monkeypatch.setattr("deepagents_talon.mcp.MCPAdapter", GroupedFailureAdapter)
 
     result = await load_mcp_tools(
         _config(tmp_path, {"DEEPAGENTS_TALON_MCP_CONFIG": str(config_path)})
@@ -953,18 +783,21 @@ async def test_unrelated_exception_group_remains_server_error(
 
     assert result.tools == ()
     assert result.servers[0].status == "error"
-    assert result.servers[0].error == "ExceptionGroup"
+    assert result.servers[0].error == "RuntimeError"
+    assert "nested detail" not in result.servers[0].error
+    assert "internal detail" not in result.servers[0].error
 
 
+@pytest.mark.parametrize("error", [OAuthFlowError, ConnectError])
 async def test_unexpected_server_error_does_not_block_other_servers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: type[Exception]
 ) -> None:
-    class PartiallyFailingMCPClient(FakeMCPClient):
-        async def get_tools(self, *, server_name: str | None = None) -> list[DummyTool]:
-            if server_name == "broken":
+    class PartiallyFailingMCPAdapter(FakeMCPAdapter):
+        async def list_tools(self) -> list[StructuredTool]:
+            if self.connection.url == "https://broken.example.com/mcp":
                 msg = "unexpected failure"
-                raise OAuthFlowError(msg)
-            return await super().get_tools(server_name=server_name)
+                raise error(msg)
+            return await super().list_tools()
 
     config_path = tmp_path / "custom.mcp.json"
     _write_config(
@@ -974,7 +807,7 @@ async def test_unexpected_server_error_does_not_block_other_servers(
             "working": {"url": "https://working.example.com/mcp"},
         },
     )
-    monkeypatch.setattr("deepagents_talon.mcp.MultiServerMCPClient", PartiallyFailingMCPClient)
+    monkeypatch.setattr("deepagents_talon.mcp.MCPAdapter", PartiallyFailingMCPAdapter)
 
     result = await load_mcp_tools(
         _config(tmp_path, {"DEEPAGENTS_TALON_MCP_CONFIG": str(config_path)})
@@ -985,15 +818,21 @@ async def test_unexpected_server_error_does_not_block_other_servers(
         ("broken", "error"),
         ("working", "ok"),
     ]
+    if error is ConnectError:
+        assert result.servers[0].error == (
+            "OAuth network request failed; check connectivity and retry login."
+        )
 
 
 async def test_tool_allowlist_filters_loaded_tools(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class MultipleToolClient(FakeMCPClient):
-        async def get_tools(self, *, server_name: str | None = None) -> list[DummyTool]:
-            assert server_name is not None
-            return [DummyTool(f"{server_name}_read"), DummyTool(f"{server_name}_write")]
+    class MultipleToolAdapter(FakeMCPAdapter):
+        async def list_tools(self) -> list[StructuredTool]:
+            return [
+                StructuredTool(name="read", description="", args_schema={"type": "object"}),
+                StructuredTool(name="write", description="", args_schema={"type": "object"}),
+            ]
 
     config_path = tmp_path / "custom.mcp.json"
     _write_config(
@@ -1005,7 +844,7 @@ async def test_tool_allowlist_filters_loaded_tools(
             }
         },
     )
-    monkeypatch.setattr("deepagents_talon.mcp.MultiServerMCPClient", MultipleToolClient)
+    monkeypatch.setattr("deepagents_talon.mcp.MCPAdapter", MultipleToolAdapter)
 
     result = await load_mcp_tools(
         _config(tmp_path, {"DEEPAGENTS_TALON_MCP_CONFIG": str(config_path)})
@@ -1021,7 +860,16 @@ async def test_oauth_connection_uses_stored_credentials(
     provider = object()
 
     class FakeStorage:
-        def __init__(self, server_name: str, *, server_url: str) -> None:
+        def __init__(
+            self,
+            server_name: str,
+            *,
+            server_url: str,
+            force_authorization: bool = False,
+            oauth: MCPOAuthConfig | None = None,
+        ) -> None:
+            del oauth
+            assert force_authorization is False
             assert (server_name, server_url) == ("remote", "https://example.com/mcp")
 
         async def get_tokens(self) -> object:
@@ -1029,7 +877,6 @@ async def test_oauth_connection_uses_stored_credentials(
 
     monkeypatch.setattr("deepagents_talon.mcp.FileTokenStorage", FakeStorage)
     monkeypatch.setattr("deepagents_talon.mcp.build_oauth_provider", lambda **_kwargs: provider)
-    monkeypatch.setattr("deepagents_talon.mcp.MultiServerMCPClient", FakeMCPClient)
     config_path = tmp_path / "custom.mcp.json"
     _write_config(
         config_path,
@@ -1040,9 +887,9 @@ async def test_oauth_connection_uses_stored_credentials(
         _config(tmp_path, {"DEEPAGENTS_TALON_MCP_CONFIG": str(config_path)})
     )
 
-    connection = FakeMCPClient.calls[-1]["connections"]
-    assert isinstance(connection, dict)
-    assert connection["remote"]["auth"] is provider
+    connection = FakeMCPAdapter.connections[-1]
+    assert isinstance(connection, StreamableHttpTransport)
+    assert connection.auth is provider
     assert result.servers[0].uses_oauth is True
 
 
@@ -1053,13 +900,25 @@ async def test_oauth_connection_prepares_oauth_login(
     prepared: list[tuple[str, object]] = []
 
     class EmptyStorage:
-        def __init__(self, server_name: str, *, server_url: str) -> None:
+        def __init__(
+            self,
+            server_name: str,
+            *,
+            server_url: str,
+            force_authorization: bool = False,
+            oauth: MCPOAuthConfig | None = None,
+        ) -> None:
+            del oauth
+            assert force_authorization is False
             assert (server_name, server_url) == (
                 "github",
                 "https://api.githubcopilot.com/mcp",
             )
 
-    async def prepare(*, server_url: str, storage: object) -> None:
+    async def prepare(
+        *, server_url: str, storage: object, oauth: MCPOAuthConfig | None = None
+    ) -> None:
+        del oauth
         prepared.append((server_url, storage))
 
     monkeypatch.setattr("deepagents_talon.mcp.FileTokenStorage", EmptyStorage)
@@ -1073,7 +932,7 @@ async def test_oauth_connection_prepares_oauth_login(
     )
 
     assert transport == "streamable_http"
-    assert connection["auth"] is provider
+    assert connection.auth is provider
     assert len(prepared) == 1
     assert prepared[0][0] == "https://api.githubcopilot.com/mcp"
 
@@ -1084,7 +943,16 @@ async def test_oauth_connection_reuses_stored_token(
     provider = object()
 
     class StoredStorage:
-        def __init__(self, _server_name: str, *, server_url: str) -> None:
+        def __init__(
+            self,
+            _server_name: str,
+            *,
+            server_url: str,
+            force_authorization: bool = False,
+            oauth: MCPOAuthConfig | None = None,
+        ) -> None:
+            del oauth
+            assert force_authorization is False
             assert server_url == "https://example.com/mcp"
 
         async def get_tokens(self) -> OAuthToken:
@@ -1098,7 +966,7 @@ async def test_oauth_connection_reuses_stored_token(
         {"url": "https://example.com/mcp", "auth": "oauth"},
     )
 
-    assert connection["auth"] is provider
+    assert connection.auth is provider
 
 
 async def test_forced_oauth_connection_bypasses_stored_credentials(
@@ -1112,8 +980,10 @@ async def test_forced_oauth_connection_bypasses_stored_credentials(
             server_name: str,
             *,
             server_url: str,
-            force_authorization: bool,
+            force_authorization: bool = False,
+            oauth: MCPOAuthConfig | None = None,
         ) -> None:
+            del oauth
             assert (server_name, server_url) == ("remote", "https://example.com/mcp")
             assert force_authorization is True
 
@@ -1128,14 +998,23 @@ async def test_forced_oauth_connection_bypasses_stored_credentials(
     )
 
     assert transport == "streamable_http"
-    assert connection["auth"] is provider
+    assert connection.auth is provider
 
 
 async def test_oauth_without_stored_credentials_requires_login(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class EmptyStorage:
-        def __init__(self, server_name: str, *, server_url: str) -> None:
+        def __init__(
+            self,
+            server_name: str,
+            *,
+            server_url: str,
+            force_authorization: bool = False,
+            oauth: MCPOAuthConfig | None = None,
+        ) -> None:
+            del oauth
+            assert force_authorization is False
             assert (server_name, server_url) == ("remote", "https://example.com/mcp")
 
         async def get_tokens(self) -> None:
@@ -1169,22 +1048,16 @@ async def test_login_uses_talon_config_and_interactive_oauth(
     calls: list[dict[str, object]] = []
 
     class LoginClient:
-        def __init__(self, connections: dict[str, object]) -> None:
-            calls.append(connections)
+        def __init__(self, connection: object) -> None:
+            calls.append(vars(connection))
 
-        def session(self, server_name: str):
-            assert server_name == "remote"
+        async def __aenter__(self) -> Self:
+            return self
 
-            class Session:
-                async def __aenter__(self) -> Self:
-                    return self
+        async def __aexit__(self, *_args: object) -> None:
+            return None
 
-                async def __aexit__(self, *_args: object) -> None:
-                    return None
-
-            return Session()
-
-    monkeypatch.setattr("deepagents_talon.mcp.MultiServerMCPClient", LoginClient)
+    monkeypatch.setattr("deepagents_talon.mcp.FastMCPClient", LoginClient)
     monkeypatch.setattr("deepagents_talon.mcp._MCP_LOAD_TIMEOUT_SECONDS", 1)
     forced: list[bool] = []
 
@@ -1194,8 +1067,10 @@ async def test_login_uses_talon_config_and_interactive_oauth(
             _server_name: str,
             *,
             server_url: str,
-            force_authorization: bool,
+            force_authorization: bool = False,
+            oauth: MCPOAuthConfig | None = None,
         ) -> None:
+            del oauth
             assert server_url == "https://example.com/mcp"
             forced.append(force_authorization)
 
@@ -1209,25 +1084,21 @@ async def test_login_uses_talon_config_and_interactive_oauth(
 
     assert result == 0
     assert forced == [True]
-    assert calls == [
-        {
-            "remote": {
-                "transport": "streamable_http",
-                "url": "https://example.com/mcp",
-                "timeout": 30.0,
-                "auth": provider,
-            }
-        }
-    ]
+    assert calls[0]["url"] == "https://example.com/mcp"
+    assert calls[0]["auth"] is provider
 
 
+@pytest.mark.parametrize("error", [OAuthFlowError, ConnectError])
 async def test_login_reports_oauth_failure_without_details(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: type[Exception],
 ) -> None:
     config_path = tmp_path / "custom.mcp.json"
     _write_config(config_path, {"remote": {"url": "https://example.com/mcp"}})
 
-    failure = OAuthFlowError("secret token exchange response")
+    failure = error("secret token exchange response")
 
     async def fail_login(*_args: object) -> None:
         raise failure
@@ -1239,7 +1110,16 @@ async def test_login_reports_oauth_failure_without_details(
     result = await login_mcp_server(_config(tmp_path), "remote", str(config_path))
 
     assert result == 1
-    assert capsys.readouterr().err == "MCP login failed: OAuthFlowError\n"
+    message = capsys.readouterr().err
+    assert message.startswith("MCP login failed: ")
+    assert "secret token exchange response" not in message
+    assert "retry" in message
+    if error is OAuthFlowError:
+        assert "client_id" in message
+        assert "callback_url" in message
+        assert "scopes" in message
+    else:
+        assert "check connectivity" in message
 
 
 async def test_login_does_not_timeout_interactive_session(
@@ -1271,9 +1151,7 @@ async def test_login_reports_missing_server_without_deepagents_code(
     assert "was not found" in capsys.readouterr().err
 
 
-async def test_invalid_stdio_environment_does_not_block_valid_server(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_invalid_stdio_environment_does_not_block_valid_server(tmp_path: Path) -> None:
     config_path = tmp_path / "custom.mcp.json"
     _write_config(
         config_path,
@@ -1282,7 +1160,6 @@ async def test_invalid_stdio_environment_does_not_block_valid_server(
             "valid": {"url": "https://example.com/mcp"},
         },
     )
-    monkeypatch.setattr("deepagents_talon.mcp.MultiServerMCPClient", FakeMCPClient)
 
     result = await load_mcp_tools(
         _config(tmp_path, {"DEEPAGENTS_TALON_MCP_CONFIG": str(config_path)})
@@ -1292,9 +1169,7 @@ async def test_invalid_stdio_environment_does_not_block_valid_server(
     assert result.servers[0].error == "MCP stdio server 'unsafe' cannot set LD_PRELOAD"
 
 
-async def test_invalid_server_does_not_block_valid_server(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_invalid_server_does_not_block_valid_server(tmp_path: Path) -> None:
     config_path = tmp_path / "custom.mcp.json"
     _write_config(
         config_path,
@@ -1303,7 +1178,6 @@ async def test_invalid_server_does_not_block_valid_server(
             "valid": {"url": "https://example.com/mcp"},
         },
     )
-    monkeypatch.setattr("deepagents_talon.mcp.MultiServerMCPClient", FakeMCPClient)
 
     result = await load_mcp_tools(
         _config(tmp_path, {"DEEPAGENTS_TALON_MCP_CONFIG": str(config_path)})
@@ -1386,7 +1260,7 @@ async def test_authenticate_reports_failure_for_a_grouped_session_error(
         lambda _self: _stored_tokens(),
     )
 
-    async def fail_inside_task_group(_client: object, _server_name: str) -> None:
+    async def fail_inside_task_group(_client: object) -> None:
         async with anyio.create_task_group() as group:
             group.start_soon(_raise_connection_failure)
 
@@ -1394,7 +1268,8 @@ async def test_authenticate_reports_failure_for_a_grouped_session_error(
 
     result = await provider._authenticate("notion", "tool-call")
 
-    assert result == {"status": "failed", "server_name": "notion"}
+    assert result == {"status": "failed", "server_name": "notion", "message": "connection reset"}
+    assert "ExceptionGroup" not in result["message"]
     assert await provider.refresh_if_needed() is None
 
 
@@ -1426,3 +1301,38 @@ async def test_login_succeeds_and_logs_a_failure_alongside_the_completion_marker
     assert captured.err == ""
     assert "after credentials were saved" in caplog.text
     assert "connection reset" in caplog.text
+
+
+async def test_authentication_tool_returns_safe_oauth_failure_remedy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "oauth.mcp.json"
+    _write_config(config_path, {"notion": {"url": "https://mcp.example", "auth": "oauth"}})
+    monkeypatch.setattr(
+        "deepagents_talon.mcp.FileTokenStorage.get_tokens", lambda _self: _no_tokens()
+    )
+    provider = MCPToolProvider(_config(tmp_path, {"DEEPAGENTS_TALON_MCP_CONFIG": str(config_path)}))
+    loaded = await provider.load()
+    authentication = next(tool for tool in loaded.tools if tool.name == "authenticate_mcp_server")
+
+    async def fail_login(*_args: object, **_kwargs: object) -> None:
+        await _raise_oauth_failure()
+
+    monkeypatch.setattr("deepagents_talon.mcp._open_authenticated_session", fail_login)
+    result = await authentication.ainvoke(
+        {
+            "name": "authenticate_mcp_server",
+            "args": {"server_name": "notion"},
+            "id": "tool-call",
+            "type": "tool_call",
+        }
+    )
+    response = json.loads(result.content)
+    assert response["status"] == "failed"
+    assert response["server_name"] == "notion"
+    assert "secret token exchange response" not in response["message"]
+    assert "client_id" in response["message"]
+    assert "callback_url" in response["message"]
+    assert "scopes" in response["message"]
+    assert "retry" in response["message"]
+    assert await provider.refresh_if_needed() is None

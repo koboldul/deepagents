@@ -1,5 +1,5 @@
 # Files
 
-- [dcode Sessions, Cost, and Observability](cost-and-sessions.md) - How dcode persists and resumes threads, estimates model cost, and exposes the diagnostics needed to investigate a run, including tracing, debug logs, and update operations.
-- [Development, CI, and Releases](development.md) - Package-scoped uv and Make workflows, repository fan-out validation, contributor gates, CI routing, and independently versioned release operations for the Deep Agents monorepo.
-- [Security Boundaries and Runbook](security.md) - Practical operating guidance for trust boundaries in the Deep Agents SDK, dcode, and Talon. Covers execution containment, project trust, loopback services, immutable workspace binding, approvals, MCP credentials and configuration, and Talon's explicit hardening limits.
+- [dcode Cost, Session, and Context Operations](cost-and-sessions.md) - Operate dcode's best-effort cost estimates, pricing catalogs and overrides, checkpoint-backed thread sessions, JavaScript-subagent receipts, and context offload settlement. Covers ownership boundaries, cancellation, recovery, and exactly-once caveats.
+- [Development, Packaging, and Releases](development.md) - Package-local uv and Makefile workflows, editable sibling dependencies, lockfile policy, package compatibility ranges, and the independent release pipeline.
+- [Security Boundaries and Operational Risks](security.md) - Practical threat model and deployment safeguards for Talon channels, host execution, MCP configuration and OAuth, approvals, state, and optional sandbox routing.

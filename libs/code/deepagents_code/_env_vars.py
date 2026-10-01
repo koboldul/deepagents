@@ -390,6 +390,13 @@ LOG_LEVEL = "DEEPAGENTS_CODE_LOG_LEVEL"
 Accepted values are DEBUG, INFO, WARNING, ERROR, and CRITICAL.
 """
 
+MCP_TOOL_TIMEOUT = "DEEPAGENTS_CODE_MCP_TOOL_TIMEOUT"
+"""Seconds an MCP tool call may run before returning a failed tool message.
+
+Values outside 1-900 seconds are ignored in favor of the next config source.
+Also settable via `[mcp].tool_timeout` in config.toml.
+"""
+
 MEMORY_AUTO_SAVE = "DEEPAGENTS_CODE_MEMORY_AUTO_SAVE"
 """Toggle automatic memory saving (defaults to on).
 
@@ -507,7 +514,7 @@ repo file, so a project `.env` cannot disable itself.
 """
 
 RECENT_THREADS = "DEEPAGENTS_CODE_RECENT_THREADS"
-"""Maximum number of recent threads loaded and displayed (default: 20)."""
+"""Maximum recent threads (default: `_constants.DEFAULT_THREAD_LIMIT`)."""
 
 RECURSION_LIMIT = "DEEPAGENTS_CODE_RECURSION_LIMIT"
 """Override the main agent's LangGraph `recursion_limit` (graph step budget).

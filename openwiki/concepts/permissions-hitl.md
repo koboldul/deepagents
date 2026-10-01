@@ -1,12 +1,14 @@
 ---
-type: security and approval concept
-title: Permissions and Human Approval
-description: Explains filesystem permission enforcement and path-scoped HITL, dcode approval modes and shell policy, and Talon's channel-mediated approval lifecycle. Distinguishes tool availability, policy enforcement, and human authorization.
-tags: [permissions, human-in-the-loop, security, filesystem, approvals, interrupts, talon, dcode]
+type: approval-and-intervention concept
+title: Permissions, Approval, and HITL
+description: Distinguishes filesystem enforcement and SDK interrupts from ACP session modes and Talon's persisted, channel-mediated approval routing. Covers Talon's experimental security limits, approval snapshots, and fail-closed unattended and delegated work.
+tags: [permissions, human-in-the-loop, talon, acp, security]
 verified:
   - by: openwiki/0.4.2
-    at: 2026-09-08T08:05:55.853Z
+    at: 2026-10-01T08:06:30.386Z
 sources:
+  - id: openwiki-source-ad08e7a262f5792c6f16e1e5
+    resource: repo://libs/acp/examples/demo_agent.py
   - id: openwiki-source-05106e66a949150d557266a2
     resource: repo://libs/code/deepagents_code/agent.py
   - id: openwiki-source-a9143c1c174362216a1cfa2c
@@ -25,131 +27,137 @@ sources:
     resource: repo://libs/deepagents/README.md
   - id: openwiki-source-f1280171b9d75cd28add0ec3
     resource: repo://libs/deepagents/THREAT_MODEL.md
+  - id: openwiki-source-cd45145a8c3a51b52eab3c2b
+    resource: repo://libs/talon/deepagents_talon/background.py
   - id: openwiki-source-6801a88de6305bc8cbdd259f
     resource: repo://libs/talon/deepagents_talon/host.py
   - id: openwiki-source-cebe4ea270e21dce4de9b074
     resource: repo://libs/talon/deepagents_talon/interfaces.py
+  - id: openwiki-source-82cac27adeecff8a900a40fa
+    resource: repo://libs/talon/deepagents_talon/mcp.py
   - id: openwiki-source-665a21e2fbd09a89d3f13ac0
     resource: repo://libs/talon/deepagents_talon/runtime.py
-generated: { by: "openwiki/0.4.2", at: "2026-09-08T08:05:55.853Z" }
+  - id: openwiki-source-267468fe937003d4716fe6c2
+    resource: repo://libs/talon/deepagents_talon/tool_approvals.py
+  - id: openwiki-source-fdd0c2c3830b8e9a88502a57
+    resource: repo://libs/talon/README.md
+  - id: openwiki-source-a69daa62c9a3eb9a49f09bf9
+    resource: repo://libs/talon/tests/test_host.py
+  - id: openwiki-source-82dab853903c3a574614fd1e
+    resource: repo://libs/talon/tests/unit_tests/test_background.py
+  - id: openwiki-source-8de0ff38635f214c7268d8e7
+    resource: repo://libs/talon/tests/unit_tests/test_tool_approval_authorization.py
+  - id: openwiki-source-6cf260dd7a6018657221ec15
+    resource: repo://libs/talon/tests/unit_tests/test_tool_approval_batch.py
+  - id: openwiki-source-242a21b2da46507f58415265
+    resource: repo://libs/talon/tests/unit_tests/test_tool_approval_runtime.py
+  - id: openwiki-source-d4964daa078854bf4438d764
+    resource: repo://libs/talon/tests/unit_tests/test_tool_approvals.py
+generated: { by: "openwiki/0.4.2", at: "2026-10-01T08:06:30.386Z" }
 ---
 
-# Permissions and Human Approval
+# Permissions, Approval, and HITL
 
-Permissions, approval prompts, and tool availability are related but distinct controls. A tool schema can be available to the model while a particular call is rejected at execution time; an interrupt can pause an otherwise permitted call; and an approval is not a general sandbox boundary. See [filesystem tools](/openwiki/concepts/tools-filesystem.md), [configuration layering](/openwiki/concepts/config-layering.md), [Talon](/openwiki/integrations/talon.md), and [security](/openwiki/operations/security.md).
+Tool exposure, a tool-level permission check, a graph interrupt, a human decision, and runtime containment answer different questions. A tool may be visible yet deny a particular call; a permitted call may pause; and approving a call is neither a sandbox nor a durable authorization grant. See [filesystem tools](/openwiki/concepts/tools-filesystem.md), [runtime behavior](/openwiki/architecture/runtime-behavior.md), [channel admission](/openwiki/concepts/talon-channel-admission.md), [ACP](/openwiki/integrations/acp.md), and [security](/openwiki/operations/security.md).
 
-## Boundary model and enforcement locations
+> **Talon is experimental.** It is alpha-status, may change or be removed, and is not intended for production or enterprise use. Talon does **not** provide complete production-grade HITL policy, channel-administrator controls, or tenant isolation. Channel approval prompts are an experimental convenience, not a complete security boundary; channel access should be treated as direct access to the operator's agent, credentials, MCP tools, and local host resources. Its opt-in sandbox does not cover MCP tools.
 
-Deep Agents follows a **trust-the-LLM** model: an agent can do anything its installed tools permit. Meaningful containment therefore belongs in the tool implementation, backend, or sandbox—not in prompt instructions asking the model to behave. HITL is opt-in and only covers calls configured to interrupt. In particular, `StateBackend` cannot execute shell commands; `LocalShellBackend` is an explicit opt-in with substantially more power.
+## Choose the right control
 
-| Question | Control | Enforcement point |
+| Need | Mechanism | It does not provide |
 | --- | --- | --- |
-| Can the model propose a call? | Tool visibility / installed schemas | Agent construction |
-| May a filesystem operation affect this path? | `FilesystemPermission` | `FilesystemMiddleware` and filesystem tool execution |
-| Must a person decide before a configured call proceeds? | `HumanInTheLoopMiddleware` / `interrupt_on` | Graph routing before tool execution |
-| May a dcode shell command run without an interactive pause? | Approval mode or `ShellAllowListMiddleware` | dcode HITL routing or inline tool-call middleware |
-| How is a Talon decision obtained? | `ToolApprovalHandler` | Channel host and runtime resume loop |
+| Restrict a filesystem operation | `FilesystemPermission` | A human prompt or OS isolation |
+| Pause a selected SDK tool call | `HumanInTheLoopMiddleware` and `interrupt_on` | A deny rule or durable authorization |
+| Select interaction behavior for an ACP session | `SessionMode` interpreted by the agent | A standardized authorization or sandbox policy |
+| Require Talon review for a named tool | `tools.json` / `ToolApprovalStore` | A wildcard policy, availability grant, or sandbox |
+| Permit a Talon policy edit | `APPROVAL_OPERATOR` and `ACTIVE_APPROVALS` | Permission to execute arbitrary tools |
+| Obtain a Talon decision | `ToolApprovalHandler` through the origin channel | Execution by the channel or a general identity grant |
 
-A denied tool call may still be visible in the model transcript: it returns an error instead of performing its effect, so the model can adapt. For bulk filesystem reads, individual denied result entries are removed; the control is still execution/result enforcement rather than schema hiding.
+Deep Agents follows a **trust-the-LLM** model: containment belongs in installed tool implementations, backends, or a sandbox—not in prompts or a review dialog. HITL is opt-in and covers only selected calls. `StateBackend` does not execute shell commands; choosing `LocalShellBackend` is an explicit higher-power opt-in.
 
-## SDK filesystem permissions
+## Three distinct ways to configure an interrupt
 
-A `FilesystemPermission` rule contains read and/or write `operations`, absolute glob `paths`, and a `mode`:
+### SDK policy: filesystem enforcement and graph routing
 
-| Mode | Effect |
-| --- | --- |
-| `allow` | The matching operation proceeds; it is the default. |
-| `deny` | The tool returns a permission-denied error without doing the operation. |
-| `interrupt` | Graph assembly arranges a human approval interruption for a matching call. |
+`FilesystemPermission` rules have read and/or write operations, absolute glob paths, and an `allow`, `deny`, or `interrupt` mode. Patterns must be absolute, cannot contain `..`, and do not support `~`. Rules are evaluated in declaration order: the first matching rule decides, and unmatched access is allowed. A deny is enforced before backend execution; bulk reads filter denied results. Potentially recursive deletes use conservative overlap checks so an earlier broad allow cannot expose a protected descendant.
 
-Patterns must begin with `/`; `..` is forbidden after backslash normalization; and `~` is rejected as unsupported. Resolution is ordered and first-match-wins: rules for another operation are skipped, and no match is `allow`. Put a more-specific exception before a broad rule.
-
-Filesystem tools validate paths and perform their permission check before calling the backend. `FilesystemMiddleware` itself only enforces denial and filters results—it does not pause execution. The separate interrupt bridge is important: an approval cannot override a tool-level `deny`, because a resumed or edited call re-enters the tool and is checked again.
-
-### Bulk reads and deletion
-
-`ls`, `glob`, and `grep` can return many paths. Their result filters exclude entries whose individual read permission is `deny`; entries with `interrupt` pass through because the relevant approval occurs before the tool runs. A direct operation rooted at a denied path returns an error rather than silently becoming a partial operation.
-
-Deletion is stricter because it may be recursive. When a target may have descendants, every deny-write pattern that could match the target or its subtree blocks deletion irrespective of declaration order. This prevents an earlier broad allow from defeating a later protected descendant. The code uses backend listings to distinguish a confirmed leaf file from a possible directory; unavailable or ambiguous backend information is treated conservatively. Once a target is confirmed as a leaf, ordinary first-match resolution applies. Wildcard-overlap logic permits demonstrably separate siblings, such as deleting `/work/notes.txt` under a deny for `/work/*.log`, but fails closed when overlap is possible.
-
-## Permission-derived HITL
-
-`_build_interrupt_on_from_permissions` converts interrupt-mode filesystem rules into the `interrupt_on` mapping used by `HumanInTheLoopMiddleware`. It returns `{}` if no rule requests interruption. For each filesystem tool that could be affected, it creates an `InterruptOnConfig` with `approve`, `edit`, `reject`, and `respond` and a per-call `when` predicate.
-
-`create_deep_agent` merges this derived mapping with caller-provided `interrupt_on` for both the main agent and its general-purpose subagent. It installs a single `HumanInTheLoopMiddleware` only when the merged map is non-empty, while independently giving the original rules to `FilesystemMiddleware`.
-
-- **Exact-path tools**—`read_file`, `write_file`, and `edit_file`—interrupt only when normal first-match resolution says `interrupt`. A prior matching `deny` wins, so no unnecessary prompt is displayed.
-- **Bulk tools**—`ls`, `glob`, `grep`, and `delete`—interrupt when their search subtree can overlap an interrupt-rule anchor. A missing bulk path fires conservatively. `.` and other current-directory aliases normalized as `/.` are treated as `/` to prevent a bypass.
-- For `glob`, the predicate also considers `pattern`: an absolute pattern can redirect the search root, while a relative pattern containing `..` cannot be safely localized and is gated.
+`interrupt` is separate from `deny`. Graph construction converts interrupt-mode filesystem rules into `HumanInTheLoopMiddleware` routing. Exact-path tools use ordinary first-match resolution. Bulk tools pause when their search scope may intersect an interrupt rule; routing deliberately treats omitted paths, current-directory aliases, absolute `glob` patterns, and relative patterns containing parent traversal conservatively. Filesystem-derived interrupts allow `approve`, `edit`, `reject`, and `respond`. An approved or edited call still enters the filesystem tool and its deny enforcement.
 
 ```mermaid
 flowchart TD
-    Call["Filesystem tool call"] --> DenyCheck{"Path resolves to deny"}
-    DenyCheck -->|Yes| Denied["Return permission error"]
-    DenyCheck -->|No| InterruptCheck{"Interrupt predicate fires"}
-    InterruptCheck -->|No| Run["Run tool against backend"]
-    InterruptCheck -->|Yes| Pause["Pause for human decision"]
+    Call["Filesystem tool call"] --> Gate{"Interrupt rule applies"}
+    Gate -->|Yes| Pause["LangGraph interrupt"]
     Pause --> Decision{"Human decision"}
-    Decision -->|approve or edit| Recheck["Recheck permission in tool"]
-    Decision -->|reject or respond| Skip["Skip tool execution"]
-    Recheck --> Run
-    Run --> Filter["Filter denied bulk entries"]
+    Decision -->|Reject or respond| Stop["Do not run operation"]
+    Decision -->|Approve or edit| Check
+    Gate -->|No| Check{"Tool denies path"}
+    Check -->|Yes| Denied["Return permission error"]
+    Check -->|No| Run["Run backend operation"]
 ```
 
-Caption: Filesystem denial is enforced by the tool, while path-scoped approval is graph routing before it.
+Caption: Interrupt routing pauses before execution, while the filesystem tool remains the denial enforcement point.
 
-## dcode approval modes and shell policy
+### ACP session mode: application-selected UX policy
 
-`ApprovalMode` is a per-session policy: `manual` pauses every gated call, `auto` enables classifier-backed review for an eligible graph, and `yolo` bypasses the approval gate. Invalid or non-string inputs coerce to `manual`. The Shift+Tab cycle is Manual → Auto → YOLO → Manual when available; Auto is omitted when ineligible, YOLO when `startup.yolo_switcher` is disabled, and exiting YOLO always returns to Manual.
+ACP's `SessionMode` is a session-facing choice, not a shared authorization model. In the demo agent, the `AgentSessionContext.mode` selects an `interrupt_on` map while building the graph: `ask_before_edits` gates edits, writes, plans, and `execute`; `accept_edits` gates only plans and `execute`; and `accept_everything` supplies no interrupts. The advertised mode names and descriptions communicate that behavior to the ACP client. An ACP integration can define different modes and mappings, so neither a mode ID nor a client selection itself proves authorization, containment, or identity.
 
-The live value is a per-thread LangGraph Store record in `("deepagents_code", "approval_mode")`, keyed by a SHA-256 hash of the thread ID. Missing stores, malformed records, bad keys, and read errors return `None`, which callers interpret as Manual. This makes loss or corruption of control state fail closed rather than silently enabling autonomous execution.
+### dcode: live, thread-scoped approval behavior
 
-`_add_interrupt_on` registers dcode's side-effecting or external-access tools—`execute`, write/edit/delete, web tools, `task`, async-subagent controls, and non-read-only MCP tools—with a shared approval predicate and approve/reject decisions. The predicate honors a prior trusted hook decision, bypasses for YOLO, and allows an Auto bypass only for an Auto-eligible graph; otherwise it interrupts. `AsyncApprovalHITLMiddleware` asynchronously rereads the live mode after the model response and passes stock HITL a transient `_RoutingDecision`. That private, in-process marker is neither checkpointed nor forgeable through serialized graph input; synchronous use warns and falls back to Manual.
+dcode stores an `ApprovalMode` per LangGraph thread: `manual`, `auto`, or `yolo`. Missing, malformed, unavailable, or untrusted typed-mode context resolves to Manual. `AsyncApprovalHITLMiddleware` rereads the mode after model completion and uses a private in-process routing marker, so checkpointed graph state cannot forge an autonomous approval decision. `yolo` bypasses gated interruptions; `auto` does so only in eligible classifier-backed graphs. `AutoModeHITLMiddleware` combines the interrupt map with deterministic policy, classifier review, denial errors, and escalation to human review; its worktree boundary and optional narrow shell allowlist do not replace backend containment.
 
-Auto is not a blanket allowlist. `AutoModeHITLMiddleware` applies deterministic policy followed by classifier review: classifier-allowed calls can continue, policy-denied or classifier-unavailable calls become error messages, and `require_human` calls escalate to an approval prompt. Its deterministic shell allowance is deliberately narrow: it permits fixed repository commands or configured command entries only after rejecting shell control syntax and broad executables or wildcard entries.
+`ask_user` is a different interrupt: it pauses from its own tool execution to obtain an answer, validates the resumed answer before attaching an authorization receipt, and depends on exception-catching middleware preserving `GraphBubbleUp`. Swallowing that exception also swallows the graph interrupt.
 
-For non-interactive dcode operation, `interrupt_shell_only=True` disables HITL only when a restrictive shell allow-list is available, then installs `ShellAllowListMiddleware`. It checks `execute` before execution and returns an error `ToolMessage` for a command outside the list, avoiding an interrupt/resume cycle. If no restrictive list can be resolved, dcode logs a warning and retains normal HITL; an empty list is invalid, and the unrestricted `SHELL_ALLOW_ALL` sentinel must use `auto_approve=True` instead. `auto_approve=True` disables all HITL interruptions. Patch Tool Calls from the code interpreter bypass `interrupt_on`/HITL altogether, so `InterpreterConfig.ptc` is their effective control.
+## Talon: exact-name routing policy, not an ACL
 
-## Talon: approvals mediated by the originating channel
+Talon keeps an assistant-local `tools.json` mapping of **exact tool names** to booleans. An enabled entry produces approve/reject `interrupt_on` configuration; an absent or `false` entry produces no prompt. Names are not patterns. On first creation, defaults enable `update_tool_approvals`, `delete_conversations`, `update_mcp_server`, `start_async_task`, and `send_message`; a valid existing policy is retained unchanged.
 
-Talon is an experimental runtime that translates graph interrupts into a channel conversation rather than exposing a local approval UI. `DeepAgentRuntime` invokes the graph asynchronously, detects `__interrupt__` values, obtains one decision for each interrupt, builds LangGraph `Command(resume=...)` payloads for every action request, and repeats for at most `DEFAULT_MAX_APPROVAL_ROUNDS` (50). A missing interrupt ID or an all-unresumable batch is an error rather than an implicit approval.
+This is graph routing, not an availability or authorization ACL. Disabling a prompt does not make a tool available, authorize its use, or provide OS/sandbox containment. In particular, `update_tool_approvals` checks operator authority and invocation context even if its own approval prompt is disabled.
 
-`interrupt_on_with_env_overlay` merges a supplied map with comma-separated tool names from `DEEPAGENTS_TALON_INTERRUPT_ON_TOOLS`; the environment overlay wins for duplicate names. When the MCP configuration update tool is present, Talon adds an approve/reject gate unless `MCP_CONFIG_AUTO_APPROVE_ENV=true`; async-subagent tools are added by default when those agents exist.
+`ToolApprovalStore` accepts a bounded regular non-symlink JSON file, rejects malformed and duplicate entries, and freezes validated contents in an `ApprovalSnapshot`. Its revision is SHA-256 over persisted bytes. Updates validate the whole batch, lock the path, compare the expected revision, merge only on a match, and atomically replace the file. Conflicts and storage failures report errors rather than overwriting policy. The read tool distinguishes persisted from active revisions and reports inactive saved changes; a successful update reports `next_invocation` availability.
 
-For a channel turn, `TalonHost` passes an approval callback through `AgentRequest`. The host stores a pending future by agent conversation, posts the tool names and argument preview, and resumes it from an approve/reject reply or a thumbs-up/thumbs-down reaction. A text reply is accepted only from the sender that started the run when that identity is known. A reaction additionally must match the provider, conversation, exact approval-prompt message, and sender. Invalid replies re-prompt; mismatches are ignored and logged. The implementation logs stable references by default, with raw approval identifiers only if `DEEPAGENTS_TALON_APPROVAL_LOG_RAW_IDS=true`.
+At invocation start, `DeepAgentRuntime` reads the snapshot under its tools lock, rebuilds the graph if it differs from the active snapshot, and binds graph and snapshot in context variables. An in-flight graph and its policy-management closures therefore retain their starting snapshot. Saved changes apply on a subsequent invocation; an invalid saved policy prevents that next invocation rather than silently reusing an older policy.
 
-Talon fails closed where no interactive channel operator exists: scheduled (`trigger == "cron"`) calls and channel calls without an approval handler receive reject decisions with explanatory messages. Approval interrupt and resolution events record action count, names, a stable conversation reference, interrupt ID, trigger, decision, and resolution.
+### Policy self-edit has two gates
+
+1. The **pre-edit** snapshot controls whether `update_tool_approvals` itself interrupts. Disabling that name cannot remove the interruption installed in the running graph.
+2. The update tool requires both `APPROVAL_OPERATOR` and `ACTIVE_APPROVALS`; it returns an authorization error without either.
+
+The host derives `APPROVAL_OPERATOR` from trusted channel `ChannelExposure`, not inbound route or message metadata. A message needs an identified sender and either a configured operator ID or, for `self` exposure, a host-recognized `from_self` message. The runtime clears this authority for cron and background delivery. Prompt approval and operator authority are independent: the former resolves a routed action batch; the latter protects policy administration.
+
+## From graph interrupt to channel decision
+
+When the graph interrupts, Talon requires every item to have a unique nonempty resumable ID. It handles MCP elicitation separately by placing a cancellation response for every valid elicitation in the resume payload. Ordinary interrupts must have a nonempty sequence of action-request mappings. Talon flattens ordinary actions into one `ToolApprovalRequest`, identified by the first ordinary interrupt ID, asks its `ToolApprovalHandler` for one `approve` or `reject`, then fans that outcome out into explicit decisions and resumes the graph with one `Command(resume=...)`. Invalid IDs/actions fail before calling a handler, and the 50-round limit fails rather than implicitly resuming.
 
 ```mermaid
 sequenceDiagram
-    participant Channel
-    participant Host as TalonHost
+    participant Graph as LangGraph
     participant Runtime as DeepAgentRuntime
-    participant Graph
-    Channel->>Host: inbound turn
-    Host->>Runtime: AgentRequest with approval handler
-    Runtime->>Graph: async invoke
-    Graph-->>Runtime: approval interrupt
-    Runtime->>Host: ToolApprovalRequest
-    Host->>Channel: prompt actions and arguments
-    Channel->>Host: approve or reject reply or reaction
-    Host-->>Runtime: decision
-    Runtime->>Graph: Command resume decisions
+    participant Host as TalonHost
+    participant Origin as Origin channel
+    Graph->>Runtime: Interrupt batch
+    Runtime->>Runtime: Validate and separate elicitation
+    Runtime->>Host: One ordinary action batch
+    Host->>Origin: Approval prompt
+    Origin->>Host: Accepted reply or reaction
+    Host->>Runtime: Approve or reject
+    Runtime->>Graph: Command resume payload
 ```
 
-Caption: Talon carries a graph approval interruption over the same channel that initiated the conversation and resumes only after a validated decision.
+Caption: Talon aggregates ordinary actions into one channel decision while cancelling valid MCP elicitation separately.
 
-## `ask_user` is not an approval gate
+The host owns the pending decision, not the graph: it keeps one pending future per agent conversation, prompts through the originating channel, and removes the entry when the future resolves. When the originating sender is known, another sender's text reply cannot resolve it. A reaction also must match provider, conversation, prompt message, and sender. The channel conveys a decision; it neither runs the tool nor grants general authorization.
 
-`AskUserMiddleware` supplies an `ask_user` tool for text, multiple-choice, and multi-select questions. The tool calls LangGraph `interrupt()` during tool execution and resumes into a `ToolMessage`; it does not approve another tool call. Answer parsing rejects mismatched counts, represents cancellation as successful `(cancelled)` answers, and converts malformed data to explicit error answers.
+## Unattended and delegated work fails closed
 
-Only genuinely answered, bounded string responses with trusted thread, turn, and tool-call identity receive an `AskUserAuthorizationReceipt`; coercions, cancellations, and errors do not. Auto mode requires that receipt instead of treating arbitrary text as authorization. Middleware that catches exceptions around tool calls must re-raise `GraphBubbleUp`, because swallowing the `GraphInterrupt` would break the interaction.
+Protected ordinary actions are rejected for cron, background-result delivery, or a request without an approval handler. The runtime applies this even when a caller injects a handler. The host withholds both approval and OAuth authorization handlers for background-result delivery, and scheduled runs likewise have no interactive handlers. These paths do not wait for a person who is absent.
 
-## Operational checklist and tests
+Detached background subagents clear operator and authorization context. If one reaches a protected action, its result reports that the action did not run. Cron-only inline delegation runs within its already-unattended scheduled caller, disallows nested delegation, and cannot inherit interactive approval or authorization. This fail-closed behavior applies only to calls actually routed through the approval mechanism; it is not a claim that every possible tool or integration is protected.
 
-- Use absolute, literal-leading protected anchors such as `/secrets/**`; leading-wildcard interrupt patterns anchor at `/` for bulk overlap and can prompt nearly every bulk call.
-- Test direct paths and bulk roots, including omitted paths, `.`, absolute glob patterns, and `..` in a relative glob pattern. Test directory deletion separately from a confirmed leaf.
-- Treat `interrupt_on` as selective approval routing, not a replacement for backend sandboxing or filesystem denial. Review interpreter PTC separately.
-- For Talon deployments, configure gates before relying on them, ensure channels provide stable message/sender identities for reaction approvals, and expect cron/no-handler execution to deny gated calls.
+## Operating and testing safely
 
-Focused coverage includes `libs/deepagents/tests/unit_tests/test_permissions.py` for validation, precedence, bulk bypass protection, and delete overlap; `libs/code/tests/unit_tests/test_approval_mode.py` for fail-closed Store behavior; and Talon's runtime and host tests for resume payloads, channel decisions, mismatch rejection, and cron denial.
+- Treat channel exposure, tool availability, filesystem denial, graph interruption, channel decision, operator authority, and backend/sandbox isolation as separate layers.
+- For ACP, document the concrete `SessionMode`-to-`interrupt_on` mapping supplied by that agent. Do not describe an ACP mode as a security grant.
+- Use exact names in Talon's `tools.json`. Persisted edits need a new invocation; use the revision from `get_tool_approvals` when updating.
+- Preserve the invocation snapshot and active-snapshot/operator checks when changing policy-management tools. Do not trust request metadata as proof of operator identity.
+- Build a Talon approval UI around one ordinary-action batch decision and validate interrupts before calling an external handler. Keep MCP elicitation out of that UI.
+- Test policy validation, defaults, CAS conflicts, and active-versus-saved snapshots in `test_tool_approvals.py`; test batch fan-out and unattended rejection in the tool-approval runtime and batch tests; test trusted sender/reaction matching and channel-derived authority in host authorization tests; and test unattended delivery wiring in `test_host.py`.
